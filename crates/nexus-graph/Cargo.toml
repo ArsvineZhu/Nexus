@@ -18,5 +18,20 @@ nexus-core.workspace = true
 nexus-math = { workspace = true, optional = true }
 nexus-vcp = { workspace = true, optional = true }
 
+[dev-dependencies]
+criterion.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "frozen"
+harness = false
+required-features = ["math-nodes", "vcp-nodes"]
+
 [lints]
 workspace = true
+
+[[example]]
+name = "live_retrieval"
+required-features = ["vcp-nodes"]

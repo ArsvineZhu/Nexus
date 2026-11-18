@@ -6,7 +6,16 @@ use crate::error::VcpError;
 use crate::operator::{ParallelPolicy, PrecisionMode};
 use crate::view::VectorMatrixView;
 use rayon::prelude::*;
-use wide::f64x4;
+use wide::{f32x8, f64x4};
+
+/// Checks finite inputs in contiguous blocks, independent of arithmetic precision.
+pub fn all_finite_f32(values: &[f32]) -> bool {
+    let (blocks, tail) = values.as_chunks::<8>();
+    blocks
+        .iter()
+        .all(|&block| f32x8::new(block).is_finite().all())
+        && tail.iter().all(|value| value.is_finite())
+}
 
 #[inline]
 fn dot_f32_strict(a: &[f32], b: &[f32]) -> f64 {
@@ -227,79 +236,33 @@ fn dot_4_f32_row(
 ) -> [f64; 4] {
     match mode {
         PrecisionMode::StrictLeftFold => {
-            let mut s0 = 0.0_f64;
-            let mut s1 = 0.0_f64;
-            let mut s2 = 0.0_f64;
-            let mut s3 = 0.0_f64;
-            for i in 0..row.len() {
-                let r = f64::from(row[i]);
-                s0 += r * f64::from(q0[i]);
-                s1 += r * f64::from(q1[i]);
-                s2 += r * f64::from(q2[i]);
-                s3 += r * f64::from(q3[i]);
+            // Vectorize across queries so each lane retains its own left fold.
+            let mut sums = f64x4::ZERO;
+            for ((((value, a), b), c), d) in row.iter().zip(q0).zip(q1).zip(q2).zip(q3) {
+                let queries = f64x4::new([*a, *b, *c, *d].map(f64::from));
+                sums += f64x4::splat(f64::from(*value)) * queries;
             }
-            [s0, s1, s2, s3]
+            sums.to_array()
         }
         PrecisionMode::FastSimd => {
-            let mut acc0 = f64x4::ZERO;
-            let mut acc1 = f64x4::ZERO;
-            let mut acc2 = f64x4::ZERO;
-            let mut acc3 = f64x4::ZERO;
-
-            let chunks = row.len() / 4;
-            let rem_start = chunks * 4;
-
-            for c in 0..chunks {
-                let off = c * 4;
-                let vr = f64x4::new([
-                    f64::from(row[off]),
-                    f64::from(row[off + 1]),
-                    f64::from(row[off + 2]),
-                    f64::from(row[off + 3]),
-                ]);
-                let vq0 = f64x4::new([
-                    f64::from(q0[off]),
-                    f64::from(q0[off + 1]),
-                    f64::from(q0[off + 2]),
-                    f64::from(q0[off + 3]),
-                ]);
-                let vq1 = f64x4::new([
-                    f64::from(q1[off]),
-                    f64::from(q1[off + 1]),
-                    f64::from(q1[off + 2]),
-                    f64::from(q1[off + 3]),
-                ]);
-                let vq2 = f64x4::new([
-                    f64::from(q2[off]),
-                    f64::from(q2[off + 1]),
-                    f64::from(q2[off + 2]),
-                    f64::from(q2[off + 3]),
-                ]);
-                let vq3 = f64x4::new([
-                    f64::from(q3[off]),
-                    f64::from(q3[off + 1]),
-                    f64::from(q3[off + 2]),
-                    f64::from(q3[off + 3]),
-                ]);
-                acc0 = vr.mul_add(vq0, acc0);
-                acc1 = vr.mul_add(vq1, acc1);
-                acc2 = vr.mul_add(vq2, acc2);
-                acc3 = vr.mul_add(vq3, acc3);
+            let mut accumulators = [f64x4::ZERO; 4];
+            let (rows, remainder) = row.as_chunks::<4>();
+            let [a, b, c, d] = [q0, q1, q2, q3].map(|query| query.as_chunks::<4>().0);
+            for ((((row, a), b), c), d) in rows.iter().zip(a).zip(b).zip(c).zip(d) {
+                let vector = f64x4::new(row.map(f64::from));
+                for (acc, query) in accumulators.iter_mut().zip([a, b, c, d]) {
+                    *acc = vector.mul_add(f64x4::new(query.map(f64::from)), *acc);
+                }
             }
-
-            let mut s0 = acc0.reduce_add();
-            let mut s1 = acc1.reduce_add();
-            let mut s2 = acc2.reduce_add();
-            let mut s3 = acc3.reduce_add();
-
-            for i in rem_start..row.len() {
-                let r = f64::from(row[i]);
-                s0 += r * f64::from(q0[i]);
-                s1 += r * f64::from(q1[i]);
-                s2 += r * f64::from(q2[i]);
-                s3 += r * f64::from(q3[i]);
+            let mut result = accumulators.map(f64x4::reduce_add);
+            let offset = rows.len() * 4;
+            for (i, &value) in remainder.iter().enumerate() {
+                let position = offset + i;
+                for (sum, query) in result.iter_mut().zip([q0, q1, q2, q3]) {
+                    *sum += f64::from(value) * f64::from(query[position]);
+                }
             }
-            [s0, s1, s2, s3]
+            result
         }
     }
 }
@@ -351,15 +314,13 @@ pub fn batch_cosines_f32(
         return Ok(());
     }
 
-    let q_sq_norms: Vec<f64> = queries.iter().map(|q| norm_sq_f32(q, mode)).collect();
-    let q_norms: Vec<f64> = q_sq_norms.iter().map(|s| s.sqrt()).collect();
     let dim = matrix.dim;
     let use_par = parallel.is_parallel() && matrix.rows >= 64;
 
     if queries.len() == 4 {
         let [q0, q1, q2, q3] = [queries[0], queries[1], queries[2], queries[3]];
-        let [bb0, bb1, bb2, bb3] = [q_sq_norms[0], q_sq_norms[1], q_sq_norms[2], q_sq_norms[3]];
-        let [nb0, nb1, nb2, nb3] = [q_norms[0], q_norms[1], q_norms[2], q_norms[3]];
+        let [bb0, bb1, bb2, bb3] = [q0, q1, q2, q3].map(|q| norm_sq_f32(q, mode));
+        let [nb0, nb1, nb2, nb3] = [bb0, bb1, bb2, bb3].map(f64::sqrt);
         let valid0 = !q0.is_empty() && bb0 > norm_sq_floor;
         let valid1 = !q1.is_empty() && bb1 > norm_sq_floor;
         let valid2 = !q2.is_empty() && bb2 > norm_sq_floor;
@@ -426,7 +387,7 @@ pub fn batch_cosines_f32(
 
     if queries.len() == 1 {
         let q = queries[0];
-        let bb = q_sq_norms[0];
+        let bb = norm_sq_f32(q, mode);
         let out = &mut out_cols[0];
         if use_par {
             parallel.install(|| {
@@ -450,6 +411,38 @@ pub fn batch_cosines_f32(
         return Ok(());
     }
 
+    if let [q0, q1] = queries
+        && let [out0, out1] = &mut *out_cols
+    {
+        let [bb0, bb1] = [q0, q1].map(|query| norm_sq_f32(query, mode));
+        let row_cosines = |index: usize| {
+            let row = matrix.row(index).unwrap();
+            let aa = matrix
+                .sq_norm_f64(index)
+                .unwrap_or_else(|| norm_sq_f32(row, mode));
+            [
+                cosine_f32_with_norms(row, q0, aa, bb0, mode, norm_sq_floor),
+                cosine_f32_with_norms(row, q1, aa, bb1, mode, norm_sq_floor),
+            ]
+        };
+        if use_par {
+            parallel.install(|| {
+                out0.par_iter_mut()
+                    .zip(out1.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(index, (a, b))| {
+                        [*a, *b] = row_cosines(index);
+                    });
+            });
+        } else {
+            for (index, (a, b)) in out0.iter_mut().zip(out1.iter_mut()).enumerate() {
+                [*a, *b] = row_cosines(index);
+            }
+        }
+        return Ok(());
+    }
+
+    let q_sq_norms: Vec<f64> = queries.iter().map(|q| norm_sq_f32(q, mode)).collect();
     for (r, row) in matrix.data.chunks_exact(dim).enumerate() {
         let aa = matrix
             .sq_norm_f64(r)

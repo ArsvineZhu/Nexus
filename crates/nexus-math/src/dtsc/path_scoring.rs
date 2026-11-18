@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::curve::{DtscCurveContext, DtscEval, Sample, is_direct, query_closure};
+use super::curve::{DtscCurveContext, DtscEval, Sample, is_direct};
 use super::field::dtsc_cosine;
 use super::{positive, unit};
 use nexus_core::NodeId;
@@ -208,13 +208,11 @@ pub(super) fn path(
 }
 
 pub(super) fn shadow(
-    chunk_vector: &[f32],
+    [a, b]: [f64; 2],
     target: usize,
     ctx: &DtscCurveContext<'_>,
     score: &mut DtscEval,
 ) {
-    let a = query_closure(ctx.original, chunk_vector);
-    let b = query_closure(ctx.enhanced, chunk_vector);
     let lift = b - a;
     score.geo_vector_lift = lift;
     score.geo_closure_score = unit(

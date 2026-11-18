@@ -4,7 +4,18 @@
 pub use nexus_core;
 
 pub mod artifact;
+pub mod context;
+pub mod dedup;
 pub mod geometry;
+pub mod observation;
+pub mod river;
+pub mod thinking;
+
+pub use context::*;
+pub use dedup::*;
+pub use observation::*;
+pub use river::*;
+pub use thinking::*;
 
 pub use artifact::{
     CounterevidenceAdj, FactMatrix, FactMatrixConfig, FactMatrixInput, FactMatrixOperator,

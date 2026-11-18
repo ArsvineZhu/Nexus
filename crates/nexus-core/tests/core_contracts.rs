@@ -285,11 +285,6 @@ fn nnls_rejects_invalid_limits_and_cancellation() {
         solve_nnls_f64(&[], &[&col], &limits, &cancel, &mut scratch),
         Err(VcpError::InvalidInput { .. })
     ));
-    // Zero-norm query
-    assert!(matches!(
-        solve_nnls_f64(&[0.0, 0.0], &[&col], &limits, &cancel, &mut scratch),
-        Err(VcpError::InvalidInput { .. })
-    ));
     // Non-finite query
     assert!(matches!(
         solve_nnls_f64(&[f64::NAN, 1.0], &[&col], &limits, &cancel, &mut scratch),
@@ -503,6 +498,17 @@ fn kernel_batch_cosines_1way_and_4way_parallel_and_seq() {
     .unwrap();
 
     let queries = [&q0, &q1, &q2, &q3];
+    let mut strict = [(); 4].map(|_| vec![0.0; rows]);
+    let mut strict_columns = strict.each_mut().map(Vec::as_mut_slice);
+    batch_cosines_f32(
+        &view,
+        &[&q0, &q1, &q2, &q3],
+        &mut strict_columns,
+        PrecisionMode::StrictLeftFold,
+        1e-12,
+        ParallelPolicy::GlobalRayon,
+    )
+    .unwrap();
     for r in 0..rows {
         let row = view.row(r).unwrap();
         assert!((out1[r] - out4_seq[0][r]).abs() <= 1e-12);
@@ -517,6 +523,7 @@ fn kernel_batch_cosines_1way_and_4way_parallel_and_seq() {
                 1e-12,
             );
             assert!((out4_seq[k][r] - exact).abs() <= 2.61e-7);
+            assert_eq!(strict[k][r].to_bits(), exact.to_bits());
         }
     }
 }

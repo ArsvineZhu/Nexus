@@ -1,0 +1,3064 @@
+{
+  "dedup": [
+    {
+      "case": "aligned_rank",
+      "query": [
+        1.0,
+        0.0
+      ],
+      "survivors": [
+        1,
+        3
+      ],
+      "threshold": 0.92,
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.9800000190734863,
+          0.20000000298023224
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    {
+      "case": "distinct_query_order",
+      "query": [
+        1.0,
+        0.0
+      ],
+      "survivors": [
+        2,
+        3
+      ],
+      "threshold": 0.92,
+      "vectors": [
+        [
+          0.9800000190734863,
+          0.20000000298023224
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    {
+      "case": "zero_vector",
+      "query": [
+        1.0,
+        0.0
+      ],
+      "survivors": [
+        1,
+        2
+      ],
+      "threshold": 0.92,
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ]
+      ]
+    }
+  ],
+  "geometry": [
+    {
+      "basis_used": 2,
+      "case": "opposed",
+      "residual_ratio": 0.34190360427810135,
+      "vectors": [
+        [
+          0.9399999976158142,
+          0.34200000762939453
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.9399999976158142,
+          -0.34200000762939453
+        ]
+      ],
+      "weights": [
+        2.0,
+        1.0
+      ]
+    },
+    {
+      "basis_used": 2,
+      "case": "reconsider_after_projection",
+      "residual_ratio": 0.9987639613721193,
+      "vectors": [
+        [
+          0.004999999888241291,
+          0.9999874830245972,
+          0.0
+        ],
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.9990000128746033,
+          0.0447101816534996,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "weights": [
+        5.0,
+        4.0,
+        3.0
+      ]
+    },
+    {
+      "basis_used": 2,
+      "case": "same_ray_tie",
+      "residual_ratio": 0.0,
+      "vectors": [
+        [
+          0.6000000238418579,
+          0.800000011920929
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "weights": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "basis_used": 1,
+      "case": "no_positive_fit",
+      "residual_ratio": 1.0,
+      "vectors": [
+        [
+          -1.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0
+        ]
+      ],
+      "weights": [
+        1.0,
+        1.0
+      ]
+    }
+  ],
+  "hypernym": [
+    {
+      "case": "redundant_parent",
+      "confidence": 1.0,
+      "contribution": 0.0,
+      "explicit": false,
+      "lexical_parent": true,
+      "names": [
+        "华为",
+        "华为汽车"
+      ],
+      "parents": [
+        1
+      ],
+      "projection": [
+        0.0,
+        1.0
+      ],
+      "query": [
+        0.800000011920929,
+        0.6000000238418579
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ]
+    },
+    {
+      "case": "explicit_parent",
+      "confidence": 0.0,
+      "contribution": 0.0,
+      "explicit": true,
+      "lexical_parent": true,
+      "names": [
+        "华为",
+        "华为汽车"
+      ],
+      "parents": [],
+      "projection": [],
+      "query": [
+        0.800000011920929,
+        0.6000000238418579
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ]
+    },
+    {
+      "case": "independent_parent",
+      "confidence": 0.0,
+      "contribution": 0.2,
+      "explicit": false,
+      "lexical_parent": false,
+      "names": [
+        "car",
+        "car assembly"
+      ],
+      "parents": [],
+      "projection": [],
+      "query": [
+        0.800000011920929,
+        0.6000000238418579
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ]
+    },
+    {
+      "case": "tight_alias",
+      "confidence": 0.0,
+      "contribution": 0.0,
+      "explicit": false,
+      "lexical_parent": false,
+      "names": [
+        "Lunarium",
+        "Lunarium星之旅"
+      ],
+      "parents": [],
+      "projection": [],
+      "query": [
+        1.0,
+        0.0
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "case": "weak_direction",
+      "confidence": 0.29986508436022974,
+      "contribution": 0.0,
+      "explicit": false,
+      "lexical_parent": true,
+      "names": [
+        "car",
+        "car assembly"
+      ],
+      "parents": [
+        1
+      ],
+      "projection": [
+        0.0,
+        1.0
+      ],
+      "query": [
+        1.0,
+        0.029999999329447746
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ]
+    },
+    {
+      "case": "low_parent_similarity",
+      "confidence": 0.0,
+      "contribution": 0.0,
+      "explicit": false,
+      "lexical_parent": true,
+      "names": [
+        "car",
+        "car assembly"
+      ],
+      "parents": [],
+      "projection": [],
+      "query": [
+        0.0,
+        1.0
+      ],
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ]
+    }
+  ],
+  "nnls": [
+    {
+      "case": "opposite",
+      "ids": [
+        1,
+        2
+      ],
+      "projection": [
+        0.9399999976158142,
+        0.0
+      ],
+      "query": [
+        0.9399999976158142,
+        0.34200000762939453
+      ],
+      "residual": [
+        0.0,
+        0.34200000762939453
+      ],
+      "residual_ratio": 0.11689807461835652,
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          0.9399999976158142,
+          -0.34200000762939453
+        ]
+      ],
+      "weights": [
+        0.939735029346913,
+        0.0
+      ]
+    },
+    {
+      "case": "joint_fit",
+      "ids": [
+        1,
+        2
+      ],
+      "projection": [
+        1.0,
+        0.10000000149011612
+      ],
+      "query": [
+        1.0,
+        0.10000000149011612
+      ],
+      "residual": [
+        -4.463041480675734e-16,
+        -2.9288707897137157e-16
+      ],
+      "residual_ratio": 2.8214873685273005e-31,
+      "vectors": [
+        [
+          1.0,
+          1.0
+        ],
+        [
+          0.0,
+          -1.0
+        ]
+      ],
+      "weights": [
+        1.4071950892529723,
+        0.8955334695741458
+      ]
+    },
+    {
+      "case": "duplicate_and_zero",
+      "ids": [
+        30,
+        10,
+        20,
+        40
+      ],
+      "projection": [
+        0.30000001192092896,
+        0.4000000059604645,
+        0.0
+      ],
+      "query": [
+        0.30000001192092896,
+        0.4000000059604645,
+        0.5
+      ],
+      "residual": [
+        0.0,
+        0.0,
+        0.5
+      ],
+      "residual_ratio": 0.4999999880790711,
+      "vectors": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "weights": [
+        0.0,
+        0.42426408051304587,
+        0.5656854266351119,
+        0.0
+      ]
+    },
+    {
+      "case": "near_collinear",
+      "ids": [
+        1,
+        2
+      ],
+      "projection": [
+        1.0000000116860974e-07,
+        9.9999998245167e-15
+      ],
+      "query": [
+        0.0,
+        1.0
+      ],
+      "residual": [
+        -1.0000000116860974e-07,
+        1.0
+      ],
+      "residual_ratio": 0.99999999999999,
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ],
+        [
+          1.0,
+          1.0000000116860974e-07
+        ]
+      ],
+      "weights": [
+        0.0,
+        1.0000000116860925e-07
+      ]
+    },
+    {
+      "case": "zero_target",
+      "ids": [
+        1
+      ],
+      "projection": [
+        0.0,
+        0.0
+      ],
+      "query": [
+        0.0,
+        0.0
+      ],
+      "residual": [
+        0.0,
+        0.0
+      ],
+      "residual_ratio": 0.0,
+      "vectors": [
+        [
+          1.0,
+          0.0
+        ]
+      ],
+      "weights": [
+        0.0
+      ]
+    }
+  ],
+  "revision": "5adb12bb55e616e22bd0e0dbfdc13032c069941a",
+  "river": [
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "ordinary_focus",
+      "has_provenance": true,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.5
+            ],
+            [
+              3,
+              0.8
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.8,
+              "normalizedFlow": 0.8,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": false
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.35
+            ],
+            [
+              3,
+              0.65
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6359940106286458,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 1,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.6061620258254237,
+            "pathQuality": 0.5535791048245502,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.05329494304622309,
+          "id": 2,
+          "path_bonus": 0.026705056953776906,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 1.0,
+            "edgeGraphScore": 0.867127382322742,
+            "edgeTopologyScore": 0.7815135084182896,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.7815135084182896,
+            "matchedEdges": 1,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.7815135084182896,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 1.0,
+            "reliability": 0.6821742531398405,
+            "reliabilityMode": "edge_topology",
+            "score": 0.867127382322742,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.7159940106286458,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.05329494304622309,
+            "finalScore": 0.7159940106286458,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.03280132342315626,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.6315225350338908,
+            "transportRequested": 0.05052180280271126,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.0024758956875481223,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.6315978043457213,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.0024758956875481223,
+            "finalScore": 0.6315978043457213,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.3771192763056868,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.057904678686631635,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.4448916800988197,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.057904678686631635,
+            "finalScore": 0.4448916800988197,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.7107139531856531,
+            "transportRequested": 0.05685711625485225,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          3
+        ]
+      ]
+    },
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "rescaled_fields",
+      "has_provenance": true,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.0005
+            ],
+            [
+              3,
+              0.0008
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.8,
+              "normalizedFlow": 0.8,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": false
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.00035
+            ],
+            [
+              3,
+              0.0006500000000000001
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6359940106286458,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 1,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.6061620258254237,
+            "pathQuality": 0.5535791048245502,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.05329494304622309,
+          "id": 2,
+          "path_bonus": 0.026705056953776906,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 1.0,
+            "edgeGraphScore": 0.867127382322742,
+            "edgeTopologyScore": 0.7815135084182896,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.7815135084182896,
+            "matchedEdges": 1,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.7815135084182896,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 1.0,
+            "reliability": 0.6821742531398405,
+            "reliabilityMode": "edge_topology",
+            "score": 0.867127382322742,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.7159940106286458,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.05329494304622309,
+            "finalScore": 0.7159940106286458,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.03280132342315626,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.6315225350338908,
+            "transportRequested": 0.05052180280271126,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.0024758956875481223,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.6315978043457213,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.0024758956875481223,
+            "finalScore": 0.6315978043457213,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.3771192763056868,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.057904678686631635,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.4448916800988197,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.057904678686631635,
+            "finalScore": 0.4448916800988197,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.7107139531856531,
+            "transportRequested": 0.05685711625485225,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          3
+        ]
+      ]
+    },
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "below_active_edge_floor",
+      "has_provenance": true,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.5
+            ],
+            [
+              3,
+              0.8
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.01,
+              "normalizedFlow": 0.01,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": false
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.35
+            ],
+            [
+              3,
+              0.65
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.592626675627966,
+          "genus_gate": 0.8690309943882263,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.3199711388778576,
+            "pathQuality": 0.29221450550039896,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.05129844581052117,
+          "id": 2,
+          "path_bonus": 0.020386733353463887,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.1388917087870603,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 0,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.709842643473573,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.664311854791951,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.05129844581052117,
+            "finalScore": 0.664311854791951,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.002107708290604243,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.6315225350338908,
+            "transportRequested": 0.05052180280271126,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.0024758956875481223,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 0,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.6315978043457213,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.0024758956875481223,
+            "finalScore": 0.6315978043457213,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.2034575277668717,
+          "genus_gate": 0.45454549789428556,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.057904678686631635,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 0,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.2712299315600046,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.057904678686631635,
+            "finalScore": 0.2712299315600046,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": [
+              1,
+              3
+            ],
+            "proxyEvidence": 0.7107139531856531,
+            "transportRequested": 0.05685711625485225,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          3
+        ]
+      ]
+    }
+  ],
+  "wormhole": [
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "independent_bridge",
+      "has_provenance": true,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.5
+            ],
+            [
+              3,
+              0.8
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.8,
+              "normalizedFlow": 0.8,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": true
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.35
+            ],
+            [
+              3,
+              0.65
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.592626675627966,
+          "genus_gate": 0.8690309943882263,
+          "geometry": {
+            "activeSegments": 1,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.6061620258254237,
+            "pathQuality": 0.5535791048245502,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.05329494304622309,
+          "id": 2,
+          "path_bonus": 0.026705056953776906,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 1.0,
+            "edgeGraphScore": 0.867127382322742,
+            "edgeTopologyScore": 0.7815135084182896,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.7815135084182896,
+            "matchedEdges": 1,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.7815135084182896,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 1.0,
+            "reliability": 0.6821742531398405,
+            "reliabilityMode": "edge_topology",
+            "score": 0.867127382322742,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.672626675627966,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.05329494304622309,
+            "finalScore": 0.672626675627966,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.03280132342315626,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.05052180280271126,
+            "wormhole": {
+              "bodyCosine": 0.8840761504135238,
+              "eligible": true,
+              "evidence": 0.6315225350338908,
+              "matchedTagId": 3,
+              "relativeFlow": 1.0,
+              "sourceId": 1,
+              "tagSimilarity": 1.0,
+              "targetId": 3
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.008041295983844874,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.637163204642018,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.008041295983844874,
+            "finalScore": 0.637163204642018,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.00574314308630106,
+            "wormhole": {
+              "bodyCosine": 0.10049870648595714,
+              "eligible": true,
+              "evidence": 0.07178928857876325,
+              "matchedTagId": 5,
+              "relativeFlow": 1.0,
+              "sourceId": 1,
+              "tagSimilarity": 0.6000000095367428,
+              "targetId": 3
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.2034575277668717,
+          "genus_gate": 0.45454549789428556,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.057904678686631635,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.2712299315600046,
+          "wormhole_unified": {
+            "active": true,
+            "appliedGraphBonus": 0.057904678686631635,
+            "finalScore": 0.2712299315600046,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.05685711625485225,
+            "wormhole": {
+              "bodyCosine": 0.9949371889695597,
+              "eligible": true,
+              "evidence": 0.7107139531856531,
+              "matchedTagId": 3,
+              "relativeFlow": 1.0,
+              "sourceId": 1,
+              "tagSimilarity": 1.0,
+              "targetId": 3
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3,
+          4
+        ],
+        [
+          1,
+          3,
+          4
+        ]
+      ]
+    },
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "missing_bridge",
+      "has_provenance": true,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.5
+            ],
+            [
+              3,
+              0.8
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.8,
+              "normalizedFlow": 0.8,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": true
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.35
+            ],
+            [
+              3,
+              0.65
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.592626675627966,
+          "genus_gate": 0.8690309943882263,
+          "geometry": {
+            "activeSegments": 1,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.6061620258254237,
+            "pathQuality": 0.5535791048245502,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.03280132342315626,
+          "id": 2,
+          "path_bonus": 0.026705056953776906,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 1.0,
+            "edgeGraphScore": 0.867127382322742,
+            "edgeTopologyScore": 0.7815135084182896,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.7815135084182896,
+            "matchedEdges": 1,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.7815135084182896,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 1.0,
+            "reliability": 0.6821742531398405,
+            "reliabilityMode": "edge_topology",
+            "score": 0.867127382322742,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.6521330560048991,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.03280132342315626,
+            "finalScore": 0.6521330560048991,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.03280132342315626,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.0024758956875481223,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.6315978043457213,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.0024758956875481223,
+            "finalScore": 0.6315978043457213,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.2034575277668717,
+          "genus_gate": 0.45454549789428556,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.003621199305377033,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.21694645217874994,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.003621199305377033,
+            "finalScore": 0.21694645217874994,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          3
+        ]
+      ]
+    },
+    {
+      "candidates": [
+        [
+          [
+            0.10000000149011612,
+            0.0,
+            0.9900000095367432
+          ],
+          [
+            3
+          ]
+        ],
+        [
+          [
+            0.41999998688697815,
+            0.20000000298023224,
+            0.8799999952316284
+          ],
+          [
+            1,
+            3
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.9900000095367432,
+            0.10000000149011612
+          ],
+          [
+            2,
+            5
+          ]
+        ]
+      ],
+      "case": "unattributed_transport",
+      "has_provenance": false,
+      "input": {
+        "calibration": {
+          "differentiaConfidence": 0.8,
+          "differentiaVector": [
+            0.0,
+            0.6,
+            0.8
+          ],
+          "exactFocusId": 1,
+          "explainedRatio": 0.9,
+          "supersededIds": [
+            5
+          ]
+        },
+        "candidates": [
+          {
+            "id": 1,
+            "score": 0.91
+          },
+          {
+            "id": 2,
+            "score": 0.83
+          },
+          {
+            "id": 3,
+            "score": 0.67
+          }
+        ],
+        "denoisedVector": [
+          0.8,
+          0.6,
+          0.0
+        ],
+        "dimension": 3,
+        "includeTrace": true,
+        "localVector": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "query": {
+          "vector": [
+            0.8,
+            0.6,
+            0.0
+          ]
+        },
+        "queryState": {
+          "completeObservation": true,
+          "fieldProvenance": [
+            {
+              "hop": 0,
+              "id": 1,
+              "sourceType": "core"
+            },
+            {
+              "hop": 0,
+              "id": 2,
+              "sourceType": "lexical_seed"
+            }
+          ],
+          "localDomainIds": [
+            1,
+            3
+          ],
+          "localField": [
+            [
+              1,
+              0.5
+            ],
+            [
+              3,
+              0.8
+            ]
+          ],
+          "riverEdges": [
+            {
+              "flow": 0.8,
+              "normalizedFlow": 0.8,
+              "sourceId": 1,
+              "targetId": 3,
+              "wormhole": true
+            }
+          ],
+          "riverNodes": [
+            {
+              "energy": 1.0,
+              "hop": 0,
+              "id": 1,
+              "normalizedEnergy": 1.0
+            },
+            {
+              "energy": 0.3,
+              "hop": 0,
+              "id": 2,
+              "normalizedEnergy": 0.3
+            },
+            {
+              "energy": 0.5,
+              "hop": 1,
+              "id": 3,
+              "normalizedEnergy": 0.5
+            }
+          ],
+          "sourceField": [
+            [
+              1,
+              0.75
+            ],
+            [
+              2,
+              0.25
+            ]
+          ],
+          "transferDomainIds": [
+            1,
+            3
+          ],
+          "transferField": [
+            [
+              1,
+              0.35
+            ],
+            [
+              3,
+              0.65
+            ]
+          ]
+        },
+        "transferVector": [
+          0.0,
+          0.0,
+          1.0
+        ]
+      },
+      "omega": 0.7143304733856898,
+      "results": [
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.592626675627966,
+          "genus_gate": 0.8690309943882263,
+          "geometry": {
+            "activeSegments": 1,
+            "meanContinuity": 0.6945698525097307,
+            "meanDirection": 1.0,
+            "meanLocalPotential": 0.7905694150420949,
+            "meanTransferPotential": 0.7337993857053428,
+            "pathCore": 0.6061620258254237,
+            "pathQuality": 0.5535791048245502,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 1.0,
+            "supportedSegments": 1,
+            "tagClosure": 0.6530107874753771,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.03280132342315626,
+          "id": 2,
+          "path_bonus": 0.026705056953776906,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 1.0,
+            "edgeGraphScore": 0.867127382322742,
+            "edgeTopologyScore": 0.7815135084182896,
+            "exactMatchedNodes": 2,
+            "matchedEdgeCoverage": 0.7815135084182896,
+            "matchedEdges": 1,
+            "matchedNodeCoverage": 0.6220554900570742,
+            "matchedNodes": 2,
+            "meanClosure": 0.6530107874753771,
+            "motifScore": 0.7815135084182896,
+            "nodeAlignmentScore": 0.7716206043725573,
+            "nodeGraphScore": 0.709842643473573,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 1.0,
+            "reliability": 0.6821742531398405,
+            "reliabilityMode": "edge_topology",
+            "score": 0.867127382322742,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9402532373852929
+          },
+          "score": 0.6521330560048991,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.03280132342315626,
+            "finalScore": 0.6521330560048991,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.03280132342315626,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.6291219086581732,
+          "genus_gate": 1.0,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.0,
+            "pathQuality": 0.0,
+            "segmentCount": 1,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9255930789394334,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.0024758956875481223,
+          "id": 3,
+          "path_bonus": 0.0,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.13637997447361036,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.27145550929728407,
+            "matchedNodes": 2,
+            "meanClosure": 0.9255930789394334,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.7576665248533909,
+            "nodeGraphScore": 0.8374311264506418,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.8374311264506418,
+            "semanticMatchedNodes": 1,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.6315978043457213,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.0024758956875481223,
+            "finalScore": 0.6315978043457213,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.0024758956875481223,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        },
+        {
+          "anchor_bonus": 0.0,
+          "base_score": 0.2034575277668717,
+          "genus_gate": 0.45454549789428556,
+          "geometry": {
+            "activeSegments": 0,
+            "meanContinuity": 0.0,
+            "meanDirection": 0.0,
+            "meanLocalPotential": 0.0,
+            "meanTransferPotential": 0.0,
+            "pathCore": 0.5,
+            "pathQuality": 0.37436714862119497,
+            "segmentCount": 0,
+            "skipSegments": 0,
+            "supportCoverage": 0.0,
+            "supportedSegments": 0,
+            "tagClosure": 0.9949371889695597,
+            "transferSegments": 0
+          },
+          "graph_bonus": 0.003621199305377033,
+          "id": 1,
+          "path_bonus": 0.00986772510650123,
+          "relative_topology": {
+            "candidateSupportDensity": 1.0,
+            "directionScore": 0.0,
+            "edgeGraphScore": 0.17954376882145962,
+            "edgeTopologyScore": 0.0,
+            "exactMatchedNodes": 1,
+            "matchedEdgeCoverage": 0.0,
+            "matchedEdges": 0,
+            "matchedNodeCoverage": 0.2770737173170673,
+            "matchedNodes": 1,
+            "meanClosure": 0.9949371889695597,
+            "motifScore": 0.0,
+            "nodeAlignmentScore": 0.9974653823414423,
+            "nodeGraphScore": 0.9962004836383296,
+            "queryEdges": 1,
+            "queryNodes": 3,
+            "relativeDistanceScore": 0.0,
+            "reliability": 0.2,
+            "reliabilityMode": "node_alignment_fallback",
+            "score": 0.9962004836383296,
+            "semanticMatchedNodes": 0,
+            "strongestNodeMatchQuality": 0.9974653823414423
+          },
+          "score": 0.21694645217874994,
+          "wormhole_unified": {
+            "active": false,
+            "appliedGraphBonus": 0.003621199305377033,
+            "finalScore": 0.21694645217874994,
+            "mode": "continuous-shared-topology-budget",
+            "previousGraphBonus": 0.003621199305377033,
+            "proxyEdge": null,
+            "proxyEvidence": 0.0,
+            "transportRequested": 0.0,
+            "wormhole": {
+              "bodyCosine": 0.0,
+              "eligible": false,
+              "evidence": 0.0,
+              "matchedTagId": null,
+              "relativeFlow": 0.0,
+              "sourceId": null,
+              "tagSimilarity": 0.0,
+              "targetId": null
+            }
+          }
+        }
+      ],
+      "tags": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          0.699999988079071,
+          0.699999988079071,
+          0.10000000149011612
+        ],
+        [
+          0.0,
+          0.800000011920929,
+          0.6000000238418579
+        ]
+      ],
+      "witness_tags": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          1,
+          3
+        ]
+      ]
+    }
+  ]
+}

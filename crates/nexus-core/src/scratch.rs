@@ -37,6 +37,12 @@ impl EpochTable {
         self.epoch
     }
 
+    /// Marks a slot within the range prepared by the current epoch.
+    #[inline]
+    pub fn mark(&mut self, index: usize) {
+        self.stamps[index] = self.epoch;
+    }
+
     #[inline]
     pub fn is_stamped(&self, index: usize) -> bool {
         self.epoch != 0 && self.stamps.get(index).copied() == Some(self.epoch)

@@ -301,10 +301,10 @@ where
     }
 
     let target_norm = euclidean_norm_f64(target);
-    if !target_norm.is_finite() || target_norm <= 0.0 {
+    if !target_norm.is_finite() {
         return Err(VcpError::InvalidInput {
             stage,
-            detail: "target vector must have strictly positive finite norm".into(),
+            detail: "target vector norm overflowed".into(),
         });
     }
 
@@ -324,6 +324,20 @@ where
             });
         }
         entries.push((id, slot, col));
+    }
+    if target_norm == 0.0 {
+        return Ok(NnlsSolution {
+            weights: vec![0.0; num_cols],
+            projection: vec![0.0; dim],
+            residual: target.to_vec(),
+            residual_norm: 0.0,
+            target_norm: 0.0,
+            residual_ratio: 0.0,
+            explained_ratio: 0.0,
+            active_columns: 0,
+            iterations: 0,
+            max_kkt_violation: 0.0,
+        });
     }
 
     entries.sort_by_key(|(id, slot, _)| (*id, *slot));

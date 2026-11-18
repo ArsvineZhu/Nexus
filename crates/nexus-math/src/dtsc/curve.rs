@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::config::DtscConfig;
-use super::field::{DtscField, DtscFieldNode, DtscFieldSampler, DtscSample, dtsc_cosine};
+use super::field::{DtscField, DtscFieldSampler, DtscSample};
 use super::path_scoring::{contacts, path, shadow};
 use super::{positive, unit};
+use nexus_core::kernel::{batch_cosines_f32, cosine_f32_with_norms, norm_sq_f32};
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator,
-    PathId, ScratchPad, VcpError, VectorMatrixView,
+    PathId, PrecisionMode, ScratchPad, VcpError, VectorMatrixView,
 };
 use std::cmp::Ordering;
 use std::time::Instant;
@@ -103,7 +104,7 @@ pub struct DtscOutput {
 
 pub struct DtscReadoutOperator;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct DtscEval {
     pub candidate: CandidateId,
     pub score: f64,
@@ -212,11 +213,9 @@ impl DtscEval {
 
 pub(super) struct DtscCurveContext<'a> {
     pub config: &'a DtscConfig,
-    pub sampler: &'a DtscFieldSampler<'a>,
+    pub field_samples: &'a [Option<(DtscSample, f64)>],
     pub graph: &'a CsrGraphView<'a>,
     pub tag_vectors: &'a VectorMatrixView<'a, f32>,
-    pub original: &'a [f32],
-    pub enhanced: &'a [f32],
     pub geometry: &'a DtscGeometryState,
     pub max_inbound: f64,
 }
@@ -224,19 +223,10 @@ pub(super) struct DtscCurveContext<'a> {
 pub(super) struct Sample<'a> {
     pub node: NodeId,
     pub vector: &'a [f32],
-    pub field: DtscSample,
+    pub field: &'a DtscSample,
     pub mass: f64,
     pub closure: f64,
     pub specificity: f64,
-}
-
-#[inline]
-pub(super) fn query_closure(q: &[f32], c: &[f32]) -> f64 {
-    if q.len() == c.len() && !c.is_empty() {
-        unit((dtsc_cosine(q, c) + 1.0) / 2.0)
-    } else {
-        0.0
-    }
 }
 
 #[inline]
@@ -244,14 +234,7 @@ pub(super) fn is_direct(s: &Sample<'_>) -> bool {
     matches!(s.field.source_type.as_str(), "seed" | "core")
 }
 
-fn empty_eval(
-    candidate: CandidateId,
-    original_knn_score: f64,
-    chunk_vector: &[f32],
-    ctx: &DtscCurveContext<'_>,
-) -> DtscEval {
-    let a = query_closure(ctx.original, chunk_vector);
-    let b = query_closure(ctx.enhanced, chunk_vector);
+fn empty_eval(candidate: CandidateId, original_knn_score: f64, [a, b]: [f64; 2]) -> DtscEval {
     let lift = b - a;
     DtscEval {
         candidate,
@@ -267,16 +250,14 @@ fn empty_eval(
     }
 }
 
-fn collect_samples<'a, 's>(
+fn collect_samples<'a>(
     chunk_vector: &[f32],
+    chunk_norm: f64,
     tags: &[NodeId],
     positions: &[u32],
     ctx: &'a DtscCurveContext<'a>,
     out: &mut Vec<Sample<'a>>,
-    neighbors_buf: &mut Vec<(f64, &'s DtscFieldNode)>,
-) where
-    'a: 's,
-{
+) {
     out.clear();
     let cfg = &ctx.config.curve;
     let hub_floor = ctx.config.field.public_hub_floor.clamp(0.05, 1.0);
@@ -286,8 +267,18 @@ fn collect_samples<'a, 's>(
         let Some(tag_vec) = ctx.tag_vectors.row(tag.index()) else {
             continue;
         };
-        let closure =
-            unit((dtsc_cosine(tag_vec, chunk_vector) - cfg.min_closure_similarity) / closure_denom);
+        let Some((field, tag_norm)) = &ctx.field_samples[tag.index()] else {
+            continue;
+        };
+        let cosine = cosine_f32_with_norms(
+            tag_vec,
+            chunk_vector,
+            *tag_norm,
+            chunk_norm,
+            PrecisionMode::StrictLeftFold,
+            1e-12,
+        );
+        let closure = unit((cosine - cfg.min_closure_similarity) / closure_denom);
         let specificity = if ctx.max_inbound <= 0.0 {
             1.0
         } else {
@@ -295,7 +286,6 @@ fn collect_samples<'a, 's>(
         };
         let anchor = ctx.graph.anchor_gain(tag).clamp(0.5, 2.0);
         let positional = (-cfg.position_decay * positive(f64::from(pos) - 1.0)).exp();
-        let field = ctx.sampler.sample_with_buf(tag, tag_vec, neighbors_buf);
         let mass = (closure * anchor * positional * specificity).max(0.02);
         out.push(Sample {
             node: tag,
@@ -447,33 +437,26 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
 
 #[allow(clippy::too_many_arguments)]
 fn eval_path<'a>(
-    candidate: CandidateId,
-    original_knn_score: f64,
+    base: DtscEval,
+    query_closures: [f64; 2],
     chunk_vector: &[f32],
+    chunk_norm: f64,
     tags: &[NodeId],
     positions: &[u32],
     ctx: &'a DtscCurveContext<'a>,
     samples_buf: &mut Vec<Sample<'a>>,
-    neighbors_buf: &mut Vec<(f64, &'a DtscFieldNode)>,
     isolated_buf: &mut Vec<usize>,
     connected_flags: &mut Vec<bool>,
 ) -> DtscEval {
-    let mut score = empty_eval(candidate, original_knn_score, chunk_vector, ctx);
-    collect_samples(
-        chunk_vector,
-        tags,
-        positions,
-        ctx,
-        samples_buf,
-        neighbors_buf,
-    );
+    let mut score = base;
+    collect_samples(chunk_vector, chunk_norm, tags, positions, ctx, samples_buf);
     if samples_buf.is_empty() {
         return score;
     }
 
     let weighted = contacts(samples_buf, ctx, &mut score);
     if score.geo_hit_count == 0 {
-        return empty_eval(candidate, original_knn_score, chunk_vector, ctx);
+        return base;
     }
 
     path(
@@ -512,7 +495,7 @@ fn eval_path<'a>(
         (score.geo_score - r.geo_reward_floor) / (r.geo_reward_saturation - r.geo_reward_floor),
     );
 
-    shadow(chunk_vector, target, ctx, &mut score);
+    shadow(query_closures, target, ctx, &mut score);
     reward(samples_buf, ctx, &mut score);
     score
 }
@@ -574,8 +557,34 @@ impl Operator for DtscReadoutOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
+        scratch: &mut ScratchPad,
     ) -> Result<Self::Output, VcpError> {
+        self.readout(ctx, config, input, None, scratch)
+    }
+}
+
+impl DtscReadoutOperator {
+    /// Reuse strict left-fold cosine columns in the candidate matrix's row order.
+    /// Columns must use the same normalization and squared-norm cutoff as DTSC.
+    pub fn execute_with_query_cosines(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        config: &DtscConfig,
+        input: DtscReadoutInput<'_, '_>,
+        query_cosines: [&[f64]; 2],
+        scratch: &mut ScratchPad,
+    ) -> Result<DtscOutput, VcpError> {
+        self.readout(ctx, config, input, Some(query_cosines), scratch)
+    }
+
+    fn readout(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        config: &DtscConfig,
+        input: DtscReadoutInput<'_, '_>,
+        query_cosines: Option<[&[f64]; 2]>,
+        scratch: &mut ScratchPad,
+    ) -> Result<DtscOutput, VcpError> {
         const STAGE: &str = "dtsc_readout";
         let start = Instant::now();
         ctx.check_cancelled(STAGE)?;
@@ -616,20 +625,62 @@ impl Operator for DtscReadoutOperator {
         let norm_cfg = config.normalized();
         let sampler = DtscFieldSampler::new(input.field, input.graph.inbound, &norm_cfg.field);
         let max_inbound = sampler.max_inbound;
+        let mut field_samples = vec![None; input.tag_vectors.rows];
+        let mut neighbors = Vec::new();
+        for &node in input.candidates.path_tags {
+            if let Some(slot) = field_samples.get_mut(node.index())
+                && slot.is_none()
+            {
+                ctx.check_cancelled(STAGE)?;
+                let row = input.tag_vectors.row(node.index()).unwrap();
+                *slot = Some((
+                    sampler.sample_with_buf(node, row, &mut neighbors),
+                    norm_sq_f32(row, PrecisionMode::StrictLeftFold),
+                ));
+            }
+        }
+        let candidates = input.candidates.candidate_count;
+        let [original, enhanced] = if let Some(columns) = query_cosines {
+            for column in columns {
+                if column.len() != candidates {
+                    return Err(VcpError::DimensionMismatch {
+                        stage: STAGE,
+                        expected: candidates,
+                        actual: column.len(),
+                    });
+                }
+            }
+            columns
+        } else {
+            let original = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, candidates, 0.0);
+            let enhanced = ScratchPad::prepare_f64(&mut scratch.f64_buf_b, candidates, 0.0);
+            // A host may have calculated the norms under a different precision policy.
+            let candidate_matrix = VectorMatrixView {
+                sq_norms_f64: None,
+                ..input.candidates.candidate_vectors
+            };
+            batch_cosines_f32(
+                &candidate_matrix,
+                &[input.original_query, input.enhanced_query],
+                &mut [&mut *original, &mut *enhanced],
+                PrecisionMode::StrictLeftFold,
+                1e-12,
+                ctx.parallel,
+            )?;
+            [&*original, &*enhanced]
+        };
+        ctx.check_cancelled(STAGE)?;
         let curve_ctx = DtscCurveContext {
             config: &norm_cfg,
-            sampler: &sampler,
+            field_samples: &field_samples,
             graph: &input.graph,
             tag_vectors: &input.tag_vectors,
-            original: input.original_query,
-            enhanced: input.enhanced_query,
             geometry: &input.geometry,
             max_inbound,
         };
 
         let mut evals = Vec::with_capacity(input.candidates.candidate_count);
         let mut samples_buf = Vec::new();
-        let mut neighbors_buf = Vec::new();
         let mut isolated_buf = Vec::new();
         let mut connected_flags = Vec::new();
 
@@ -640,28 +691,26 @@ impl Operator for DtscReadoutOperator {
             let cand = CandidateId(c as u32);
             let original_knn_score = input.candidates.baseline_scores[c];
             let chunk_vector = input.candidates.candidate_vectors.row(c).unwrap_or(&[]);
+            let closures = [original[c], enhanced[c]].map(|cosine| unit((cosine + 1.0) / 2.0));
+            let base = empty_eval(cand, original_knn_score, closures);
             let paths = input.candidates.candidate_paths(cand);
 
             if paths.is_empty() {
-                evals.push(empty_eval(
-                    cand,
-                    original_knn_score,
-                    chunk_vector,
-                    &curve_ctx,
-                ));
+                evals.push(base);
             } else {
+                let chunk_norm = norm_sq_f32(chunk_vector, PrecisionMode::StrictLeftFold);
                 let mut best: Option<DtscEval> = None;
                 for p in paths {
                     let (tags, positions) = input.candidates.path_steps(PathId(p as u32));
                     let cand_eval = eval_path(
-                        cand,
-                        original_knn_score,
+                        base,
+                        closures,
                         chunk_vector,
+                        chunk_norm,
                         tags,
                         positions,
                         &curve_ctx,
                         &mut samples_buf,
-                        &mut neighbors_buf,
                         &mut isolated_buf,
                         &mut connected_flags,
                     );
