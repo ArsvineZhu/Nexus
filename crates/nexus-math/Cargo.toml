@@ -1,0 +1,20 @@
+[package]
+name = "nexus-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish = false
+description = "Apache-2.0 standalone numerical operators (DTSC from Nous-Wave)"
+
+[features]
+default = []
+schemars = ["dep:schemars", "nexus-core/schemars"]
+
+[dependencies]
+nexus-core.workspace = true
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+
+[lints]
+workspace = true

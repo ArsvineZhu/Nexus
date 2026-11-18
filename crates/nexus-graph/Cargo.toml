@@ -1,0 +1,22 @@
+[package]
+name = "nexus-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+publish = false
+description = "Apache-2.0 strongly typed DAG orchestrator for Nexus operators"
+
+[features]
+default = ["math-nodes", "vcp-nodes"]
+math-nodes = ["dep:nexus-math"]
+vcp-nodes = ["dep:nexus-vcp"]
+schemars = ["nexus-core/schemars", "nexus-math?/schemars", "nexus-vcp?/schemars"]
+
+[dependencies]
+nexus-core.workspace = true
+nexus-math = { workspace = true, optional = true }
+nexus-vcp = { workspace = true, optional = true }
+
+[lints]
+workspace = true

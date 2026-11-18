@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: Apache-2.0
+#![forbid(unsafe_code)]
+
+use crate::error::VcpError;
+
+macro_rules! define_slot_id {
+    ($name:ident, $doc:expr) => {
+        #[doc = $doc]
+        #[repr(transparent)]
+        #[derive(
+            Clone,
+            Copy,
+            Debug,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
+        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+        pub struct $name(pub u32);
+
+        impl $name {
+            #[inline]
+            pub const fn index(self) -> usize {
+                self.0 as usize
+            }
+
+            #[inline]
+            pub fn from_index(index: usize, stage: &'static str) -> Result<Self, VcpError> {
+                u32::try_from(index)
+                    .map(Self)
+                    .map_err(|_| VcpError::InvalidInput {
+                        stage,
+                        detail: format!("{} index {} exceeds u32::MAX", stringify!($name), index),
+                    })
+            }
+        }
+
+        impl From<u32> for $name {
+            #[inline]
+            fn from(value: u32) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+define_slot_id!(NodeId, "Dense 0-based concept/tag node slot index.");
+define_slot_id!(CandidateId, "Dense 0-based candidate slot index.");
+define_slot_id!(DocumentId, "Dense 0-based document slot index.");
+define_slot_id!(RootId, "Dense 0-based provenance root slot index.");
+define_slot_id!(GroupId, "Dense 0-based support-group slot index.");
+define_slot_id!(PathId, "Dense 0-based curve/path slot index.");
+define_slot_id!(SequenceId, "Dense 0-based sequence slot index.");
