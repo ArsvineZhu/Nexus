@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use nexus::core::{CandidateId, PrecisionMode, ThinkingStageInputView};
 use nexus::math::DtscConfig;
-use nexus::vcp::{
-    ComputeFields, FieldConfig, ObservationConfig, PoolCalibrateInput, PoolCalibrateOperator,
-    ThinkingConfig, ThinkingInput, ThinkingPlanOperator,
-};
+use nexus::vcp::{ObservationConfig, ThinkingConfig};
 use nexus::*;
 use serde::Deserialize;
 use std::error::Error;
@@ -46,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let data: Fixture = serde_json::from_slice(&std::fs::read(path)?)?;
     let titles: Vec<_> = data.documents.iter().map(|doc| doc.title.clone()).collect();
     let ids: Vec<_> = (0..titles.len() as u64).collect();
+    let ctx = ExecutionContext::default();
     let nexus = Nexus::prepare(
         Dataset {
             concepts: data
@@ -65,6 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .enumerate()
                 .map(|(id, doc)| Document {
                     id: id as u64,
+                    document_id: None,
                     vector: doc.vector,
                     paths: vec![Sequence {
                         source: id as u64,
@@ -77,9 +75,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }],
                 })
                 .collect(),
+            sources: ids
+                .iter()
+                .map(|&id| SourceFact {
+                    id,
+                    checksum: id + 1,
+                    tags: vec![],
+                    required_sources: vec![],
+                })
+                .collect(),
             ..Dataset::default()
         },
         &AssetConfig::default(),
+        &ctx,
     )?;
     let assets = nexus.prepared();
     println!(
@@ -89,182 +97,51 @@ fn main() -> Result<(), Box<dyn Error>> {
         ids.len(),
         assets.graph.nnz()
     );
-    let borrowed = Nexus::from_prepared(assets)?;
-    let ctx = ExecutionContext::default();
-    let mut config = RiverPipelineConfig::default();
-    config.calibration.precision = Some(PrecisionMode::StrictLeftFold);
-    let candidates = Candidates::recall(ids.len());
+    let indexes = nexus.prepare_recall(&RecallConfig::default(), &ctx)?;
     let mut top_one = 0;
     let mut grounded = 0;
-    for (index, probe) in data.queries.iter().enumerate() {
-        let query = Query::new(&probe.vector, &probe.text);
-        let result = nexus.run(&query, &candidates, Pipeline::river(), &config)?;
-        if index == 0 {
-            let tag_memo = nexus.run(
-                &query,
-                &candidates,
-                Pipeline::tag_memo(),
-                &TagMemoConfig::default(),
-            )?;
-            assert_eq!(tag_memo.ranking.scores.len(), ids.len());
-            let dtsc = nexus.run(
-                &query,
-                &candidates,
-                Pipeline::dtsc(),
-                &DtscPipelineConfig::default(),
-            )?;
-            assert_eq!(dtsc.scores.results.len(), ids.len());
-        }
-        let top = result
-            .scores
-            .items
-            .first()
-            .ok_or("River returned no candidate")?;
+    let dtsc_config = DtscConfig::default();
+    for probe in &data.queries {
+        let query = Query::new(&probe.vector, &probe.text).with_tag_recall(&indexes);
+        let observation = nexus.observe(&query, &ObservationConfig::default(), ctx)?;
+        let candidates = observation.recall(&indexes, &RecallRequest::top_k(ids.len()))?;
+        let evaluation = observation.evaluate(&candidates)?;
+        let fields = observation.fields(&Default::default())?;
+        let result = evaluation.river(&fields, &RiverConfig::default())?;
+        let dtsc_field = observation.dtsc_field(&dtsc_config.field)?;
+        let dtsc = evaluation.dtsc(&dtsc_field, &dtsc_config.scoring)?;
+        let thinking = evaluation.thinking(
+            &[Stage {
+                name: "Explore",
+                limit: 2,
+                candidates: candidates.ids(),
+            }],
+            &ThinkingConfig::default(),
+        )?;
+        let top = result.items.first().ok_or("River returned no candidates")?;
         let expected_rank = result
-            .scores
             .items
             .iter()
-            .position(|item| {
-                result.candidate_ids[item.candidate.index()] == probe.expected_document
-            })
+            .position(|item| item.id == probe.expected_document)
             .ok_or("expected passage missing from River")?
             + 1;
-        top_one += usize::from(expected_rank == 1);
-        let observed = borrowed.observe(&query, &ObservationConfig::default())?;
-        let batch = borrowed.candidates(query.vector, &candidates)?;
-        let fields = borrowed.fields(&observed, &config.fields)?;
-        let river_direct =
-            borrowed.river_with(&fields, &batch, &config.readout, &config.calibration, &ctx)?;
-        assert_eq!(river_direct.scores.items, result.scores.items);
-        let dtsc = borrowed.dtsc(&observed, &batch, &DtscConfig::default())?;
-        let stages = [Stage {
-            name: "Explore",
-            limit: 2,
-            documents: &ids,
-        }];
-        let plan = borrowed.thinking(&observed, &batch, &stages, &ThinkingConfig::default())?;
-        let thought = plan.scores.stages[0]
+        let routes = thinking.stages[0]
             .results
             .iter()
             .filter(|item| item.route.is_some())
             .count();
-        grounded += usize::from(thought > 0);
+        top_one += usize::from(expected_rank == 1);
+        grounded += usize::from(routes > 0);
         println!(
-            "{} | River: {} ({:.4}, topology {:.4}) | expected rank: {expected_rank} | tags: {} | DTSC: {} | Thinking routes: {thought}",
+            "{} | River: {} ({:.4}) | expected rank: {expected_rank} | DTSC: {} | Thinking routes: {routes}",
             probe.text,
-            titles[result.candidate_ids[top.candidate.index()] as usize],
-            top.quality_score,
-            top.topology_bonus,
-            observed.sense.nodes.len(),
-            dtsc.scores.results.len()
-        );
-
-        let thinking_candidates: Vec<_> = (0..batch.ids().len())
-            .map(|slot| CandidateId::from_index(slot, "example"))
-            .collect::<Result<_, _>>()?;
-        let plan_stages = [ThinkingStageInputView {
-            stage_label: "Explore",
-            k: 2,
-            candidates: &thinking_candidates,
-        }];
-        let mut plan = Plan::new();
-        let observation = plan.add(ObserveQuery, ObservationConfig::default(), (), |_| {
-            Ok(QueryInput {
-                nexus: &borrowed,
-                query,
-            })
-        })?;
-        let fields = plan.add(
-            ComputeFields,
-            FieldConfig::default(),
-            observation,
-            |inputs| Ok(borrowed.field_input(inputs.get())),
-        )?;
-        let calibration = plan.add(
-            PoolCalibrateOperator,
-            config.calibration.clone(),
-            fields,
-            |inputs| {
-                Ok(PoolCalibrateInput {
-                    fields: inputs.get(),
-                    candidates: batch.view(),
-                })
-            },
-        )?;
-        let river = plan.add(
-            ReadRiver,
-            config.readout.clone(),
-            (fields, calibration),
-            |inputs| {
-                let (fields, pool) = inputs.get();
-                Ok(RiverInput {
-                    assets,
-                    fields,
-                    pool,
-                    candidates: batch.view(),
-                })
-            },
-        )?;
-        let dtsc_step = plan.add(
-            ReadDtsc,
-            DtscConfig::default(),
-            (observation, calibration),
-            |inputs| {
-                let (observation, pool) = inputs.get();
-                Ok(ObservedDtscInput {
-                    assets,
-                    observation,
-                    pool: Some(pool),
-                    candidates: batch.view(),
-                })
-            },
-        )?;
-        let combined = if thought == 0 {
-            plan.run((river, dtsc_step), &ctx)?
-        } else {
-            let thinking = plan.add(
-                ThinkingPlanOperator,
-                ThinkingConfig::default(),
-                observation,
-                |inputs| {
-                    Ok(ThinkingInput {
-                        trace: inputs.get().complete_trace()?,
-                        candidates: batch.view(),
-                        stages: &plan_stages,
-                        graph: assets.graph,
-                        provenance: assets.provenance,
-                        support_groups: assets.groups,
-                        tag_vectors: assets.tags,
-                        query_cosines: None,
-                    })
-                },
-            )?;
-            let result = plan.run((river, dtsc_step, thinking), &ctx)?;
-            assert!(
-                result.get(thinking)?.stages[0]
-                    .results
-                    .iter()
-                    .any(|item| item.route.is_some())
-            );
-            result
-        };
-        assert_eq!(combined.get(river)?.items, result.scores.items);
-        assert_eq!(
-            combined
-                .get(dtsc_step)?
-                .results
-                .iter()
-                .map(|x| x.score)
-                .collect::<Vec<_>>(),
-            dtsc.scores
-                .results
-                .iter()
-                .map(|x| x.score)
-                .collect::<Vec<_>>()
+            titles[top.id as usize],
+            top.score,
+            dtsc.items.len(),
         );
     }
     println!(
-        "Top-1: {top_one}/{} · queries with grounded Thinking routes: {grounded}",
+        "Top-1: {top_one}/{}; queries with grounded Thinking routes: {grounded}",
         data.queries.len()
     );
     if top_one != data.queries.len() || grounded == 0 {

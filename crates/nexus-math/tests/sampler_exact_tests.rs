@@ -2,9 +2,9 @@
 
 use nexus_math::nexus_core::{ExecutionContext, NodeId, Operator, VectorMatrixView};
 use nexus_math::{
-    DtscField, DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig, DtscFieldNode,
-    DtscFieldSampleInput, DtscFieldSampleOperator, DtscFieldSampler, DtscNodeInput, DtscSample,
-    dtsc_cosine,
+    DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig, DtscFieldSampleInput,
+    DtscFieldSampleOperator, DtscFieldSampler, DtscFieldValues, DtscNodeInput, DtscSample,
+    DtscSourceType, dtsc_cosine,
 };
 
 fn unit(v: f64) -> f64 {
@@ -48,15 +48,15 @@ fn baseline_cosine(a: &[f32], b: &[f32]) -> f64 {
 fn baseline_sample(
     node: NodeId,
     vector: &[f32],
-    field: &DtscField,
+    field: &DtscFieldValues,
     inbound: &[f64],
-    config: &DtscFieldConfig,
 ) -> DtscSample {
-    let exact = field.exact_field.iter().find(|s| s.node == node);
+    let config = field.config();
+    let exact = field.exact_field().iter().find(|s| s.node == node);
     let maximum = inbound.iter().copied().fold(0.0, f64::max);
     let threshold = config.field_similarity_threshold.clamp(-1.0, 1.0);
     let mut neighbors = field
-        .field_nodes
+        .field_nodes()
         .iter()
         .filter(|n| n.node != node)
         .filter_map(|n| {
@@ -92,9 +92,9 @@ fn baseline_sample(
         potential: unit(exact.map_or(0.0, |s| s.potential).max(interpolated)),
         exact: exact.is_some(),
         source_type: exact
-            .map(|s| s.source_type.clone())
-            .or_else(|| neighbors.first().map(|(_, n)| n.source_type.clone()))
-            .unwrap_or_else(|| "unknown".into()),
+            .map(|s| s.source_type)
+            .or_else(|| neighbors.first().map(|(_, n)| n.source_type))
+            .unwrap_or(DtscSourceType::Unknown),
     }
 }
 
@@ -166,36 +166,26 @@ fn cosine_matches_reference_bits() {
 #[test]
 fn sampler_matches_reference_bits_and_order() {
     let vectors = vectors();
-    let field = DtscField {
-        exact_field: vec![
-            DtscSample {
-                node: NodeId(3),
-                potential: 0.4,
-                exact: true,
-                source_type: "first".into(),
-            },
-            DtscSample {
-                node: NodeId(3),
-                potential: 0.9,
-                exact: true,
-                source_type: "duplicate".into(),
-            },
-        ],
-        field_nodes: vectors
-            .iter()
-            .enumerate()
-            .map(|(i, vector)| DtscFieldNode {
-                node: NodeId((i % 13) as u32),
-                potential: (i % 4) as f64 / 3.0,
-                vector: vector.clone(),
-                source_type: format!("node-{i}"),
-            })
-            .collect(),
-        field_entropy: 0.0,
-        field_trusted: true,
-        total_energy: 0.0,
-        max_energy: 0.0,
-    };
+    let field_rows: Vec<_> = vectors
+        .iter()
+        .filter(|vector| vector.len() == 7)
+        .cloned()
+        .collect();
+    let flat = field_rows.concat();
+    let tags = VectorMatrixView::new(&flat, field_rows.len(), 7).unwrap();
+    let nodes: Vec<_> = (0..field_rows.len())
+        .map(|i| DtscNodeInput {
+            node: NodeId(i as u32),
+            energy: (i + 1) as f64,
+            normalized_energy: 0.0,
+            source_type: [
+                DtscSourceType::Core,
+                DtscSourceType::Seed,
+                DtscSourceType::Emergent,
+            ][i % 3],
+        })
+        .collect();
+    let ctx = ExecutionContext::default();
 
     let inbound_cases = [
         dense_first_wins(17, &[]),
@@ -205,18 +195,29 @@ fn sampler_matches_reference_bits_and_order() {
     ];
 
     for inbound in &inbound_cases {
-        for threshold in [-1.0, 0.0, 0.5, 1.0, f64::NAN] {
-            for neighbors in [0, 1, 4, 128] {
+        for threshold in [-1.0, 0.0, 0.5, 1.0] {
+            for neighbors in [1, 4, 128] {
                 let config = DtscFieldConfig {
+                    min_field_tags: nodes.len(),
                     field_similarity_threshold: threshold,
                     max_field_neighbors: neighbors,
                     ..Default::default()
                 };
-                let sampler = DtscFieldSampler::new(&field, inbound, &config);
+                let field = DtscFieldBuildOperator
+                    .execute(
+                        &ctx,
+                        &config,
+                        DtscFieldBuildInput {
+                            nodes: &nodes,
+                            tag_vectors: tags,
+                        },
+                    )
+                    .unwrap();
+                let sampler = DtscFieldSampler::new(&field, inbound);
                 for (i, vector) in vectors.iter().enumerate() {
                     let node = NodeId((i % 17) as u32);
                     let actual = sampler.sample(node, vector);
-                    let expected = baseline_sample(node, vector, &field, inbound, &config);
+                    let expected = baseline_sample(node, vector, &field, inbound);
                     assert_eq!(
                         actual.potential.to_bits(),
                         expected.potential.to_bits(),
@@ -244,41 +245,41 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
     }
     let tag_matrix = VectorMatrixView::new(&flat_tags, dim128_vecs.len(), dim).unwrap();
 
-    // Include NodeId(0) and duplicate NodeId(3) ("first" then "duplicate").
+    // Include NodeId(0) and duplicate NodeId(3) with different provenance.
     let nodes = vec![
         DtscNodeInput {
             node: NodeId(0),
             energy: 1.0,
             normalized_energy: 0.0,
-            source_type: "seed".into(),
+            source_type: DtscSourceType::Seed,
         },
         DtscNodeInput {
             node: NodeId(3),
             energy: 0.4,
             normalized_energy: 0.0,
-            source_type: "first".into(),
+            source_type: DtscSourceType::Core,
         },
         DtscNodeInput {
             node: NodeId(3),
             energy: 0.9,
             normalized_energy: 0.0,
-            source_type: "duplicate".into(),
+            source_type: DtscSourceType::Emergent,
         },
         DtscNodeInput {
             node: NodeId(1),
             energy: 0.8,
             normalized_energy: 0.0,
-            source_type: "core".into(),
+            source_type: DtscSourceType::Core,
         },
         DtscNodeInput {
             node: NodeId(2),
             energy: 0.6,
             normalized_energy: 0.0,
-            source_type: "seed".into(),
+            source_type: DtscSourceType::Seed,
         },
     ];
 
-    let ctx = ExecutionContext::default(); // FastSimd default; DTSC must still enforce StrictLeftFold.
+    let ctx = ExecutionContext::default();
 
     let cfg = DtscFieldConfig::default();
 
@@ -293,23 +294,22 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
         )
         .unwrap();
 
-    assert!(field.field_trusted);
-    assert!(field.exact_field.iter().any(|s| s.node == NodeId(0)));
-    assert!(field.field_nodes.iter().any(|n| n.node == NodeId(0)));
+    assert!(field.exact_field().iter().any(|s| s.node == NodeId(0)));
+    assert!(field.field_nodes().iter().any(|n| n.node == NodeId(0)));
     // First-duplicate-wins preserved in exact_field order.
     let first_3 = field
-        .exact_field
+        .exact_field()
         .iter()
         .find(|s| s.node == NodeId(3))
         .unwrap();
-    assert_eq!(first_3.source_type, "first");
+    assert_eq!(first_3.source_type, DtscSourceType::Core);
 
     let query_ids: Vec<NodeId> = (0..dim128_vecs.len()).map(|i| NodeId(i as u32)).collect();
     let inbound = vec![0.2, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
     let samples = DtscFieldSampleOperator
         .execute(
             &ctx,
-            &cfg,
+            &(),
             DtscFieldSampleInput {
                 field: &field,
                 query_ids: &query_ids,
@@ -320,10 +320,10 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
         .unwrap();
 
     assert_eq!(samples.len(), query_ids.len());
-    let sampler = DtscFieldSampler::new(&field, &inbound, &cfg);
+    let sampler = DtscFieldSampler::new(&field, &inbound);
     for (i, actual) in samples.iter().enumerate() {
         let expected_sampler = sampler.sample(query_ids[i], dim128_vecs[i]);
-        let expected_ref = baseline_sample(query_ids[i], dim128_vecs[i], &field, &inbound, &cfg);
+        let expected_ref = baseline_sample(query_ids[i], dim128_vecs[i], &field, &inbound);
         assert_eq!(
             actual.potential.to_bits(),
             expected_sampler.potential.to_bits()

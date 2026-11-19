@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{GatedSeeds, SenseOutput, finite_vector, invalid, numeric_failure};
+use super::{GatedSeeds, SenseOutput, finite_vector, invalid, numeric_failure, unit_direction};
 use nexus_core::kernel::{cosine_f32, norm_sq_f32, normalize_f64};
-use nexus_core::{Diagnostics, ExecutionContext, NodeId, Operator, VcpResult, VectorMatrixView};
+use nexus_core::{
+    Diagnostics, ExecutionContext, NodeId, Operator, PrecisionMode, VcpResult, VectorMatrixView,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -30,14 +32,14 @@ impl Default for ObservationFuseConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ObservationFuseInput<'asset, 'query> {
-    pub query: &'asset [f32],
-    pub gated: &'query GatedSeeds,
-    pub sense: &'query SenseOutput,
-    pub core_tags: &'asset [NodeId],
-    pub ghost_vectors: Option<VectorMatrixView<'asset, f32>>,
-    pub ghost_is_core: &'asset [bool],
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
+pub struct ObservationFuseInput<'call> {
+    pub query: &'call [f32],
+    pub gated: &'call GatedSeeds,
+    pub sense: &'call SenseOutput,
+    pub core_tags: &'call [NodeId],
+    pub ghost_vectors: Option<VectorMatrixView<'call, f32>>,
+    pub ghost_is_core: &'call [bool],
+    pub tag_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,7 +53,6 @@ pub struct FusionTag {
 pub struct FusedObservation {
     pub enhanced_query: Vec<f32>,
     pub selected_tags: Vec<FusionTag>,
-    pub source_field: Vec<(NodeId, f64)>,
     pub diagnostics: Diagnostics,
 }
 
@@ -59,7 +60,7 @@ pub struct ObservationFuseOperator;
 
 impl Operator for ObservationFuseOperator {
     type Config = ObservationFuseConfig;
-    type Input<'asset, 'query> = ObservationFuseInput<'asset, 'query>;
+    type Input<'call> = ObservationFuseInput<'call>;
     type Output = FusedObservation;
 
     fn name(&self) -> &'static str {
@@ -70,7 +71,7 @@ impl Operator for ObservationFuseOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -79,7 +80,7 @@ impl Operator for ObservationFuseOperator {
             return Err(invalid(stage, "max_fusion_tags must be positive"));
         }
         let dim = input.tag_vectors.dim;
-        finite_vector(stage, input.query, dim)?;
+        unit_direction(stage, input.query, dim)?;
         if !(-1.0..=1.0).contains(&config.deduplication_threshold)
             || !(0.0..=1.0).contains(&config.duplicate_weight_transfer)
             || !config.core_boost_factor.is_finite()
@@ -171,21 +172,21 @@ impl Operator for ObservationFuseOperator {
                 .row(node.index())
                 .ok_or_else(|| invalid(stage, "fusion node is outside the tag matrix"))?;
             finite_vector(stage, vector, dim)?;
-            if tag.weight > 0.0 && norm_sq_f32(vector, ctx.precision) > 1e-24 {
+            if tag.weight > 0.0 && norm_sq_f32(vector, PrecisionMode::FastSimd) > 1e-24 {
                 vectors.push((tag, 0, vector));
             }
         }
         if let Some(ghosts) = input.ghost_vectors {
             for (index, &is_core) in input.ghost_is_core.iter().enumerate() {
                 let vector = ghosts.row(index).unwrap();
-                finite_vector(stage, vector, dim)?;
+                unit_direction(stage, vector, dim)?;
                 let weight = base
                     * if is_core {
                         input.gated.dynamic_core_boost
                     } else {
                         1.0
                     };
-                if weight > 0.0 && norm_sq_f32(vector, ctx.precision) > 1e-24 {
+                if weight > 0.0 {
                     vectors.push((
                         FusionTag {
                             node: None,
@@ -209,7 +210,7 @@ impl Operator for ObservationFuseOperator {
         for (candidate, _, vector) in vectors {
             ctx.check_cancelled(stage)?;
             if let Some((tag, _)) = selected.iter_mut().find(|(_, prior)| {
-                cosine_f32(prior, vector, ctx.precision) > config.deduplication_threshold
+                cosine_f32(prior, vector, PrecisionMode::FastSimd) > config.deduplication_threshold
             }) {
                 tag.weight += candidate.weight * config.duplicate_weight_transfer;
                 tag.is_core |= candidate.is_core;
@@ -231,12 +232,14 @@ impl Operator for ObservationFuseOperator {
                     *out += f64::from(*value) * (tag.weight / mass);
                 }
             }
-            normalize_f64(context, 1e-12, ctx.precision);
+            normalize_f64(context, 1e-12, PrecisionMode::FastSimd);
             let alpha = input.gated.effective_tag_boost;
             for (memo, &source) in context.iter_mut().zip(input.query) {
                 *memo = (1.0 - alpha) * f64::from(source) + alpha * *memo;
             }
-            normalize_f64(context, 1e-12, ctx.precision);
+            if !normalize_f64(context, 0.0, PrecisionMode::FastSimd) {
+                return Err(invalid(stage, "enhanced query has no net direction"));
+            }
             for (out, &value) in enhanced_query.iter_mut().zip(context.iter()) {
                 *out = value as f32;
             }
@@ -244,7 +247,6 @@ impl Operator for ObservationFuseOperator {
         Ok(FusedObservation {
             enhanced_query,
             selected_tags: selected.into_iter().map(|(tag, _)| tag).collect(),
-            source_field: input.sense.source_field.clone(),
             diagnostics: Diagnostics::default(),
         })
     }

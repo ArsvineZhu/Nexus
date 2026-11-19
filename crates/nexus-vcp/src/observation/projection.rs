@@ -3,8 +3,8 @@
 use super::{DualFields, SenseOutput, finite_vector, invalid};
 use nexus_core::kernel::normalize_f64;
 use nexus_core::{
-    CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator, VcpError, VcpResult,
-    VectorMatrixView,
+    Diagnostics, ExecutionContext, NodeId, Operator, PrecisionMode, TransportGraphView, VcpError,
+    VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -32,11 +32,11 @@ impl Default for BasinProjectionConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct BasinProjectionInput<'asset, 'query> {
-    pub graph: CsrGraphView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub sense: &'query SenseOutput,
-    pub dual_fields: &'query DualFields,
+pub struct BasinProjectionInput<'call> {
+    pub graph: TransportGraphView<'call>,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub sense: &'call SenseOutput,
+    pub dual_fields: &'call DualFields,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,7 +58,7 @@ pub struct BasinSupports {
 
 fn seed_basins(
     ctx: &ExecutionContext<'_>,
-    graph: CsrGraphView<'_>,
+    graph: TransportGraphView<'_>,
     sense: &SenseOutput,
     stage: &'static str,
 ) -> VcpResult<Vec<Basin>> {
@@ -200,7 +200,7 @@ pub struct BasinProjectionOperator;
 
 impl Operator for BasinProjectionOperator {
     type Config = BasinProjectionConfig;
-    type Input<'asset, 'query> = BasinProjectionInput<'asset, 'query>;
+    type Input<'call> = BasinProjectionInput<'call>;
     type Output = BasinSupports;
 
     fn name(&self) -> &'static str {
@@ -211,7 +211,7 @@ impl Operator for BasinProjectionOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -398,7 +398,7 @@ impl Operator for BasinProjectionOperator {
                     *out += f64::from(value) * weight;
                 }
             }
-            normalize_f64(vector, 1e-12, ctx.precision);
+            normalize_f64(vector, 1e-12, PrecisionMode::FastSimd);
             Ok(vector.iter().map(|&v| v as f32).collect())
         };
         let local_vector = project(0)?;

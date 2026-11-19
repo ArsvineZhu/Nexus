@@ -3,8 +3,8 @@
 use super::{GatedSeeds, finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::cosine_f32;
 use nexus_core::{
-    CsrGraphView, Diagnostics, EpochTable, ExecutionContext, NodeId, Operator, VcpResult,
-    VectorMatrixView,
+    Diagnostics, EpochTable, ExecutionContext, NodeId, Operator, PrecisionMode, TransportGraphView,
+    VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -55,11 +55,11 @@ impl Default for SenseConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct SenseInput<'asset, 'query> {
-    pub graph: CsrGraphView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub seeds: &'query GatedSeeds,
-    pub residuals: Option<&'query [Vec<f32>]>,
+pub struct SenseInput<'call> {
+    pub graph: TransportGraphView<'call>,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub seeds: &'call GatedSeeds,
+    pub residuals: Option<&'call [Vec<f32>]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +187,7 @@ struct RoutingScores {
 }
 
 impl RoutingScores {
-    fn begin(&mut self, graph: CsrGraphView<'_>) {
+    fn begin(&mut self, graph: TransportGraphView<'_>) {
         self.evaluated.next_epoch(graph.node_count);
         self.offsets.resize(graph.node_count, 0);
         self.flux.resize(graph.node_count, 0.0);
@@ -197,7 +197,7 @@ impl RoutingScores {
     fn evaluate(
         &mut self,
         ctx: &ExecutionContext<'_>,
-        graph: CsrGraphView<'_>,
+        graph: TransportGraphView<'_>,
         vectors: VectorMatrixView<'_>,
         residuals: &[Vec<f32>],
         active: &[Spike],
@@ -252,20 +252,18 @@ impl RoutingScores {
             self.scores.resize(offset + residuals.len(), 0.0);
             let mut max = 0.0_f64;
             for level in (1..residuals.len()).rev() {
-                max = max.max(cosine_f32(&residuals[level], vector, ctx.precision));
+                max = max.max(cosine_f32(
+                    &residuals[level],
+                    vector,
+                    PrecisionMode::FastSimd,
+                ));
                 self.scores[offset + level - 1] = max;
             }
         }
         Ok(())
     }
 
-    fn select(
-        &mut self,
-        input: SenseInput<'_, '_>,
-        config: &SenseConfig,
-        spike: Spike,
-        layers: usize,
-    ) {
+    fn select(&mut self, input: SenseInput<'_>, config: &SenseConfig, spike: Spike, layers: usize) {
         let graph = input.graph;
         let source = spike.node.index();
         let start = graph.row_offsets[source];
@@ -412,7 +410,7 @@ impl SpikeSenseOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &SenseConfig,
-        input: SenseInput<'_, '_>,
+        input: SenseInput<'_>,
         work: &mut SenseWorkspace,
         output: &mut SenseOutput,
     ) -> VcpResult<()> {
@@ -432,7 +430,7 @@ impl SpikeSenseOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &SenseConfig,
-        input: SenseInput<'_, '_>,
+        input: SenseInput<'_>,
         work: &mut SenseWorkspace,
         output: &mut SenseOutput,
     ) -> VcpResult<()> {
@@ -710,7 +708,7 @@ impl SpikeSenseOperator {
 
 impl Operator for SpikeSenseOperator {
     type Config = SenseConfig;
-    type Input<'asset, 'query> = SenseInput<'asset, 'query>;
+    type Input<'call> = SenseInput<'call>;
     type Output = SenseOutput;
 
     fn name(&self) -> &'static str {
@@ -721,7 +719,7 @@ impl Operator for SpikeSenseOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let mut output = SenseOutput::default();
         self.execute_into(

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{EpaAnalysis, PyramidResidual, PyramidTagEntry, finite_vector, invalid};
+use super::{EpaAnalysis, PyramidResidual, PyramidTagEntry, invalid, unit_direction};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f64, normalize_f64};
 use nexus_core::{
     ExecutionContext, NodeId, Operator, PrecisionMode, TagLexicalMetaView, VcpResult,
@@ -88,12 +88,12 @@ impl Default for HypernymConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct HypernymPruneInput<'asset, 'query> {
-    pub query: &'asset [f32],
-    pub pyramid: &'query PyramidResidual,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub lexical_meta: TagLexicalMetaView<'asset>,
-    pub core_tags: &'asset [NodeId],
+pub struct HypernymPruneInput<'call> {
+    pub query: &'call [f32],
+    pub pyramid: &'call PyramidResidual,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub lexical_meta: TagLexicalMetaView<'call>,
+    pub core_tags: &'call [NodeId],
     pub seed_contribution_floor: f64,
     pub seed_contribution_ratio: f64,
 }
@@ -121,7 +121,7 @@ pub struct HypernymPruneOperator;
 
 impl Operator for HypernymPruneOperator {
     type Config = HypernymConfig;
-    type Input<'asset, 'query> = HypernymPruneInput<'asset, 'query>;
+    type Input<'call> = HypernymPruneInput<'call>;
     type Output = DisambiguatedTags;
 
     fn name(&self) -> &'static str {
@@ -132,12 +132,12 @@ impl Operator for HypernymPruneOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         input.tag_vectors.validate(stage)?;
-        finite_vector(stage, input.query, input.tag_vectors.dim)?;
+        unit_direction(stage, input.query, input.tag_vectors.dim)?;
         validate_metadata(stage, input.lexical_meta, input.tag_vectors.rows)?;
         if ![config.peer_max_cosine, config.query_parent_min_cosine]
             .into_iter()
@@ -178,7 +178,7 @@ impl Operator for HypernymPruneOperator {
                     && !input.core_tags.contains(&tag.node)
                     && tag.contribution < threshold
                     && !parent.is_empty()
-                    && cosine_f32(input.query, vector, ctx.precision)
+                    && cosine_f32(input.query, vector, PrecisionMode::FastSimd)
                         >= config.query_parent_min_cosine
                     && level.tags.iter().enumerate().any(|(peer, entry)| {
                         entry.node != tag.node
@@ -186,7 +186,7 @@ impl Operator for HypernymPruneOperator {
                             && entry.similarity > 0.0
                             && parent.len() < tokens[peer].len()
                             && parent.is_subset(&tokens[peer])
-                            && cosine_f32(vector, vectors[peer], ctx.precision)
+                            && cosine_f32(vector, vectors[peer], PrecisionMode::FastSimd)
                                 < config.peer_max_cosine
                     });
                 if is_parent {
@@ -271,14 +271,14 @@ impl Default for TagGatingConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TagGatingInput<'asset, 'query> {
-    pub epa: &'query EpaAnalysis,
-    pub pyramid: &'query PyramidResidual,
-    pub disambiguated: &'query DisambiguatedTags,
-    pub query_text: &'asset str,
-    pub core_tags: &'asset [NodeId],
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub lexical_meta: TagLexicalMetaView<'asset>,
+pub struct TagGatingInput<'call> {
+    pub epa: &'call EpaAnalysis,
+    pub pyramid: &'call PyramidResidual,
+    pub disambiguated: &'call DisambiguatedTags,
+    pub query_text: &'call str,
+    pub core_tags: &'call [NodeId],
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub lexical_meta: TagLexicalMetaView<'call>,
     pub graph_node_count: usize,
 }
 
@@ -304,7 +304,7 @@ pub struct TagGatingOperator;
 
 impl Operator for TagGatingOperator {
     type Config = TagGatingConfig;
-    type Input<'asset, 'query> = TagGatingInput<'asset, 'query>;
+    type Input<'call> = TagGatingInput<'call>;
     type Output = GatedSeeds;
 
     fn name(&self) -> &'static str {
@@ -315,7 +315,7 @@ impl Operator for TagGatingOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -355,11 +355,11 @@ impl Operator for TagGatingOperator {
         }
         let activation = activation_min
             + input.pyramid.activation.clamp(0.0, 1.0) * (activation_max - activation_min);
-        let dynamic_factor = input.epa.logic_depth * (1.0 + input.epa.resonance.ln_1p())
+        let dynamic_factor = input.epa.spectral_concentration * (1.0 + input.epa.resonance.ln_1p())
             / (1.0 + input.epa.entropy * 0.5)
             * activation;
         let core_metric =
-            (input.epa.logic_depth + 1.0 - input.pyramid.coverage).clamp(0.0, 2.0) * 0.5;
+            (input.epa.spectral_concentration + 1.0 - input.pyramid.coverage).clamp(0.0, 2.0) * 0.5;
         let core_boost = core_min + core_metric * (core_max - core_min);
         let query_name = input.query_text.trim().to_lowercase();
         let exact_focus = input.pyramid.levels.first().and_then(|level| {
@@ -424,8 +424,8 @@ impl Operator for TagGatingOperator {
                     })
                     .filter_map(|peer| {
                         let peer_vector = input.tag_vectors.row(peer.node.index())?;
-                        let tightness =
-                            cosine_f32(vector, peer_vector, ctx.precision).clamp(0.0, 1.0);
+                        let tightness = cosine_f32(vector, peer_vector, PrecisionMode::FastSimd)
+                            .clamp(0.0, 1.0);
                         (tightness >= 0.8).then_some(peer.contribution * tightness)
                     })
                     .fold(0.0, f64::max);
@@ -438,7 +438,8 @@ impl Operator for TagGatingOperator {
                     && let Some(first) = dominant.filter(|first| first.node != tag.node)
                     && let Some(first_vector) = input.tag_vectors.row(first.node.index())
                 {
-                    let tightness = cosine_f32(vector, first_vector, ctx.precision).clamp(0.0, 1.0);
+                    let tightness =
+                        cosine_f32(vector, first_vector, PrecisionMode::FastSimd).clamp(0.0, 1.0);
                     if tightness >= 0.90 {
                         if redundancy_slots == 0 {
                             continue;

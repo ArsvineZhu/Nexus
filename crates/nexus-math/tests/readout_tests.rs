@@ -1,200 +1,73 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use nexus_math::nexus_core::{
-    CancellationToken, CandidateId, CandidatePoolView, CsrGraphView, CsrParts, DocumentId,
-    ExecutionContext, NodeId, Operator, RootId, VcpError, VectorMatrixView,
+    CancellationToken, CandidateId, CandidateRowsView, CsrGraph, CsrStorage, DocumentId,
+    ExecutionContext, NodeId, Operator, PathId, QueryCosines, TransportGraph, TransportGraphView,
+    VcpError, VcpResult, VectorMatrixView,
 };
 use nexus_math::{
-    DtscAuxConfig, DtscConfig, DtscField, DtscFieldBuildInput, DtscFieldBuildOperator,
-    DtscFieldConfig, DtscGeometryState, DtscIdentityConfig, DtscNodeInput, DtscReadoutInput,
-    DtscReadoutOperator,
+    DtscAuxConfig, DtscConfig, DtscEvidenceConfig, DtscEvidenceInput, DtscEvidenceOperator,
+    DtscEvidenceValues, DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig,
+    DtscFieldSampler, DtscFieldValues, DtscGeometryState, DtscIdentityConfig, DtscNodeInput,
+    DtscOrder, DtscOutput, DtscReadoutConfig, DtscReadoutInput, DtscReadoutOperator,
+    DtscRewardConfig, DtscSourceType, DtscTrustConfig, dtsc_cosine,
 };
-use serde::Deserialize;
-use serde::de::IntoDeserializer;
-use serde::de::value::{MapDeserializer, StrDeserializer};
-use std::sync::atomic::AtomicBool;
+use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-fn unit_vec(dim: usize, hot_idx: usize) -> Vec<f32> {
-    let mut v = vec![0.0_f32; dim];
-    v[hot_idx] = 1.0;
-    v
-}
-
-fn mix_vec(dim: usize, a: usize, wa: f32, b: usize, wb: f32) -> Vec<f32> {
-    let mut v = vec![0.0_f32; dim];
-    v[a] = wa;
-    v[b] = wb;
-    v
-}
-
-fn build_test_field(
-    nodes: &[DtscNodeInput],
-    tag_vectors: VectorMatrixView<'_, f32>,
-    cfg: &DtscFieldConfig,
-) -> DtscField {
-    let ctx = ExecutionContext::default();
-
-    DtscFieldBuildOperator
-        .execute(&ctx, cfg, DtscFieldBuildInput { nodes, tag_vectors })
-        .unwrap()
-}
-
-struct OwnedGraph {
-    node_count: usize,
-    row_offsets: Vec<usize>,
-    targets: Vec<NodeId>,
-    weights: Vec<f64>,
-    is_static_wormhole: Vec<bool>,
-    inbound: Vec<f64>,
-    max_inbound: f64,
-    anchor_gains: Vec<f64>,
-    target_sorted_indices: Vec<u32>,
-}
-
-impl OwnedGraph {
-    fn from_edges(
-        node_count: usize,
-        edges: &[(usize, usize, f64)],
-        inbound: Vec<f64>,
-        anchor_gains: Vec<f64>,
-    ) -> Self {
-        let mut adj: Vec<Vec<(NodeId, f64)>> = vec![Vec::new(); node_count];
-        for &(u, v, w) in edges {
-            adj[u].push((NodeId(v as u32), w));
-        }
-        let mut row_offsets = Vec::with_capacity(node_count + 1);
-        let mut targets = Vec::new();
-        let mut weights = Vec::new();
-        let mut target_sorted_indices = Vec::new();
-        row_offsets.push(0);
-        for row in &mut adj {
-            // Primary order descending by weight.
-            row.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let start = targets.len();
-            for &(dst, w) in row.iter() {
-                targets.push(dst);
-                weights.push(w);
-            }
-            let end = targets.len();
-            let mut indices: Vec<u32> = (start..end).map(|i| i as u32).collect();
-            indices.sort_by_key(|&e| (targets[e as usize], e));
-            target_sorted_indices.extend(indices);
-            row_offsets.push(end);
-        }
-        let nnz = targets.len();
-        let max_inbound = inbound.iter().copied().fold(0.0_f64, f64::max);
-        Self {
-            node_count,
-            row_offsets,
-            targets,
-            weights,
-            is_static_wormhole: vec![false; nnz],
-            inbound,
-            max_inbound,
-            anchor_gains,
-            target_sorted_indices,
-        }
-    }
-
-    fn view(&self) -> CsrGraphView<'_> {
-        CsrGraphView::new(CsrParts {
-            node_count: self.node_count,
-            row_offsets: &self.row_offsets,
-            targets: &self.targets,
-            weights: &self.weights,
-            is_static_wormhole: &self.is_static_wormhole,
-            inbound: &self.inbound,
-            max_inbound: self.max_inbound,
-            anchor_gains: &self.anchor_gains,
-            target_sorted_indices: Some(&self.target_sorted_indices),
-            edge_gates: None,
-        })
-        .unwrap()
-    }
-}
-
-struct OwnedPool {
-    candidate_count: usize,
-    baseline_scores: Vec<f64>,
-    union_scores: Vec<f64>,
-    union_ranks: Vec<u32>,
-    bm25_scores: Vec<f64>,
-    anchor_scores: Vec<f64>,
-    curve_document_ids: Vec<DocumentId>,
-    cand_vec_data: Vec<f32>,
+struct CandidateRows {
+    matrix: Vec<f32>,
     dim: usize,
-    candidate_root_offsets: Vec<u32>,
-    candidate_roots: Vec<RootId>,
+    document_ids: Vec<DocumentId>,
+    root_offsets: Vec<u32>,
     candidate_path_offsets: Vec<u32>,
     path_tag_offsets: Vec<u32>,
     path_tags: Vec<NodeId>,
     path_positions: Vec<u32>,
 }
 
-type CandidateSpec = (f64, Vec<f32>, Vec<Vec<(NodeId, u32)>>);
+type Steps = Vec<(NodeId, u32)>;
+type Candidate = (Vec<f32>, Vec<Steps>);
 
-impl OwnedPool {
-    fn from_candidates(dim: usize, items: &[CandidateSpec]) -> Self {
-        let candidate_count = items.len();
-        let mut baseline_scores = Vec::with_capacity(candidate_count);
-        let mut cand_vec_data = Vec::with_capacity(candidate_count * dim);
-        let mut candidate_root_offsets = vec![0_u32];
-        let mut candidate_path_offsets = vec![0_u32];
-        let mut path_tag_offsets = vec![0_u32];
-        let mut path_tags = Vec::new();
-        let mut path_positions = Vec::new();
-
-        for (score, vec, paths) in items {
-            baseline_scores.push(*score);
-            cand_vec_data.extend_from_slice(vec);
-            candidate_root_offsets.push(0);
-            for path in paths {
-                for &(node, pos) in path {
-                    path_tags.push(node);
-                    path_positions.push(pos);
-                }
-                path_tag_offsets.push(path_tags.len() as u32);
-            }
-            candidate_path_offsets.push((path_tag_offsets.len() - 1) as u32);
-        }
-
-        Self {
-            candidate_count,
-            baseline_scores: baseline_scores.clone(),
-            union_scores: baseline_scores,
-            union_ranks: (0..candidate_count as u32).collect(),
-            bm25_scores: vec![0.0; candidate_count],
-            anchor_scores: vec![0.0; candidate_count],
-            curve_document_ids: (0..candidate_count as u32).map(DocumentId).collect(),
-            cand_vec_data,
+impl CandidateRows {
+    fn new(dim: usize, items: &[Candidate]) -> Self {
+        let mut rows = Self {
+            matrix: Vec::new(),
             dim,
-            candidate_root_offsets,
-            candidate_roots: Vec::new(),
-            candidate_path_offsets,
-            path_tag_offsets,
-            path_tags,
-            path_positions,
+            document_ids: (0..items.len() as u32).map(DocumentId).collect(),
+            root_offsets: vec![0; items.len() + 1],
+            candidate_path_offsets: vec![0],
+            path_tag_offsets: vec![0],
+            path_tags: Vec::new(),
+            path_positions: Vec::new(),
+        };
+        for (vector, paths) in items {
+            rows.matrix.extend_from_slice(vector);
+            for path in paths {
+                for &(node, position) in path {
+                    rows.path_tags.push(node);
+                    rows.path_positions.push(position);
+                }
+                rows.path_tag_offsets.push(rows.path_tags.len() as u32);
+            }
+            rows.candidate_path_offsets
+                .push((rows.path_tag_offsets.len() - 1) as u32);
         }
+        rows
     }
 
-    fn view(&self) -> CandidatePoolView<'_> {
-        CandidatePoolView {
-            candidate_count: self.candidate_count,
-            baseline_scores: &self.baseline_scores,
-            union_scores: &self.union_scores,
-            union_ranks: &self.union_ranks,
-            bm25_scores: &self.bm25_scores,
-            bm25_reference: 1.0,
-            anchor_scores: &self.anchor_scores,
-            curve_document_ids: &self.curve_document_ids,
+    fn view(&self) -> CandidateRowsView<'_> {
+        CandidateRowsView {
+            candidate_count: self.document_ids.len(),
+            document_ids: &self.document_ids,
             candidate_vectors: VectorMatrixView::new(
-                &self.cand_vec_data,
-                self.candidate_count,
+                &self.matrix,
+                self.document_ids.len(),
                 self.dim,
             )
             .unwrap(),
-            candidate_root_offsets: &self.candidate_root_offsets,
-            candidate_roots: &self.candidate_roots,
+            candidate_root_offsets: &self.root_offsets,
+            candidate_roots: &[],
             candidate_path_offsets: &self.candidate_path_offsets,
             path_tag_offsets: &self.path_tag_offsets,
             path_tags: &self.path_tags,
@@ -203,789 +76,452 @@ impl OwnedPool {
     }
 }
 
-#[test]
-fn trusted_field_curve_scoring_and_aux_identity_boost() {
-    let dim = 8;
-    let mut tag_data = Vec::new();
-    for i in 0..5 {
-        tag_data.extend_from_slice(&unit_vec(dim, i));
+fn graph(
+    node_count: usize,
+    edges: &[(usize, usize, f64)],
+    inbound: Vec<f64>,
+    anchor_gains: Vec<f64>,
+) -> TransportGraph {
+    let mut adjacency = vec![Vec::new(); node_count];
+    for &(source, target, weight) in edges {
+        adjacency[source].push((NodeId(target as u32), weight));
     }
-    let tag_vectors = VectorMatrixView::new(&tag_data, 5, dim).unwrap();
-    let cfg_field = DtscFieldConfig::default();
-    let field = build_test_field(
-        &[
-            DtscNodeInput {
-                node: NodeId(0),
-                energy: 1.0,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(1),
-                energy: 0.9,
-                normalized_energy: 0.0,
-                source_type: "core".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(2),
-                energy: 0.85,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(3),
-                energy: 0.8,
-                normalized_energy: 0.0,
-                source_type: "emergent".into(),
-            },
-        ],
-        tag_vectors,
-        &cfg_field,
-    );
-    assert!(field.field_trusted);
+    let mut row_offsets = vec![0];
+    let mut targets = Vec::new();
+    let mut weights = Vec::new();
+    for row in &mut adjacency {
+        row.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for &(target, weight) in row.iter() {
+            targets.push(target);
+            weights.push(weight);
+        }
+        row_offsets.push(targets.len());
+    }
+    let max_inbound = inbound.iter().copied().fold(0.0, f64::max);
+    let csr = CsrGraph::new(CsrStorage {
+        node_count,
+        row_offsets,
+        targets,
+        is_static_wormhole: vec![false; weights.len()],
+        weights,
+        inbound,
+        max_inbound,
+        anchor_gains,
+        target_sorted_indices: None,
+    })
+    .unwrap();
+    TransportGraph::new(csr).unwrap()
+}
 
-    let graph = OwnedGraph::from_edges(
-        5,
-        &[(0, 1, 0.8), (1, 2, 0.7), (2, 3, 0.6)],
-        vec![0.1, 0.1, 0.1, 0.2, 0.5],
-        vec![1.2, 1.1, 1.0, 1.0, 1.0],
-    );
+fn empty_graph(node_count: usize) -> TransportGraph {
+    graph(
+        node_count,
+        &[],
+        vec![0.0; node_count],
+        vec![1.0; node_count],
+    )
+}
 
-    // Candidate 0 has lower knn score (0.50) but strong direct path matching query field.
-    // Candidate 1 has higher knn score (0.54) but weak / irrelevant tag 4.
-    let cand0_vec = mix_vec(dim, 0, 0.6, 1, 0.6);
-    let cand1_vec = unit_vec(dim, 4);
-    let pool = OwnedPool::from_candidates(
-        dim,
-        &[
-            (
-                0.50,
-                cand0_vec,
-                vec![vec![
-                    (NodeId(0), 1),
-                    (NodeId(1), 2),
-                    (NodeId(2), 3),
-                    (NodeId(3), 4),
-                ]],
-            ),
-            (0.50, cand1_vec, vec![vec![(NodeId(4), 1)]]),
-        ],
-    );
+fn unit_vector(dim: usize, hot_index: usize) -> Vec<f32> {
+    let mut vector = vec![0.0; dim];
+    vector[hot_index] = 1.0;
+    vector
+}
 
-    let query = mix_vec(dim, 0, 0.7, 1, 0.7);
+fn path(tags: &[u32]) -> Steps {
+    tags.iter()
+        .enumerate()
+        .map(|(i, &node)| (NodeId(node), i as u32 + 1))
+        .collect()
+}
+
+fn seeds(values: &[(u32, f64)]) -> Vec<DtscNodeInput> {
+    values
+        .iter()
+        .map(|&(node, energy)| DtscNodeInput {
+            node: NodeId(node),
+            energy,
+            normalized_energy: energy,
+            source_type: DtscSourceType::Seed,
+        })
+        .collect()
+}
+
+fn build_field(
+    nodes: &[DtscNodeInput],
+    tag_vectors: VectorMatrixView<'_, f32>,
+    config: &DtscFieldConfig,
+) -> DtscFieldValues {
+    DtscFieldBuildOperator
+        .execute(
+            &ExecutionContext::default(),
+            config,
+            DtscFieldBuildInput { nodes, tag_vectors },
+        )
+        .unwrap()
+}
+
+fn evidence(
+    field: &DtscFieldValues,
+    query: &QueryCosines<'_, '_>,
+    graph: TransportGraphView<'_>,
+    tag_vectors: VectorMatrixView<'_, f32>,
+    config: &DtscEvidenceConfig,
+) -> VcpResult<DtscEvidenceValues> {
+    DtscEvidenceOperator.execute(
+        &ExecutionContext::default(),
+        config,
+        DtscEvidenceInput {
+            field,
+            query,
+            graph,
+            tag_vectors,
+            geometry: DtscGeometryState::default(),
+        },
+    )
+}
+
+fn readout(evidence: &DtscEvidenceValues, config: &DtscReadoutConfig) -> DtscOutput {
+    DtscReadoutOperator
+        .execute(
+            &ExecutionContext::default(),
+            config,
+            DtscReadoutInput { evidence },
+        )
+        .unwrap()
+}
+
+#[test]
+fn evidence_is_candidate_local_and_fallback_uses_the_entire_pool() {
+    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
+    let nodes = seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]);
+    let field = build_field(&nodes, tags, &DtscFieldConfig::default());
+    close("entropy", field.field_entropy(), 1.0);
+    let graph = empty_graph(3);
+    let contacted = (vec![1.0, 0.0], vec![path(&[0])]);
+    let no_path = (vec![0.0, 1.0], vec![]);
+    let a = CandidateRows::new(2, std::slice::from_ref(&contacted));
+    let b = CandidateRows::new(2, &[no_path.clone(), contacted]);
     let ctx = ExecutionContext::default();
+    let q = [1.0, 0.0];
+    let a_query = QueryCosines::prepare(&ctx, a.view(), &q, &q).unwrap();
+    let b_query = QueryCosines::prepare(&ctx, b.view(), &q, &q).unwrap();
+    let scoring = DtscEvidenceConfig::default();
+    let a_evidence = evidence(&field, &a_query, graph.view(), tags, &scoring).unwrap();
+    let b_evidence = evidence(&field, &b_query, graph.view(), tags, &scoring).unwrap();
+    let a_contact = &a_evidence.items()[0];
+    let b_contact = &b_evidence.items()[1];
+    assert_eq!(a_contact.geo_score.to_bits(), b_contact.geo_score.to_bits());
+    assert_eq!(a_contact.geo_bonus.to_bits(), b_contact.geo_bonus.to_bits());
+    assert_eq!(b_contact.chosen_path, Some(PathId(0)));
+    assert!(b_contact.geo_bonus > 0.0);
 
-    let cfg = DtscConfig {
-        reward: nexus_math::DtscRewardConfig {
-            alpha: 0.0,
+    let mut config = DtscReadoutConfig {
+        trust: DtscTrustConfig {
+            min_geo_score: 1.0,
+            min_strong_evidence: 100.0,
+            min_candidate_coverage: 0.75,
             ..Default::default()
         },
-        auxiliary: Some(DtscAuxConfig {
-            min_class_evidence: 0.0,
-            min_fused_score: 0.0,
-            min_closure_score: 0.0,
-            identity_anchor: Some(DtscIdentityConfig {
-                min_potential: 0.0,
-                min_specificity: 0.0,
-                min_tag_chunk_closure: 0.0,
-                min_strength: 0.0,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
         ..Default::default()
     };
-
-    let out = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &query,
-                enhanced_query: &query,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-
-    let leading = &out.results[0];
-    assert!(leading.geo_aux_bonus > 0.0);
-    let evidence = leading.auxiliary_evidence.unwrap();
-    assert!(evidence.identity_floor > 0.0);
-    assert!(evidence.shadow_score > 0.0 && evidence.geometry_floor > 0.0);
-    assert!(out.field_trusted);
-    assert!(!out.fallback_used);
-    assert_eq!(out.fallback_reason, None);
-    assert_eq!(out.results.len(), 2);
-    // Candidate 0 boosted past Candidate 1.
-    assert_eq!(out.results[0].candidate, CandidateId(0));
-    assert_eq!(out.results[0].geo_effect, "boost");
-    assert_eq!(out.results[0].geo_evidence_class, "direct");
-    assert!(out.results[0].geo_reward_eligible);
-    assert!(out.results[0].geo_bonus > 0.0);
-    assert!(out.results[0].score > out.results[0].original_knn_score);
-    assert!(out.results[0].score > out.results[1].score);
-    assert_eq!(out.results[1].candidate, CandidateId(1));
-    assert_eq!(out.results[1].geo_effect, "neutral");
-}
-
-#[test]
-fn sparse_association_relief_and_edge_gates_effect() {
-    let dim = 8;
-    // Build vectors:
-    // nodes 0, 2, 4 share a semantic direction (cosine >= 0.48) with chunk vector;
-    // nodes 1, 3 are orthogonal cold gaps separating 0, 2, 4 so all 3 contacts are isolated.
-    let v0 = mix_vec(dim, 0, 0.9, 5, 0.4);
-    let v1 = unit_vec(dim, 6);
-    let v2 = mix_vec(dim, 0, 0.85, 5, 0.5);
-    let v3 = unit_vec(dim, 7);
-    let v4 = mix_vec(dim, 0, 0.88, 5, 0.45);
-    let mut tag_data = Vec::new();
-    for v in [&v0, &v1, &v2, &v3, &v4] {
-        tag_data.extend_from_slice(v);
-    }
-    let tag_vectors = VectorMatrixView::new(&tag_data, 5, dim).unwrap();
-    let cfg_field = DtscFieldConfig::default();
-    let field = build_test_field(
-        &[
-            DtscNodeInput {
-                node: NodeId(0),
-                energy: 1.0,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(2),
-                energy: 0.9,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(4),
-                energy: 0.85,
-                normalized_energy: 0.0,
-                source_type: "core".into(),
-            },
-        ],
-        tag_vectors,
-        &cfg_field,
-    );
-    assert!(field.field_trusted);
-
-    // Non-adjacent edges (0->2, 2->4, 0->4) provide sparse-association conductance.
-    let graph = OwnedGraph::from_edges(
-        5,
-        &[(0, 2, 0.8), (2, 4, 0.7), (0, 4, 0.6)],
-        vec![0.1; 5],
-        vec![1.0; 5],
-    );
-    let chunk = unit_vec(dim, 0);
-    let pool = OwnedPool::from_candidates(
-        dim,
-        &[(
-            0.5,
-            chunk.clone(),
-            vec![vec![
-                (NodeId(0), 1),
-                (NodeId(1), 2),
-                (NodeId(2), 3),
-                (NodeId(3), 4),
-                (NodeId(4), 5),
-            ]],
-        )],
-    );
-
-    let ctx = ExecutionContext::default();
-
-    let cfg_sparse_on = DtscConfig::default();
-    let mut cfg_sparse_off = DtscConfig::default();
-    cfg_sparse_off.sparse.enabled = false;
-
-    let out_on = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_sparse_on,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &chunk,
-                enhanced_query: &chunk,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-
-    let out_off = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_sparse_off,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &chunk,
-                enhanced_query: &chunk,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-
-    // Sparse relief reduces geo_isolated_ratio and increases confidence/geo_score.
-    assert!(out_on.results[0].geo_isolated_ratio < out_off.results[0].geo_isolated_ratio);
-    assert!(out_on.results[0].geo_score > out_off.results[0].geo_score);
-
-    // Edge gates = all 1.0 must match un-gated 0 bits; edge gates = all 0.0 blocks sparse relief.
-    let ones = vec![1.0; graph.weights.len()];
-    let gated_ones = graph.view().with_edge_gates(&ones).unwrap();
-    let out_ones = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_sparse_on,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: gated_ones,
-                tag_vectors,
-                original_query: &chunk,
-                enhanced_query: &chunk,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
+    let alone = readout(&a_evidence, &config);
+    assert!(!alone.fallback_used);
+    assert!(alone.results[0].score > 1.0);
+    let mixed = readout(&b_evidence, &config);
+    assert_eq!(mixed.order, DtscOrder::Input);
     assert_eq!(
-        out_ones.results[0].score.to_bits(),
-        out_on.results[0].score.to_bits()
+        mixed.fallback_reason,
+        Some("candidate-curve-readout-jointly-low-trust")
     );
     assert_eq!(
-        out_ones.results[0].geo_isolated_ratio.to_bits(),
-        out_on.results[0].geo_isolated_ratio.to_bits()
+        mixed
+            .results
+            .iter()
+            .map(|item| item.score)
+            .collect::<Vec<_>>(),
+        [0.0, 1.0]
     );
-
-    let zeros = vec![0.0; graph.weights.len()];
-    let gated_zeros = graph.view().with_edge_gates(&zeros).unwrap();
-    let out_zeros = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_sparse_on,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: gated_zeros,
-                tag_vectors,
-                original_query: &chunk,
-                enhanced_query: &chunk,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        out_zeros.results[0].geo_isolated_ratio.to_bits(),
-        out_off.results[0].geo_isolated_ratio.to_bits()
-    );
-}
-
-#[test]
-fn low_trust_fallback_restores_knn_scores_and_preserves_input_order() {
-    let dim = 4;
-    let mut tag_data = Vec::new();
-    for i in 0..4 {
-        tag_data.extend_from_slice(&unit_vec(dim, i));
-    }
-    let tag_vectors = VectorMatrixView::new(&tag_data, 4, dim).unwrap();
-    // Only 1 node -> field_trusted == false (< min_field_tags = 3).
-    let untrusted_field = build_test_field(
-        &[DtscNodeInput {
-            node: NodeId(0),
-            energy: 1.0,
-            normalized_energy: 0.0,
-            source_type: "seed".into(),
-        }],
-        tag_vectors,
-        &DtscFieldConfig::default(),
-    );
-    assert!(!untrusted_field.field_trusted);
-
-    let graph = OwnedGraph::from_edges(4, &[], vec![0.0; 4], vec![1.0; 4]);
-    // Deliberately unsorted baseline scores: [0.30, 0.90, 0.60].
-    let pool = OwnedPool::from_candidates(
-        dim,
-        &[
-            (0.30, unit_vec(dim, 0), vec![vec![(NodeId(0), 1)]]),
-            (0.90, unit_vec(dim, 1), vec![vec![(NodeId(1), 1)]]),
-            (0.60, unit_vec(dim, 2), vec![vec![(NodeId(2), 1)]]),
-        ],
-    );
-
-    let q = unit_vec(dim, 0);
-    let ctx = ExecutionContext::default();
-
-    let out = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &untrusted_field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-
-    assert!(!out.field_trusted);
-    assert!(out.fallback_used);
-    assert_eq!(out.fallback_reason, Some("query-energy-field-low-trust"));
-    // Input order [0, 1, 2] MUST be preserved on fallback!
-    assert_eq!(out.results[0].candidate, CandidateId(0));
-    assert_eq!(out.results[1].candidate, CandidateId(1));
-    assert_eq!(out.results[2].candidate, CandidateId(2));
-    for item in &out.results {
-        assert_eq!(item.score.to_bits(), item.original_knn_score.to_bits());
+    for item in &mixed.results {
+        assert_eq!(item.score, item.original_cosine);
         assert_eq!(item.geo_bonus, 0.0);
         assert_eq!(item.geo_base_bonus, 0.0);
         assert_eq!(item.geo_aux_bonus, 0.0);
         assert_eq!(item.geo_effect, "neutral");
     }
+    assert!(b_evidence.items()[1].geo_bonus > 0.0);
 
-    // Trusted field, but candidate has no contacts -> "no-candidate-curve-contacted-query-field".
-    let trusted_field = build_test_field(
-        &[
-            DtscNodeInput {
-                node: NodeId(0),
-                energy: 1.0,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(1),
-                energy: 0.9,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(2),
-                energy: 0.8,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-        ],
-        tag_vectors,
-        &DtscFieldConfig::default(),
-    );
-    let cold_pool = OwnedPool::from_candidates(
-        dim,
-        &[
-            (0.25, unit_vec(dim, 3), vec![vec![(NodeId(3), 1)]]),
-            (0.75, unit_vec(dim, 3), vec![]),
-        ],
-    );
-    let out_cold = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &trusted_field,
-                candidates: cold_pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert!(out_cold.fallback_used);
+    config.fallback_on_low_trust = false;
+    config.top_k = 1;
+    let first = readout(&b_evidence, &config);
+    assert_eq!(first.order, DtscOrder::Score);
+    assert_eq!(first.available, 2);
+    assert_eq!(first.results.len(), 1);
+    assert_eq!(first.results[0].candidate, CandidateId(1));
+    assert_eq!(first.results[0].score.to_bits(), b_contact.score.to_bits());
+    assert!(!first.diagnostics.truncated);
+
+    let short = build_field(&nodes[..1], tags, &DtscFieldConfig::default());
+    let short_evidence = evidence(&short, &a_query, graph.view(), tags, &scoring).unwrap();
     assert_eq!(
-        out_cold.fallback_reason,
+        readout(&short_evidence, &config).fallback_reason,
+        Some("query-energy-field-low-trust")
+    );
+    let cold = CandidateRows::new(2, &[no_path]);
+    let cold_query = QueryCosines::prepare(&ctx, cold.view(), &q, &q).unwrap();
+    let cold_evidence = evidence(&field, &cold_query, graph.view(), tags, &scoring).unwrap();
+    assert_eq!(
+        readout(&cold_evidence, &config).fallback_reason,
         Some("no-candidate-curve-contacted-query-field")
     );
-    assert_eq!(out_cold.results[0].candidate, CandidateId(0));
-    assert_eq!(out_cold.results[1].candidate, CandidateId(1));
 }
 
 #[test]
-fn multipath_csr_isolation_best_path_and_top_k_truncation() {
-    let dim = 6;
-    let mut tag_data = Vec::new();
-    for i in 0..6 {
-        tag_data.extend_from_slice(&unit_vec(dim, i));
-    }
-    let tag_vectors = VectorMatrixView::new(&tag_data, 6, dim).unwrap();
-    let field = build_test_field(
-        &[
-            DtscNodeInput {
-                node: NodeId(0),
-                energy: 1.0,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(1),
-                energy: 0.9,
-                normalized_energy: 0.0,
-                source_type: "core".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(2),
-                energy: 0.85,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-        ],
-        tag_vectors,
+fn identity_auxiliary_adds_the_expected_reward() {
+    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
+    let field = build_field(
+        &seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
+        tags,
         &DtscFieldConfig::default(),
     );
-    let graph = OwnedGraph::from_edges(6, &[(0, 1, 0.9), (1, 2, 0.8)], vec![0.1; 6], vec![1.0; 6]);
+    let graph = empty_graph(3);
+    let rows = CandidateRows::new(2, &[(vec![1.0, 0.0], vec![path(&[0])])]);
+    let q = [1.0, 0.0];
+    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
+    let mut config = DtscEvidenceConfig {
+        reward: DtscRewardConfig {
+            alpha: 0.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let disabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
+    let baseline = &disabled.items()[0];
+    assert_eq!(baseline.geo_base_bonus, 0.0);
+    assert_eq!(baseline.geo_aux_bonus, 0.0);
+    assert_eq!(baseline.auxiliary_evidence, None);
+    config.auxiliary = Some(DtscAuxConfig::default());
+    let geometry = evidence(&field, &query, graph.view(), tags, &config).unwrap();
+    let item = &geometry.items()[0];
+    let auxiliary = item.auxiliary_evidence.unwrap();
+    assert!(auxiliary.geometry_floor > 0.0);
+    assert_eq!(auxiliary.identity_floor, 0.0);
+    close(
+        "geometry-only auxiliary bonus",
+        item.geo_aux_bonus,
+        auxiliary.geometry_floor,
+    );
 
-    let cand_vec = mix_vec(dim, 0, 0.6, 1, 0.6);
-    let weak_path = vec![(NodeId(4), 1), (NodeId(5), 2)];
-    let strong_path = vec![(NodeId(0), 1), (NodeId(1), 2), (NodeId(2), 3)];
+    config.auxiliary = Some(DtscAuxConfig {
+        identity_anchor: Some(DtscIdentityConfig::default()),
+        ..Default::default()
+    });
+    let enabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
+    let result = readout(&enabled, &DtscReadoutConfig::default());
+    let item = &result.results[0];
+    let auxiliary = item.auxiliary_evidence.unwrap();
+    assert!(auxiliary.shadow_score > 0.0);
+    close("identity floor", auxiliary.identity_floor, 0.018);
+    close("auxiliary bonus", item.geo_aux_bonus, 0.018);
+    close("score", item.score, 1.018);
+    assert!(item.geo_bonus <= config.reward.direct_bonus_cap);
+}
 
-    // Candidate 0: [weak, strong]
-    // Candidate 1: [strong] alone
-    // Candidate 2: [weak] alone
-    // Candidate 3: split single-tag paths [(NodeId(0), 1)] and [(NodeId(1), 1)] (must NOT mix!).
-    let pool = OwnedPool::from_candidates(
+#[test]
+fn sparse_association_uses_effective_transport_edges() {
+    let directions = [
+        [0.9, 0.4, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.85, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.88, 0.45, 0.0, 0.0],
+    ]
+    .concat();
+    let tags = VectorMatrixView::new(&directions, 5, 4).unwrap();
+    let field = build_field(
+        &seeds(&[(0, 1.0), (2, 0.9), (4, 0.85)]),
+        tags,
+        &DtscFieldConfig::default(),
+    );
+    let graph = graph(
+        5,
+        &[(0, 2, 0.5), (2, 4, 0.7), (0, 4, 0.5)],
+        vec![0.1; 5],
+        vec![1.0; 5],
+    );
+    let q = unit_vector(4, 0);
+    let rows = CandidateRows::new(4, &[(q.clone(), vec![path(&[0, 1, 2, 3, 4])])]);
+    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
+    let mut config = DtscEvidenceConfig::default();
+    let with_relief = evidence(&field, &query, graph.view(), tags, &config).unwrap();
+    let zeros = [0.0; 3];
+    let gated = graph.view().with_edge_gates(&zeros).unwrap();
+    let with_gate = evidence(&field, &query, gated, tags, &config).unwrap();
+    config.sparse.enabled = false;
+    let without_relief = evidence(&field, &query, graph.view(), tags, &config).unwrap();
+    let on = &with_relief.items()[0];
+    let off = &without_relief.items()[0];
+    assert!(on.geo_isolated_ratio < off.geo_isolated_ratio);
+    assert!(on.geo_score > off.geo_score);
+    assert_eq!(
+        off.geo_isolated_ratio.to_bits(),
+        with_gate.items()[0].geo_isolated_ratio.to_bits()
+    );
+}
+
+#[test]
+fn full_path_scoring_keeps_path_identity_and_stable_ties() {
+    let dim = 6;
+    let tag_data = (0..dim)
+        .flat_map(|i| unit_vector(dim, i))
+        .collect::<Vec<_>>();
+    let tags = VectorMatrixView::new(&tag_data, dim, dim).unwrap();
+    let field = build_field(
+        &seeds(&[(0, 1.0), (1, 0.9), (2, 0.85)]),
+        tags,
+        &DtscFieldConfig::default(),
+    );
+    let graph = graph(
+        dim,
+        &[(0, 1, 0.9), (1, 2, 0.8)],
+        vec![0.1; dim],
+        vec![1.0; dim],
+    );
+    let q = vec![0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
+    let strong = path(&[0, 1, 2]);
+    let rows = CandidateRows::new(
         dim,
         &[
-            (0.50, cand_vec.clone(), vec![weak_path, strong_path.clone()]),
-            (0.50, cand_vec.clone(), vec![strong_path]),
-            (0.45, unit_vec(dim, 4), vec![vec![(NodeId(4), 1)]]),
             (
-                0.50,
-                cand_vec.clone(),
-                vec![vec![(NodeId(0), 1)], vec![(NodeId(1), 1)]],
+                q.clone(),
+                vec![path(&[4, 5]), strong.clone(), strong.clone()],
             ),
+            (q.clone(), vec![strong]),
+            (q.clone(), vec![path(&[0]), path(&[1])]),
         ],
     );
-
-    let q = mix_vec(dim, 0, 0.7, 1, 0.7);
-    let ctx = ExecutionContext::default();
-
-    let out_all = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-
-    assert_eq!(out_all.results.len(), 4);
-    let item0 = out_all
-        .results
-        .iter()
-        .find(|r| r.candidate == CandidateId(0))
-        .unwrap();
-    let item1 = out_all
-        .results
-        .iter()
-        .find(|r| r.candidate == CandidateId(1))
-        .unwrap();
-    let item3 = out_all
-        .results
-        .iter()
-        .find(|r| r.candidate == CandidateId(3))
-        .unwrap();
-
-    // Candidate 0 picks strong_path and matches Candidate 1 bit-for-bit.
-    assert_eq!(item0.score.to_bits(), item1.score.to_bits());
-    assert_eq!(item0.geo_score.to_bits(), item1.geo_score.to_bits());
-    assert_eq!(item0.geo_hit_count, 3);
-    // Candidate 3 evaluates its two 1-tag paths separately (never mixes into 2 hits).
-    assert_eq!(item3.geo_hit_count, 1);
-    assert!(item0.score > item3.score);
-
-    // Test top_k truncation = 2.
-    let cfg_top2 = DtscConfig {
-        top_k: 2,
-        ..Default::default()
-    };
-    let out_top2 = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_top2,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert_eq!(out_top2.results.len(), 2);
-    assert_eq!(out_top2.results[0].candidate, CandidateId(0));
-    assert_eq!(out_top2.results[1].candidate, CandidateId(1));
-}
-
-#[test]
-fn config_rejects_invalid_threshold_without_rewriting() {
-    // Empty map deserializes to exact Default values.
-    let empty: Vec<(&str, &str)> = Vec::new();
-    let de = MapDeserializer::<_, serde::de::value::Error>::new(empty.into_iter());
-    let cfg = DtscConfig::deserialize(de).unwrap();
-    assert_eq!(cfg.field.min_field_tags, 3);
-    assert_eq!(cfg.curve.strong_contact_threshold, 0.16);
-    assert_eq!(cfg.sparse.pair_saturation, 3);
-    assert_eq!(cfg.reward.alpha, 0.35);
-    assert_eq!(cfg.trust.min_strong_evidence, 1.0);
-    assert!(cfg.auxiliary.is_none());
-    assert_eq!(cfg.top_k, 0);
-
-    // Unknown field is rejected (`deny_unknown_fields`).
-    let unknown = vec![("unknown_field_xyz", 1_u64)];
-    let de_unknown = MapDeserializer::<_, serde::de::value::Error>::new(
-        unknown
-            .into_iter()
-            .map(|(k, v)| (StrDeserializer::new(k), v.into_deserializer())),
+    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
+    let raw = evidence(
+        &field,
+        &query,
+        graph.view(),
+        tags,
+        &DtscEvidenceConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(raw.items()[0].chosen_path, Some(PathId(1)));
+    assert_eq!(
+        raw.items()[0].score.to_bits(),
+        raw.items()[1].score.to_bits()
     );
-    assert!(DtscConfig::deserialize(de_unknown).is_err());
-
-    let mut bad = DtscConfig::default();
-    bad.curve.weak_contact_threshold = 0.9;
-    let error = bad.validate().unwrap_err();
-    assert!(error.to_string().contains("curve.weak_contact_threshold"));
-    assert_eq!(bad.curve.weak_contact_threshold, 0.9);
+    assert_eq!(raw.items()[0].geo_hit_count, 3);
+    assert_eq!(raw.items()[2].geo_hit_count, 1);
+    assert!(raw.items()[0].score > raw.items()[2].score);
+    let result = readout(
+        &raw,
+        &DtscReadoutConfig {
+            top_k: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        result
+            .results
+            .iter()
+            .map(|item| item.candidate)
+            .collect::<Vec<_>>(),
+        [CandidateId(0), CandidateId(1)]
+    );
 }
 
 #[test]
-fn readout_validates_inputs_and_cancellation() {
-    let dim = 4;
-    let tag_data = vec![1.0_f32, 0.0, 0.0, 0.0];
-    let tag_vectors = VectorMatrixView::new(&tag_data, 1, dim).unwrap();
-    let field = DtscField::default();
-    let graph = OwnedGraph::from_edges(1, &[], vec![0.0], vec![1.0]);
-    let pool = OwnedPool::from_candidates(dim, &[]);
-    let q = vec![1.0_f32; dim];
-
-    // Cancelled context.
-    let cancel_flag = AtomicBool::new(true);
-    let cancelled_ctx = ExecutionContext {
-        cancel: CancellationToken::from_atomic(&cancel_flag),
-        ..Default::default()
-    };
-    let err = DtscReadoutOperator
-        .execute(
-            &cancelled_ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(err, VcpError::Cancelled { .. }));
-
-    // Zero dimension.
-    let zero_tags = VectorMatrixView::empty(0);
-    let zero_pool = OwnedPool::from_candidates(0, &[]);
-    let ctx = ExecutionContext::default();
-    let err_zero = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &field,
-                candidates: zero_pool.view(),
-                graph: graph.view(),
-                tag_vectors: zero_tags,
-                original_query: &[],
-                enhanced_query: &[],
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(err_zero, VcpError::InvalidInput { .. }));
-
-    // Mismatched query length.
-    let err_dim = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &DtscConfig::default(),
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool.view(),
-                graph: graph.view(),
-                tag_vectors,
-                original_query: &[1.0_f32; 2],
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap_err();
-    assert!(matches!(
-        err_dim,
-        VcpError::DimensionMismatch {
-            expected: 4,
-            actual: 2,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn low_trust_coverage_and_spread_fallback_and_bypass() {
-    let dim = 6;
-    let mut tag_data = Vec::new();
-    for i in 0..6 {
-        tag_data.extend_from_slice(&unit_vec(dim, i));
-    }
-    let tag_vectors = VectorMatrixView::new(&tag_data, 6, dim).unwrap();
-    let field = build_test_field(
-        &[
-            DtscNodeInput {
-                node: NodeId(0),
-                energy: 1.0,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(1),
-                energy: 0.9,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-            DtscNodeInput {
-                node: NodeId(2),
-                energy: 0.85,
-                normalized_energy: 0.0,
-                source_type: "seed".into(),
-            },
-        ],
-        tag_vectors,
+fn trust_rejects_an_undifferentiated_pool_until_policy_changes() {
+    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
+    let field = build_field(
+        &seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
+        tags,
         &DtscFieldConfig::default(),
     );
-    let graph = OwnedGraph::from_edges(6, &[], vec![0.1; 6], vec![1.0; 6]);
-    let q = unit_vec(dim, 0);
+    let graph = empty_graph(3);
+    let row = (vec![1.0, 0.0], vec![path(&[0])]);
+    let rows = CandidateRows::new(2, &[row.clone(), row]);
+    let q = [1.0, 0.0];
     let ctx = ExecutionContext::default();
-
-    // 1 of 3 candidates has weak non-strong contact -> coverage (1/3 < 0.5) -> jointly low trust.
-    let mut cfg_low = DtscConfig::default();
-    cfg_low.field.field_similarity_threshold = 0.1;
-    cfg_low.trust.min_geo_score = 0.5;
-    cfg_low.trust.min_strong_evidence = 1.0;
-    cfg_low.trust.min_candidate_coverage = 0.5;
-
-    let pool_cov = OwnedPool::from_candidates(
-        dim,
-        &[
-            (0.4, unit_vec(dim, 4), vec![vec![(NodeId(4), 1)]]),
-            (0.8, unit_vec(dim, 5), vec![vec![(NodeId(5), 1)]]),
-            (0.6, unit_vec(dim, 5), vec![vec![(NodeId(5), 1)]]),
-        ],
-    );
-    // NodeId(4) has cosine 0.60 with NodeId(0), giving weak interpolated potential (~0.108 >= 0.06, < 0.16).
-    let mut tag_data_cov = tag_data.clone();
-    let near0 = mix_vec(dim, 0, 0.6, 4, 0.8);
-    tag_data_cov[4 * dim..5 * dim].copy_from_slice(&near0);
-    let tv_cov = VectorMatrixView::new(&tag_data_cov, 6, dim).unwrap();
-
-    let out_cov = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_low,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool_cov.view(),
-                graph: graph.view(),
-                tag_vectors: tv_cov,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert!(out_cov.fallback_used);
+    let query = QueryCosines::prepare(&ctx, rows.view(), &q, &q).unwrap();
+    let evidence = evidence(
+        &field,
+        &query,
+        graph.view(),
+        tags,
+        &DtscEvidenceConfig::default(),
+    )
+    .unwrap();
+    let mut config = DtscReadoutConfig {
+        trust: DtscTrustConfig {
+            min_geo_score: 1.0,
+            min_strong_evidence: 100.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     assert_eq!(
-        out_cov.fallback_reason,
-        Some("candidate-curve-readout-jointly-low-trust")
-    );
-
-    // 2 of 2 contributors with identical geo_score (< min_geo_spread) -> lack discrimination.
-    let pool_spread = OwnedPool::from_candidates(
-        dim,
-        &[
-            (0.4, unit_vec(dim, 4), vec![vec![(NodeId(4), 1)]]),
-            (0.8, unit_vec(dim, 4), vec![vec![(NodeId(4), 1)]]),
-        ],
-    );
-    let out_spread = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_low,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool_spread.view(),
-                graph: graph.view(),
-                tag_vectors: tv_cov,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert!(out_spread.fallback_used);
-    assert_eq!(
-        out_spread.fallback_reason,
+        readout(&evidence, &config).fallback_reason,
         Some("candidate-curve-scores-lack-discrimination")
     );
+    config.fallback_on_low_trust = false;
+    assert!(!readout(&evidence, &config).fallback_used);
 
-    // When fallback_to_knn_on_low_trust = false, fallback is bypassed for low coverage/spread.
-    cfg_low.field.fallback_to_knn_on_low_trust = false;
-    let out_bypass = DtscReadoutOperator
-        .execute(
-            &ctx,
-            &cfg_low,
-            DtscReadoutInput {
-                field: &field,
-                candidates: pool_cov.view(),
-                graph: graph.view(),
-                tag_vectors: tv_cov,
-                original_query: &q,
-                enhanced_query: &q,
-                geometry: DtscGeometryState::default(),
-            },
-        )
-        .unwrap();
-    assert!(!out_bypass.fallback_used);
-    assert_eq!(out_bypass.fallback_reason, None);
-    // Sorted descending by score on non-fallback.
-    assert!(out_bypass.results[0].score >= out_bypass.results[1].score);
+    let flag = AtomicBool::new(false);
+    let ctx = ExecutionContext {
+        cancel: CancellationToken::from_atomic(&flag),
+        ..Default::default()
+    };
+    flag.store(true, Ordering::Relaxed);
+    let cancelled = DtscReadoutOperator.execute(
+        &ctx,
+        &config,
+        DtscReadoutInput {
+            evidence: &evidence,
+        },
+    );
+    assert!(matches!(cancelled, Err(VcpError::Cancelled { .. })));
+}
+
+#[test]
+fn config_deserialization_and_validation_follow_stage_ownership() {
+    let config: DtscConfig = serde_json::from_value(serde_json::json!({
+        "field": {"min_field_entropy": 0.5},
+        "scoring": {"evidence": {"reward": {"alpha": 0.2}}, "readout": {"top_k": 7}}
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.field.min_field_entropy, 0.5);
+    assert_eq!(config.scoring.evidence.reward.alpha, 0.2);
+    assert_eq!(config.scoring.readout.top_k, 7);
+    assert!(serde_json::from_value::<DtscConfig>(serde_json::json!({"top_k": 7})).is_err());
+    let mut invalid_evidence = config.scoring.evidence;
+    invalid_evidence.curve.weak_contact_threshold = 0.9;
+    assert!(matches!(
+        invalid_evidence.validate(),
+        Err(VcpError::InvalidInput { .. })
+    ));
+    let mut invalid_readout = config.scoring.readout;
+    invalid_readout.trust.min_strong_evidence = f64::NAN;
+    assert!(matches!(
+        invalid_readout.validate(),
+        Err(VcpError::InvalidInput { .. })
+    ));
 }
 
 #[cfg(feature = "schemars")]
 #[test]
-fn schemars_generates_dtsc_config_schema() {
-    let schema = schemars::schema_for!(DtscConfig);
-    assert!(schema.as_object().is_some());
+fn config_schema_describes_scoring_inputs() {
+    let schema = serde_json::to_value(schemars::schema_for!(DtscConfig)).unwrap();
+    let scoring = &schema["$defs"]["DtscScoringConfig"]["properties"];
+    assert!(scoring.get("evidence").is_some() && scoring.get("readout").is_some());
 }
 
-fn fixture_matrix(input: &serde_json::Value, dim: usize) -> Vec<f32> {
+fn fixture_matrix(input: &Value, dim: usize) -> Vec<f32> {
     let rows: Vec<(usize, Vec<f32>)> =
         serde_json::from_value(input["tag_vectors"].clone()).unwrap();
     let count = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
@@ -996,7 +532,7 @@ fn fixture_matrix(input: &serde_json::Value, dim: usize) -> Vec<f32> {
     values
 }
 
-fn fixture_nodes(input: &serde_json::Value) -> Vec<DtscNodeInput> {
+fn fixture_nodes(input: &Value) -> Vec<DtscNodeInput> {
     input["nodes"]
         .as_array()
         .unwrap()
@@ -1005,12 +541,12 @@ fn fixture_nodes(input: &serde_json::Value) -> Vec<DtscNodeInput> {
             node: NodeId((node["id"].as_u64().unwrap() - 1) as u32),
             energy: node["energy"].as_f64().unwrap(),
             normalized_energy: node["normalizedEnergy"].as_f64().unwrap(),
-            source_type: node["sourceType"].as_str().unwrap().into(),
+            source_type: serde_json::from_value(node["sourceType"].clone()).unwrap(),
         })
         .collect()
 }
 
-fn fixture_weights(input: &serde_json::Value, field: &str, count: usize, default: f64) -> Vec<f64> {
+fn fixture_weights(input: &Value, field: &str, count: usize, default: f64) -> Vec<f64> {
     let mut values = vec![default; count];
     for (id, mass) in serde_json::from_value::<Vec<(usize, f64)>>(input[field].clone()).unwrap() {
         values[id - 1] = mass;
@@ -1019,8 +555,7 @@ fn fixture_weights(input: &serde_json::Value, field: &str, count: usize, default
 }
 
 #[track_caller]
-fn close_to_corpus(label: &str, actual: f64, expected: &serde_json::Value) {
-    let expected = expected.as_f64().unwrap();
+fn close(label: &str, actual: f64, expected: f64) {
     assert!(
         (actual - expected).abs() < 1e-12,
         "{label}: {actual} != {expected}"
@@ -1029,110 +564,131 @@ fn close_to_corpus(label: &str, actual: f64, expected: &serde_json::Value) {
 
 #[test]
 fn nous_wave_field_corpus() {
-    let fixture: serde_json::Value =
+    let fixture: Value =
         serde_json::from_str(include_str!("fixtures/vcp-dtsc-field.json")).unwrap();
-    assert_eq!(
-        fixture["source"]["commit"],
-        "e03b891d42055cdf3cab5dc961cc71dd5facd65a"
-    );
     for case in fixture["cases"].as_array().unwrap() {
         let input = &case["input"];
         let expected = &case["expected"];
         let dim = input["dimension"].as_u64().unwrap() as usize;
         let data = fixture_matrix(input, dim);
-        let matrix = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
-        let inbound = fixture_weights(input, "inbound", matrix.rows, 0.0);
+        let tags = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
+        let inbound = fixture_weights(input, "inbound", tags.rows, 0.0);
         let custom = &input["config"];
         let config = DtscFieldConfig {
             min_field_tags: custom["minFieldTags"].as_u64().unwrap_or(3) as usize,
             max_field_nodes: custom["maxFieldNodes"].as_u64().unwrap_or(48) as usize,
             field_energy_mass_ratio: custom["fieldEnergyMassRatio"].as_f64().unwrap_or(0.95),
-            ..DtscFieldConfig::default()
+            ..Default::default()
         };
-        let field = build_test_field(&fixture_nodes(input), matrix, &config);
-        close_to_corpus(
+        let field = build_field(&fixture_nodes(input), tags, &config);
+        close(
             "field entropy",
-            field.field_entropy,
-            &expected["fieldEntropy"],
+            field.field_entropy(),
+            expected["fieldEntropy"].as_f64().unwrap(),
         );
-        close_to_corpus("total energy", field.total_energy, &expected["totalEnergy"]);
-        assert_eq!(
-            field.field_trusted,
-            expected["fieldTrusted"].as_bool().unwrap()
+        close(
+            "total energy",
+            field.total_energy(),
+            expected["totalEnergy"].as_f64().unwrap(),
         );
         let retained = expected["fieldNodes"].as_array().unwrap();
-        assert_eq!(field.field_nodes.len(), retained.len());
-        for (node, expected) in field.field_nodes.iter().zip(retained) {
+        assert_eq!(field.field_nodes().len(), retained.len());
+        for (node, expected) in field.field_nodes().iter().zip(retained) {
             assert_eq!(u64::from(node.node.0) + 1, expected["id"].as_u64().unwrap());
-            close_to_corpus("retained potential", node.potential, &expected["potential"]);
+            close(
+                "retained potential",
+                node.potential,
+                expected["potential"].as_f64().unwrap(),
+            );
         }
-        let sampler = nexus_math::DtscFieldSampler::new(&field, &inbound, &config);
+        let sampler = DtscFieldSampler::new(&field, &inbound);
         let targets: Vec<(u32, Vec<f32>)> =
             serde_json::from_value(input["sample_tags"].clone()).unwrap();
-        for ((id, vector), expected) in targets
-            .into_iter()
-            .zip(expected["samples"].as_array().unwrap())
+        for ((id, vector), expected) in targets.iter().zip(expected["samples"].as_array().unwrap())
         {
-            let result = sampler.sample(NodeId(id - 1), &vector);
-            close_to_corpus("sample potential", result.potential, &expected["potential"]);
+            let result = sampler.sample(NodeId(id - 1), vector);
+            close(
+                "sample potential",
+                result.potential,
+                expected["potential"].as_f64().unwrap(),
+            );
             assert_eq!(result.exact, expected["exact"].as_bool().unwrap());
             assert_eq!(
-                result.source_type.as_str(),
-                expected["sourceType"].as_str().unwrap()
+                result.source_type,
+                serde_json::from_value::<DtscSourceType>(expected["sourceType"].clone()).unwrap()
             );
+        }
+        let graph = empty_graph(tags.rows);
+        let empty = CandidateRows::new(dim, &[]);
+        let zero = vec![0.0; dim];
+        let query = QueryCosines::prepare(&ExecutionContext::default(), empty.view(), &zero, &zero)
+            .unwrap();
+        let raw = evidence(
+            &field,
+            &query,
+            graph.view(),
+            tags,
+            &DtscEvidenceConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            readout(&raw, &DtscReadoutConfig::default()).field_trusted,
+            expected["fieldTrusted"].as_bool().unwrap()
+        );
+        if expected["fieldTrusted"] == false {
+            let permissive = DtscReadoutConfig {
+                fallback_on_low_trust: false,
+                ..Default::default()
+            };
+            assert!(readout(&raw, &permissive).field_trusted);
         }
     }
 }
 
 #[test]
 fn nous_wave_curve_and_fallback_corpus() {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/vcp-dtsc.json")).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/vcp-dtsc.json")).unwrap();
     let ctx = ExecutionContext::default();
     for case in fixture["cases"].as_array().unwrap() {
         let input = &case["input"];
         let dim = input["dimension"].as_u64().unwrap() as usize;
         if dim == 0 {
-            let matrix = VectorMatrixView::empty(0);
-            let field = DtscField::default();
-            let graph = OwnedGraph::from_edges(0, &[], vec![], vec![]);
-            let candidates = OwnedPool::from_candidates(0, &[]);
-            let result = DtscReadoutOperator.execute(
-                &ctx,
-                &DtscConfig::default(),
-                DtscReadoutInput {
-                    field: &field,
-                    candidates: candidates.view(),
-                    graph: graph.view(),
-                    tag_vectors: matrix,
-                    original_query: &[],
-                    enhanced_query: &[],
-                    geometry: DtscGeometryState::default(),
-                },
+            let tags = VectorMatrixView::empty(0);
+            let field = build_field(&[], tags, &DtscFieldConfig::default());
+            let graph = empty_graph(0);
+            let rows = CandidateRows::new(0, &[]);
+            let query = QueryCosines::prepare(&ctx, rows.view(), &[], &[]).unwrap();
+            let result = evidence(
+                &field,
+                &query,
+                graph.view(),
+                tags,
+                &DtscEvidenceConfig::default(),
             );
             assert!(matches!(result, Err(VcpError::InvalidInput { .. })));
             continue;
         }
+
         let data = fixture_matrix(input, dim);
-        let matrix = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
+        let tags = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
         let edges: Vec<(usize, usize, f64)> =
             serde_json::from_value(input["edges"].clone()).unwrap();
         let edges: Vec<_> = edges
             .into_iter()
-            .map(|(a, b, w)| (a - 1, b - 1, w))
+            .map(|(a, b, weight)| (a - 1, b - 1, weight))
             .collect();
-        let graph = OwnedGraph::from_edges(
-            matrix.rows,
+        let graph = graph(
+            tags.rows,
             &edges,
-            fixture_weights(input, "inbound", matrix.rows, 0.0),
-            fixture_weights(input, "anchor_gain", matrix.rows, 1.0),
+            fixture_weights(input, "inbound", tags.rows, 0.0),
+            fixture_weights(input, "anchor_gain", tags.rows, 1.0),
         );
         let candidates = input["candidates"].as_array().unwrap();
         let specs: Vec<_> = candidates
             .iter()
             .map(|candidate| {
                 let curve = &candidate["curve"];
-                let tags = curve["tags"]
+                let steps = curve["tags"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1144,65 +700,78 @@ fn nous_wave_curve_and_fallback_corpus() {
                     })
                     .collect();
                 (
-                    candidate["score"].as_f64().unwrap(),
                     serde_json::from_value(curve["chunk_vector"].clone()).unwrap(),
-                    vec![tags],
+                    vec![steps],
                 )
             })
             .collect();
-        let pool = OwnedPool::from_candidates(dim, &specs);
-        let query: Vec<f32> = serde_json::from_value(input["original_vector"].clone()).unwrap();
+        let rows = CandidateRows::new(dim, &specs);
+        let original: Vec<f32> = serde_json::from_value(input["original_vector"].clone()).unwrap();
         let enhanced: Vec<f32> = serde_json::from_value(input["enhanced_vector"].clone()).unwrap();
-        let config = DtscConfig {
-            top_k: input["top_k"].as_u64().unwrap() as usize,
-            ..Default::default()
-        };
-        let field = build_test_field(&fixture_nodes(input), matrix, &config.field);
-        let actual = DtscReadoutOperator
-            .execute(
-                &ctx,
-                &config,
-                DtscReadoutInput {
-                    graph: graph.view(),
-                    field: &field,
-                    candidates: pool.view(),
-                    tag_vectors: matrix,
-                    original_query: &query,
-                    enhanced_query: &enhanced,
-                    geometry: DtscGeometryState::default(),
-                },
-            )
-            .unwrap();
+        let query = QueryCosines::prepare(&ctx, rows.view(), &original, &enhanced).unwrap();
+        let field = build_field(&fixture_nodes(input), tags, &DtscFieldConfig::default());
+        let raw = evidence(
+            &field,
+            &query,
+            graph.view(),
+            tags,
+            &DtscEvidenceConfig::default(),
+        )
+        .unwrap();
+        let top_k = input["top_k"].as_u64().unwrap() as usize;
+        let actual = readout(
+            &raw,
+            &DtscReadoutConfig {
+                top_k,
+                ..Default::default()
+            },
+        );
         let expected = &case["expected"];
         let diagnostics = &expected["diagnostics"];
-        let results = expected["results"].as_array().unwrap();
-        assert_eq!(actual.results.len(), results.len());
         assert_eq!(
             actual.fallback_reason,
             diagnostics["fallbackReason"].as_str()
         );
-        assert_eq!(
-            actual.field_trusted,
-            diagnostics["fieldTrusted"].as_bool().unwrap()
-        );
-        close_to_corpus(
+        let trusted = diagnostics["fieldTrusted"].as_bool().unwrap();
+        assert_eq!(actual.field_trusted, trusted);
+        close(
             "curve field entropy",
             actual.field_entropy,
-            &diagnostics["fieldEntropy"],
+            diagnostics["fieldEntropy"].as_f64().unwrap(),
         );
-        for (row, expected) in actual.results.iter().zip(results) {
-            assert_eq!(
-                candidates[row.candidate.index()]["curve"]["id"],
-                expected["id"]
-            );
+
+        // Apply the new base score to the captured geometric rewards, indexed by the captured ID.
+        let captured = expected["results"].as_array().unwrap();
+        let mut expected_scores = Vec::new();
+        for (i, candidate) in candidates.iter().enumerate() {
+            let expected = captured
+                .iter()
+                .find(|row| row["id"] == candidate["curve"]["id"])
+                .unwrap();
+            let cosine = dtsc_cosine(&specs[i].0, &original);
+            let bonus = expected["geoBonus"].as_f64().unwrap();
+            expected_scores.push((CandidateId(i as u32), cosine, cosine + bonus, expected));
+        }
+        if !diagnostics["fallbackUsed"].as_bool().unwrap() {
+            expected_scores.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| b.1.total_cmp(&a.1)));
+        }
+        if top_k != 0 {
+            expected_scores.truncate(top_k);
+        }
+        assert_eq!(actual.results.len(), expected_scores.len());
+        for (item, (candidate, cosine, score, expected)) in
+            actual.results.iter().zip(expected_scores)
+        {
+            assert_eq!(item.candidate, candidate);
+            close("original cosine", item.original_cosine, cosine);
+            close("score", item.score, score);
             for (label, value) in [
-                ("score", row.score),
-                ("geoScore", row.geo_score),
-                ("geoBonus", row.geo_bonus),
-                ("geoConfidence", row.geo_confidence),
-                ("geoIsolatedRatio", row.geo_isolated_ratio),
+                ("geoScore", item.geo_score),
+                ("geoBonus", item.geo_bonus),
+                ("geoConfidence", item.geo_confidence),
+                ("geoIsolatedRatio", item.geo_isolated_ratio),
             ] {
-                close_to_corpus(label, value, &expected[label]);
+                close(label, value, expected[label].as_f64().unwrap());
             }
         }
     }

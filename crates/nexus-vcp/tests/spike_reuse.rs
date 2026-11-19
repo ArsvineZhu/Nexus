@@ -17,18 +17,21 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         dynamic_wormhole_slots: 1,
         ..Default::default()
     };
-    let graph = CsrGraphView::new(CsrParts {
-        node_count: 3,
-        row_offsets: &[0, 2, 2, 3],
-        targets: &[NodeId(1), NodeId(2), NodeId(0)],
-        weights: &[0.65, 0.3, 0.85],
-        is_static_wormhole: &[false; 3],
-        inbound: &[0.85, 0.65, 0.3],
-        max_inbound: 0.85,
-        anchor_gains: &[0.0; 3],
-        target_sorted_indices: None,
-        edge_gates: None,
-    })
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            node_count: 3,
+            row_offsets: &[0, 2, 2, 3],
+            targets: &[NodeId(1), NodeId(2), NodeId(0)],
+            weights: &[0.65, 0.3, 0.85],
+            is_static_wormhole: &[false; 3],
+            inbound: &[0.85, 0.65, 0.3],
+            max_inbound: 0.85,
+            anchor_gains: &[0.0; 3],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap(),
+    )
     .unwrap();
     let tag_vectors = VectorMatrixView::new(&[1., 0., 1., 0., 0., 1.], 3, 2).unwrap();
     let seeds = GatedSeeds {

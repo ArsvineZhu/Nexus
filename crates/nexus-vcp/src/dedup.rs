@@ -29,9 +29,9 @@ impl Default for CosineDedupConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct CosineDedupInput<'asset, 'query> {
-    pub ranked: &'query [CandidateId],
-    pub candidate_vectors: VectorMatrixView<'asset, f32>,
+pub struct CosineDedupInput<'call> {
+    pub ranked: &'call [CandidateId],
+    pub candidate_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ pub struct CosineDedupOperator;
 
 impl Operator for CosineDedupOperator {
     type Config = CosineDedupConfig;
-    type Input<'asset, 'query> = CosineDedupInput<'asset, 'query>;
+    type Input<'call> = CosineDedupInput<'call>;
     type Output = DedupResult;
 
     fn name(&self) -> &'static str {
@@ -110,7 +110,7 @@ impl Operator for CosineDedupOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         let mut suffix = Vec::new();

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{FusedObservation, invalid, numeric_failure};
+use super::{invalid, numeric_failure};
 use nexus_core::kernel::{csr_spmv_dual, relax_field};
-use nexus_core::{CsrGraphView, ExecutionContext, NodeId, Operator, VcpResult};
+use nexus_core::{ExecutionContext, NodeId, Operator, TransportGraphView, VcpResult};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -33,9 +33,9 @@ impl Default for DualFieldConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DualFieldSolveInput<'asset, 'query> {
-    pub graph: CsrGraphView<'asset>,
-    pub fused: &'query FusedObservation,
+pub struct DualFieldSolveInput<'call> {
+    pub graph: TransportGraphView<'call>,
+    pub source_field: &'call [(NodeId, f64)],
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -77,7 +77,7 @@ pub struct DualFieldSolveOperator;
 
 impl Operator for DualFieldSolveOperator {
     type Config = DualFieldConfig;
-    type Input<'asset, 'query> = DualFieldSolveInput<'asset, 'query>;
+    type Input<'call> = DualFieldSolveInput<'call>;
     type Output = DualFields;
 
     fn name(&self) -> &'static str {
@@ -88,7 +88,7 @@ impl Operator for DualFieldSolveOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -109,7 +109,7 @@ impl Operator for DualFieldSolveOperator {
         let n = input.graph.node_count;
         let mut source_buffer = vec![0.0; n];
         let source = source_buffer.as_mut_slice();
-        for &(node, mass) in &input.fused.source_field {
+        for &(node, mass) in input.source_field {
             if node.index() >= n || !mass.is_finite() || mass < 0.0 {
                 return Err(invalid(stage, "source field node or mass is invalid"));
             }
@@ -147,7 +147,7 @@ impl Operator for DualFieldSolveOperator {
         for iteration in 0..=config.max_iterations {
             ctx.check_cancelled(stage)?;
             csr_spmv_dual(
-                &input.graph,
+                &input.graph.as_csr(),
                 &local,
                 &transfer,
                 propagated_local,

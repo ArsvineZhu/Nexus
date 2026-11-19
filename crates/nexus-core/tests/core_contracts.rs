@@ -1151,3 +1151,145 @@ fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
     assert!(sol_exact.residual_norm.is_finite());
     assert!(sol_exact.max_kkt_violation <= CHECK_TOL);
 }
+
+#[test]
+fn transport_checks_the_actual_gated_row_mass() {
+    use nexus_core::{TransportGraph, TransportGraphView};
+    let graph = |weights| {
+        CsrGraphView::new(CsrParts {
+            node_count: 2,
+            row_offsets: &[0, 1, 2],
+            targets: &[NodeId(1), NodeId(0)],
+            weights,
+            is_static_wormhole: &[false, false],
+            inbound: &[0.0, 0.0],
+            max_inbound: 0.0,
+            anchor_gains: &[1.0, 1.0],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap()
+    };
+    let too_large = [2.0, 2.0];
+    let general = graph(&too_large);
+    let error = TransportGraphView::new(general).unwrap_err();
+    assert!(matches!(
+        error,
+        VcpError::InvalidInput {
+            stage: "transport.prepare",
+            ..
+        }
+    ));
+    let gated = TransportGraphView::new(general.with_edge_gates(&[0.4, 0.4]).unwrap()).unwrap();
+    assert_eq!(gated.effective_weight(0), 0.8);
+    assert!(gated.with_edge_gates(&[1.0, 1.0]).is_err());
+    assert!(TransportGraphView::new(graph(&[1.0, 1.0])).is_ok());
+    assert!(TransportGraphView::new(graph(&[f64::from_bits(1.0_f64.to_bits() + 1), 1.0])).is_err());
+
+    let storage = nexus_core::CsrStorage {
+        node_count: 2,
+        row_offsets: vec![0, 1, 2],
+        targets: vec![NodeId(1), NodeId(0)],
+        weights: vec![0.9, 0.9],
+        is_static_wormhole: vec![false, false],
+        inbound: vec![0.9, 0.9],
+        max_inbound: 0.9,
+        anchor_gains: vec![1.0, 1.0],
+        target_sorted_indices: None,
+    };
+    let checked = TransportGraph::new(nexus_core::CsrGraph::new(storage).unwrap()).unwrap();
+    assert_eq!(checked.view().effective_weight(0), 0.9);
+}
+
+#[test]
+fn shared_cosines_use_actual_row_sources_and_strict_norms() -> nexus_core::VcpResult<()> {
+    use nexus_core::{CandidateRowsView, DocumentId, ExecutionContext, QueryCosines};
+    let matrix = [2.0, 0.0, 0.0, 3.0];
+    let rows = CandidateRowsView {
+        candidate_count: 2,
+        candidate_vectors: VectorMatrixView::new(&matrix, 2, 2)?.with_sq_norms(&[9., 4.])?,
+        document_ids: &[DocumentId(0), DocumentId(1)],
+        candidate_root_offsets: &[0, 0, 0],
+        candidate_roots: &[],
+        candidate_path_offsets: &[0, 0, 0],
+        path_tag_offsets: &[0],
+        path_tags: &[],
+        path_positions: &[],
+    };
+    let ctx = ExecutionContext::default();
+    let original = [1.0, 0.0];
+    let prior = QueryCosines::prepare(&ctx, rows, &original, &[1., 0.])?;
+    let reused = QueryCosines::reuse_original(&ctx, &prior, rows, &original, &[0., 1.])?;
+    assert!(std::ptr::eq(
+        prior.original_cosines(),
+        reused.original_cosines()
+    ));
+    assert!(std::ptr::eq(
+        prior.rows().candidate_vectors.sq_norms_f64.unwrap(),
+        reused.rows().candidate_vectors.sq_norms_f64.unwrap()
+    ));
+    assert_eq!(reused.original_cosines(), &[1., 0.]);
+    assert_eq!(reused.enhanced_cosines(), &[0., 1.]);
+    assert_eq!(
+        reused.rows().candidate_vectors.sq_norms_f64,
+        Some(&[4., 9.][..])
+    );
+    let reordered = [0., 3., 2., 0.];
+    let reordered = CandidateRowsView {
+        candidate_vectors: VectorMatrixView::new(&reordered, 2, 2)?,
+        ..rows
+    };
+    assert!(QueryCosines::reuse_original(&ctx, &prior, reordered, &original, &[0., 1.]).is_err());
+    Ok(())
+}
+
+#[test]
+fn plan_prunes_steps_shares_results_and_releases_after_last_use() -> nexus_core::VcpResult<()> {
+    use nexus_core::{ExecutionContext, Plan};
+    use std::sync::atomic::Ordering;
+    let dropped = std::sync::Arc::new(AtomicBool::new(false));
+    struct OwnedTracked(std::sync::Arc<AtomicBool>);
+    impl Drop for OwnedTracked {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let ctx = ExecutionContext::default();
+    let mut plan = Plan::new();
+    let shared = plan.add((), |_, _| Ok(OwnedTracked(dropped.clone())))?;
+    let never = plan.add((), |_, _| -> nexus_core::VcpResult<()> {
+        panic!("unused branch ran")
+    })?;
+    let first = plan.add(shared, |_, input| {
+        assert!(!input.get().0.load(Ordering::Relaxed));
+        Ok(4)
+    })?;
+    let second = plan.add(shared, |_, input| {
+        assert!(!input.get().0.load(Ordering::Relaxed));
+        Ok(5)
+    })?;
+    let end = plan.add((first, second), |_, input| {
+        assert!(dropped.load(Ordering::Relaxed));
+        let (a, b) = input.get();
+        Ok(a + b)
+    })?;
+    let result = plan.run(end, &ctx)?;
+    assert_eq!(*result.get(end)?, 9);
+    assert!(result.get(never).is_err());
+    let mut unrelated = Plan::new();
+    assert!(unrelated.add(shared, |_, _| Ok(())).is_err());
+
+    let stop = AtomicBool::new(true);
+    let stopped = ExecutionContext {
+        cancel: CancellationToken::from_atomic(&stop),
+        ..ctx
+    };
+    let output = unrelated.add((), |_, _| -> nexus_core::VcpResult<()> {
+        panic!("cancelled branch ran")
+    })?;
+    assert!(matches!(
+        unrelated.run(output, &stopped),
+        Err(VcpError::Cancelled { stage: "plan" })
+    ));
+    Ok(())
+}

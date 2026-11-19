@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{finite_vector, invalid};
+use super::{invalid, unit_direction};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f32, norm_sq_f64};
 use nexus_core::nnls::solve_nnls_with_ids_f64;
-use nexus_core::{EpaBasisView, ExecutionContext, NodeId, Operator, VcpResult, VectorMatrixView};
+use nexus_core::{
+    EpaBasisView, ExecutionContext, NodeId, Operator, PrecisionMode, VcpResult, VectorMatrixView,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -24,9 +26,9 @@ pub struct EpaConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct EpaAnalyzeInput<'asset> {
-    pub query: &'asset [f32],
-    pub basis: Option<EpaBasisView<'asset>>,
+pub struct EpaAnalyzeInput<'call> {
+    pub query: &'call [f32],
+    pub basis: Option<EpaBasisView<'call>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -47,7 +49,7 @@ pub struct EpaBridge {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EpaAnalysis {
-    pub logic_depth: f64,
+    pub spectral_concentration: f64,
     pub entropy: f64,
     pub resonance: f64,
     pub dominant_axes: Vec<EpaAxis>,
@@ -64,7 +66,7 @@ pub struct EpaAnalysis {
 impl Default for EpaAnalysis {
     fn default() -> Self {
         Self {
-            logic_depth: 0.5,
+            spectral_concentration: 0.5,
             entropy: 0.5,
             resonance: 0.0,
             dominant_axes: Vec::new(),
@@ -84,7 +86,7 @@ pub struct EpaAnalyzeOperator;
 
 impl Operator for EpaAnalyzeOperator {
     type Config = EpaConfig;
-    type Input<'asset, 'query> = EpaAnalyzeInput<'asset>;
+    type Input<'call> = EpaAnalyzeInput<'call>;
     type Output = EpaAnalysis;
 
     fn name(&self) -> &'static str {
@@ -95,23 +97,27 @@ impl Operator for EpaAnalyzeOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
-        finite_vector(stage, input.query, input.query.len())?;
-        let Some(basis) = input.basis.filter(|basis| !basis.is_empty()) else {
+        let basis = input.basis.filter(|basis| !basis.is_empty());
+        unit_direction(
+            stage,
+            input.query,
+            basis.map_or(input.query.len(), |basis| basis.dim),
+        )?;
+        let Some(basis) = basis else {
             return Ok(EpaAnalysis::default());
         };
         basis.validate(stage)?;
-        finite_vector(stage, input.query, basis.dim)?;
         let mut centered_buffer = vec![0.0; basis.dim];
         let centered = centered_buffer.as_mut_slice();
         for ((slot, &value), &mean) in centered.iter_mut().zip(input.query).zip(basis.mean) {
             *slot = f64::from(value) - mean;
         }
         let count = basis.k_sem.max(1).min(basis.basis_count);
-        let mode = ctx.precision;
+        let mode = PrecisionMode::FastSimd;
         let centered_energy = norm_sq_f64(centered, mode);
         let mut semantic = Vec::with_capacity(count);
         let mut captured = 0.0;
@@ -194,7 +200,7 @@ impl Operator for EpaAnalyzeOperator {
             }
         }
         Ok(EpaAnalysis {
-            logic_depth: (1.0 - entropy) * gate,
+            spectral_concentration: (1.0 - entropy) * gate,
             entropy,
             resonance: bridges.iter().map(|bridge| bridge.strength).sum(),
             dominant_axes,
@@ -216,14 +222,7 @@ impl Operator for EpaAnalyzeOperator {
 
 /// The host fills up to `limit` graph-local candidates for the current residual.
 /// The buffer starts empty and its capacity is reused across layers.
-pub type PyramidCandidates<'a> = dyn Fn(
-        usize,
-        &[f32],
-        usize,
-        &mut Vec<(NodeId, f64)>,
-        Option<&EpaAnalysis>,
-        &[NodeId],
-    ) -> VcpResult<()>
+pub type PyramidCandidates<'a> = dyn Fn(usize, &[f32], usize, &mut Vec<NodeId>, Option<&EpaAnalysis>, &[NodeId]) -> VcpResult<()>
     + 'a;
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -252,11 +251,11 @@ impl Default for PyramidConfig {
 }
 
 #[derive(Clone, Copy)]
-pub struct PyramidAnalyzeInput<'asset, 'query> {
-    pub query: &'asset [f32],
-    pub candidates: &'asset PyramidCandidates<'asset>,
-    pub epa: Option<&'query EpaAnalysis>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
+pub struct PyramidAnalyzeInput<'call> {
+    pub query: &'call [f32],
+    pub candidates: &'call PyramidCandidates<'call>,
+    pub epa: Option<&'call EpaAnalysis>,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -302,7 +301,6 @@ fn handshakes(
     query: &[f32],
     tags: &mut [PyramidTagEntry],
     vectors: VectorMatrixView<'_>,
-    ctx: &ExecutionContext<'_>,
 ) -> HandshakeFeatures {
     let mut directions = Vec::with_capacity(tags.len().min(5));
     let mut average = vec![0.0; query.len()];
@@ -315,7 +313,7 @@ fn handshakes(
         for ((out, &q), &v) in direction.iter_mut().zip(query).zip(vector) {
             *out = f64::from(q) - f64::from(v);
         }
-        let distance = norm_sq_f64(&direction, ctx.precision).sqrt();
+        let distance = norm_sq_f64(&direction, PrecisionMode::FastSimd).sqrt();
         tag.handshake_magnitude = distance;
         if distance > 1e-9 {
             for (sum, value) in average.iter_mut().zip(&mut direction) {
@@ -327,12 +325,13 @@ fn handshakes(
             directions.push(direction.clone());
         }
     }
-    let coherence = (norm_sq_f64(&average, ctx.precision).sqrt() / count as f64).clamp(0.0, 1.0);
+    let coherence =
+        (norm_sq_f64(&average, PrecisionMode::FastSimd).sqrt() / count as f64).clamp(0.0, 1.0);
     let mut pair_sum = 0.0;
     let mut pairs = 0;
     for (index, left) in directions.iter().enumerate() {
         for right in &directions[index + 1..] {
-            pair_sum += dot_f64(left, right, ctx.precision).abs();
+            pair_sum += dot_f64(left, right, PrecisionMode::FastSimd).abs();
             pairs += 1;
         }
     }
@@ -349,7 +348,7 @@ pub struct PyramidAnalyzeOperator;
 
 impl Operator for PyramidAnalyzeOperator {
     type Config = PyramidConfig;
-    type Input<'asset, 'query> = PyramidAnalyzeInput<'asset, 'query>;
+    type Input<'call> = PyramidAnalyzeInput<'call>;
     type Output = PyramidResidual;
 
     fn name(&self) -> &'static str {
@@ -360,12 +359,12 @@ impl Operator for PyramidAnalyzeOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         input.tag_vectors.validate(stage)?;
-        finite_vector(stage, input.query, input.tag_vectors.dim)?;
+        unit_direction(stage, input.query, input.tag_vectors.dim)?;
         if ![
             config.min_energy_ratio,
             config.min_layer_explained_energy,
@@ -383,7 +382,7 @@ impl Operator for PyramidAnalyzeOperator {
             novelty: 1.0,
             ..PyramidResidual::default()
         };
-        let precision = ctx.precision;
+        let precision = PrecisionMode::FastSimd;
         let original_energy = norm_sq_f32(input.query, precision);
         let limit = config.pyramid_top_k.min(ctx.limits.nnls_max_columns);
         if original_energy <= 1e-12 || limit == 0 {
@@ -417,16 +416,13 @@ impl Operator for PyramidAnalyzeOperator {
             seen.clear();
             let mut tags = Vec::with_capacity(candidates.len());
             columns.clear();
-            for &(node, score) in &candidates {
+            for &node in &candidates {
                 let vector = input.tag_vectors.row(node.index()).ok_or_else(|| {
                     invalid(
                         stage,
                         "candidate provider returned a node outside the graph",
                     )
                 })?;
-                if !score.is_finite() {
-                    return Err(invalid(stage, "candidate score must be finite"));
-                }
                 if seen.insert(node) {
                     tags.push(PyramidTagEntry {
                         node,
@@ -457,7 +453,7 @@ impl Operator for PyramidAnalyzeOperator {
                 tag.contribution = weight;
             }
             excluded.extend(tags.iter().map(|tag| tag.node));
-            let handshake = handshakes(&residual, &mut tags, input.tag_vectors, ctx);
+            let handshake = handshakes(&residual, &mut tags, input.tag_vectors);
             output.total_explained_energy += explained;
             output.levels.push(PyramidLevel {
                 level,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
+use nexus_core::kernel::{norm_sq_f32, normalize_direction};
 use nexus_core::*;
-use nexus_vcp::hyperbolic::{ChunkField, WarpedConfig, WarpedIndex, tag_field};
 use nexus_vcp::*;
 use std::collections::{BTreeSet, HashMap};
 
@@ -23,6 +23,7 @@ pub struct Concept {
 
 pub struct Document {
     pub id: u64,
+    pub document_id: Option<u64>,
     pub vector: Vec<f32>,
     pub paths: Vec<Sequence>,
 }
@@ -72,14 +73,13 @@ pub struct AssetConfig {
     pub facts: FactMatrixConfig,
     pub transport: TransportConfig,
     pub provenance: ProvenanceConfig,
-    pub chunk_geometry: WarpedConfig,
-    pub tag_geometry: WarpedConfig,
 }
 
-/// Long-lived document rows in the same slot space as the supplied Chunk field.
+/// Long-lived candidate rows and their document, path and source facts.
 #[derive(Clone, Copy)]
 pub struct Catalog<'a> {
     pub ids: &'a [u64],
+    pub document_ids: Option<&'a [u64]>,
     pub vectors: VectorMatrixView<'a>,
     pub root_offsets: &'a [u32],
     pub roots: &'a [RootId],
@@ -87,23 +87,22 @@ pub struct Catalog<'a> {
     pub tag_offsets: &'a [u32],
     pub tags: &'a [NodeId],
     pub positions: &'a [u32],
-    pub chunks: &'a ChunkField,
 }
 
 /// Borrowed assets. The caller can share them across multiple threads and queries.
 #[derive(Clone, Copy)]
 pub struct PreparedDataset<'a> {
-    /// External concept IDs in vector row order. An empty slice uses dense slots.
+    /// External concept IDs in vector row order.
     pub concept_ids: &'a [u64],
+    pub source_ids: &'a [u64],
     pub tags: VectorMatrixView<'a>,
     pub lexical: TagLexicalMetaView<'a>,
-    pub graph: CsrGraphView<'a>,
+    pub graph: TransportGraphView<'a>,
     pub basis: Option<EpaBasisView<'a>>,
     pub provenance: ProvenanceView<'a>,
     pub groups: SupportGroupView<'a>,
     pub sources: RootFactView<'a>,
     pub counterevidence: CounterevidenceAdjView<'a>,
-    pub tag_search: Option<&'a WarpedIndex>,
     pub documents: Option<Catalog<'a>>,
 }
 
@@ -111,6 +110,7 @@ pub struct Nexus<'a> {
     assets: Assets<'a>,
     pub(crate) concept_slots: HashMap<u64, usize>,
     pub(crate) document_slots: HashMap<u64, usize>,
+    pub(crate) source_slots: HashMap<u64, usize>,
 }
 
 enum Assets<'a> {
@@ -128,6 +128,7 @@ struct OwnedDataset {
     graph: TransportGraph,
     basis: EpaBasis,
     provenance: ProvenanceData,
+    source_ids: Vec<u64>,
     source_checksums: Vec<u64>,
     source_tag_offsets: Vec<u32>,
     source_tags: Vec<NodeId>,
@@ -137,12 +138,13 @@ struct OwnedDataset {
     group_kinds: Vec<SupportKind>,
     group_roots: Vec<RootId>,
     counterevidence: CounterevidenceAdj,
-    tag_search: WarpedIndex,
+    tag_residuals: Vec<IntrinsicResidual>,
     documents: Option<OwnedCatalog>,
 }
 
 struct OwnedCatalog {
     ids: Vec<u64>,
+    document_ids: Vec<u64>,
     vectors: Vec<f32>,
     root_offsets: Vec<u32>,
     roots: Vec<RootId>,
@@ -150,15 +152,14 @@ struct OwnedCatalog {
     tag_offsets: Vec<u32>,
     tags: Vec<NodeId>,
     positions: Vec<u32>,
-    chunks: ChunkField,
 }
 
-fn push_offset(offsets: &mut Vec<u32>, len: usize) -> VcpResult<()> {
+pub(crate) fn push_offset(offsets: &mut Vec<u32>, len: usize) -> VcpResult<()> {
     offsets.push(u32::try_from(len).map_err(|_| invalid(STAGE, "asset offsets exceed u32"))?);
     Ok(())
 }
 
-fn ids(keys: impl IntoIterator<Item = u64>) -> VcpResult<HashMap<u64, usize>> {
+pub(crate) fn ids(keys: impl IntoIterator<Item = u64>) -> VcpResult<HashMap<u64, usize>> {
     let mut slots = HashMap::new();
     for (slot, key) in keys.into_iter().enumerate() {
         if slots.insert(key, slot).is_some() {
@@ -168,7 +169,7 @@ fn ids(keys: impl IntoIterator<Item = u64>) -> VcpResult<HashMap<u64, usize>> {
     Ok(slots)
 }
 
-fn slot(slots: &HashMap<u64, usize>, id: u64) -> VcpResult<usize> {
+pub(crate) fn slot(slots: &HashMap<u64, usize>, id: u64) -> VcpResult<usize> {
     slots
         .get(&id)
         .copied()
@@ -179,22 +180,41 @@ fn node(slots: &HashMap<u64, usize>, id: u64) -> VcpResult<NodeId> {
     NodeId::from_index(slot(slots, id)?, STAGE)
 }
 
-fn check_vector(vector: &[f32], dim: usize) -> VcpResult<()> {
-    if vector.len() != dim || !nexus_core::kernel::all_finite_f32(vector) {
-        return Err(invalid(
-            STAGE,
-            "each vector must be finite and match the dataset dimension",
-        ));
+pub(crate) fn validate_unit_matrix(
+    matrix: VectorMatrixView<'_>,
+    stage: &'static str,
+) -> VcpResult<()> {
+    matrix.validate(stage)?;
+    if matrix.dim == 0 {
+        return Err(invalid(stage, "unit matrix must have a positive dimension"));
+    }
+    for (index, row) in matrix.data.chunks_exact(matrix.dim).enumerate() {
+        let squared = norm_sq_f32(row, PrecisionMode::StrictLeftFold);
+        if !squared.is_finite() || (squared - 1.0).abs() > 1e-6 {
+            return Err(invalid(
+                stage,
+                format!("row {index} is not a finite unit direction (squared norm {squared})"),
+            ));
+        }
     }
     Ok(())
 }
 
-impl Nexus<'static> {
-    pub fn prepare(data: Dataset, config: &AssetConfig) -> VcpResult<Self> {
-        Self::prepare_with(data, config, &ExecutionContext::default())
-    }
+pub(crate) fn path_steps(
+    slots: &HashMap<u64, usize>,
+    path: &Sequence,
+) -> VcpResult<Vec<(u32, NodeId)>> {
+    let mut steps = path
+        .tags
+        .iter()
+        .map(|&(tag, position)| Ok((position, node(slots, tag)?)))
+        .collect::<VcpResult<Vec<_>>>()?;
+    steps.sort_by_key(|step| step.0);
+    Ok(steps)
+}
 
-    pub fn prepare_with(
+impl Nexus<'static> {
+    pub fn prepare(
         data: Dataset,
         config: &AssetConfig,
         ctx: &ExecutionContext<'_>,
@@ -211,19 +231,8 @@ impl Nexus<'static> {
         }
         let concept_slots = ids(data.concepts.iter().map(|tag| tag.id))?;
         let document_slots = ids(data.documents.iter().map(|doc| doc.id))?;
-        ids(data.sources.iter().map(|source| source.id))?;
-        let source_keys: BTreeSet<_> = data
-            .sources
-            .iter()
-            .map(|item| item.id)
-            .chain(
-                data.documents
-                    .iter()
-                    .flat_map(|doc| doc.paths.iter().map(|path| path.source)),
-            )
-            .chain(data.relations.iter().map(|relation| relation.source))
-            .collect();
-        let source_slots = ids(source_keys.iter().copied())?;
+        let source_ids: Vec<_> = data.sources.iter().map(|source| source.id).collect();
+        let source_slots = ids(source_ids.iter().copied())?;
         let root = |id| RootId::from_index(slot(&source_slots, id)?, STAGE);
 
         let mut concept_ids = Vec::new();
@@ -233,15 +242,15 @@ impl Nexus<'static> {
         let mut alias_offsets = vec![0];
         for concept in data.concepts {
             ctx.check_cancelled(STAGE)?;
-            check_vector(&concept.vector, dim)?;
+
             concept_ids.push(concept.id);
-            tags.extend(concept.vector);
+            tags.extend(normalize_direction(&concept.vector, dim, STAGE)?);
             names.push(concept.name);
             aliases.extend(concept.aliases);
             push_offset(&mut alias_offsets, aliases.len())?;
         }
         let tag_view = VectorMatrixView::new(&tags, concept_ids.len(), dim)?;
-        let count = source_keys.len();
+        let count = source_ids.len();
         let mut source_tags = vec![BTreeSet::new(); count];
         let mut source_checksums = vec![0; count];
         let mut required = vec![Vec::new(); count];
@@ -260,6 +269,7 @@ impl Nexus<'static> {
 
         let mut doc_ids = Vec::new();
         let mut doc_vectors = Vec::new();
+        let mut doc_document_ids = Vec::new();
         let mut root_offsets = vec![0];
         let mut doc_roots = Vec::new();
         let mut path_offsets = vec![0];
@@ -270,10 +280,11 @@ impl Nexus<'static> {
         let mut positions = Vec::new();
         for doc in data.documents {
             ctx.check_cancelled(STAGE)?;
-            check_vector(&doc.vector, dim)?;
+
             let document = DocumentId::from_index(doc_ids.len(), STAGE)?;
             doc_ids.push(doc.id);
-            doc_vectors.extend(doc.vector);
+            doc_document_ids.push(doc.document_id.unwrap_or(doc.id));
+            doc_vectors.extend(normalize_direction(&doc.vector, dim, STAGE)?);
             let mut roots = BTreeSet::new();
             for path in doc.paths {
                 let source = root(path.source)?;
@@ -281,13 +292,7 @@ impl Nexus<'static> {
                 roots.extend(required[source.index()].iter().copied());
                 seq_docs.push(document);
                 seq_roots.push(source);
-                let mut steps = path
-                    .tags
-                    .into_iter()
-                    .map(|(tag, position)| Ok((position, node(&concept_slots, tag)?)))
-                    .collect::<VcpResult<Vec<_>>>()?;
-                steps.sort_unstable();
-                for (position, tag) in steps {
+                for (position, tag) in path_steps(&concept_slots, &path)? {
                     seq_tags.push(tag);
                     positions.push(position);
                     source_tags[source.index()].insert(tag);
@@ -410,27 +415,19 @@ impl Nexus<'static> {
             ctx,
             &config.provenance,
             ProvenanceBuildInput {
-                transport_row_offsets: &graph.row_offsets,
-                transport_targets: &graph.targets,
+                transport_row_offsets: &graph.graph.row_offsets,
+                transport_targets: &graph.graph.targets,
                 sequences,
                 positive_relations: Some(pos),
                 support_groups: Some(group_view),
             },
         )?;
-        let computed: Vec<_> = geometry
+        let tag_residuals = geometry
             .intrinsics
             .into_iter()
             .zip(&geometry.computed_nodes)
             .filter_map(|(residual, computed)| computed.then_some(residual))
             .collect();
-        let search = tag_field(
-            tag_view,
-            &basis.mean,
-            &graph.inbound,
-            &computed,
-            config.tag_geometry,
-            ctx,
-        )?;
         let mut all_tags = Vec::new();
         let mut source_tag_offsets = vec![0];
         let mut source_requirements = Vec::new();
@@ -444,13 +441,9 @@ impl Nexus<'static> {
         let documents = if doc_ids.is_empty() {
             None
         } else {
-            let chunks = ChunkField::build(
-                VectorMatrixView::new(&doc_vectors, doc_ids.len(), dim)?,
-                config.chunk_geometry,
-                ctx,
-            )?;
             Some(OwnedCatalog {
                 ids: doc_ids,
+                document_ids: doc_document_ids,
                 vectors: doc_vectors,
                 root_offsets,
                 roots: doc_roots,
@@ -458,7 +451,6 @@ impl Nexus<'static> {
                 tag_offsets,
                 tags: seq_tags,
                 positions,
-                chunks,
             })
         };
         Ok(Self {
@@ -469,9 +461,10 @@ impl Nexus<'static> {
                 names,
                 aliases,
                 alias_offsets,
-                graph,
+                graph: graph.graph,
                 basis,
                 provenance,
+                source_ids,
                 source_checksums,
                 source_tag_offsets,
                 source_tags: all_tags,
@@ -481,11 +474,12 @@ impl Nexus<'static> {
                 group_kinds,
                 group_roots,
                 counterevidence: facts.counterevidence,
-                tag_search: search,
+                tag_residuals,
                 documents,
             })),
             concept_slots,
             document_slots,
+            source_slots,
         })
     }
 }
@@ -513,35 +507,56 @@ impl PositiveRows {
 
 impl<'a> Nexus<'a> {
     pub fn from_prepared(data: PreparedDataset<'a>) -> VcpResult<Self> {
-        data.tags.validate(STAGE)?;
+        validate_unit_matrix(data.tags, STAGE)?;
         data.lexical.validate(STAGE)?;
         data.provenance.validate(data.graph.nnz(), STAGE)?;
         data.groups.validate(STAGE)?;
         data.sources.validate(STAGE)?;
         data.counterevidence.validate(data.tags.rows, STAGE)?;
-        if data.graph.node_count != data.tags.rows
+        if data.tags.rows == 0
+            || data.graph.node_count != data.tags.rows
             || data.lexical.node_count != data.tags.rows
-            || (!data.concept_ids.is_empty() && data.concept_ids.len() != data.tags.rows)
+            || data.concept_ids.len() != data.tags.rows
+            || data.source_ids.len() != data.sources.root_count
             || data.basis.is_some_and(|basis| basis.dim != data.tags.dim)
             || data
-                .tag_search
-                .is_some_and(|search| search.dimension() != data.tags.dim)
+                .groups
+                .group_roots
+                .iter()
+                .any(|id| id.index() >= data.sources.root_count)
+            || data
+                .provenance
+                .prov_groups
+                .iter()
+                .any(|id| id.index() >= data.groups.group_count)
+            || data
+                .sources
+                .root_tags
+                .iter()
+                .any(|id| id.index() >= data.tags.rows)
+            || data
+                .sources
+                .root_required_roots
+                .iter()
+                .any(|id| id.index() >= data.sources.root_count)
+            || data
+                .counterevidence
+                .roots
+                .iter()
+                .any(|id| id.index() >= data.sources.root_count)
         {
             return Err(invalid(
                 STAGE,
-                "prepared tag, graph, basis and search dimensions must agree",
+                "prepared concept, graph, provenance and source columns must share slot spaces",
             ));
         }
         if let Some(basis) = data.basis {
             basis.validate(STAGE)?;
         }
-        let concept_slots = if data.concept_ids.is_empty() {
-            ids(0..data.tags.rows as u64)?
-        } else {
-            ids(data.concept_ids.iter().copied())?
-        };
+        let concept_slots = ids(data.concept_ids.iter().copied())?;
+        let source_slots = ids(data.source_ids.iter().copied())?;
         let document_slots = if let Some(catalog) = data.documents {
-            catalog.validate(data.tags.dim, data.tags.rows)?;
+            catalog.validate(data.tags.dim, data.tags.rows, data.sources.root_count)?;
             ids(catalog.ids.iter().copied())?
         } else {
             HashMap::new()
@@ -550,7 +565,15 @@ impl<'a> Nexus<'a> {
             assets: Assets::Borrowed(Box::new(data)),
             concept_slots,
             document_slots,
+            source_slots,
         })
+    }
+
+    pub(crate) fn tag_residuals(&self) -> &[IntrinsicResidual] {
+        match &self.assets {
+            Assets::Owned(data) => &data.tag_residuals,
+            Assets::Borrowed(_) => &[],
+        }
     }
 
     /// Borrows the same assets that are used for queries.
@@ -559,6 +582,7 @@ impl<'a> Nexus<'a> {
             Assets::Borrowed(data) => **data,
             Assets::Owned(data) => PreparedDataset {
                 concept_ids: &data.concept_ids,
+                source_ids: &data.source_ids,
                 tags: VectorMatrixView::new(&data.tags, data.concept_ids.len(), data.dim)
                     .expect("prepared matrix dimensions"),
                 lexical: TagLexicalMetaView {
@@ -567,7 +591,7 @@ impl<'a> Nexus<'a> {
                     alias_offsets: &data.alias_offsets,
                     node_count: data.concept_ids.len(),
                 },
-                graph: data.graph.as_csr_view(),
+                graph: data.graph.view(),
                 basis: Some(data.basis.as_view()),
                 provenance: data.provenance.as_view(),
                 groups: SupportGroupView {
@@ -585,9 +609,9 @@ impl<'a> Nexus<'a> {
                     root_required_roots: &data.source_requirements,
                 },
                 counterevidence: data.counterevidence.as_view(),
-                tag_search: Some(&data.tag_search),
                 documents: data.documents.as_ref().map(|catalog| Catalog {
                     ids: &catalog.ids,
+                    document_ids: Some(&catalog.document_ids),
                     vectors: VectorMatrixView::new(&catalog.vectors, catalog.ids.len(), data.dim)
                         .expect("prepared catalog dimensions"),
                     root_offsets: &catalog.root_offsets,
@@ -596,7 +620,6 @@ impl<'a> Nexus<'a> {
                     tag_offsets: &catalog.tag_offsets,
                     tags: &catalog.tags,
                     positions: &catalog.positions,
-                    chunks: &catalog.chunks,
                 }),
             },
         }
@@ -604,8 +627,8 @@ impl<'a> Nexus<'a> {
 }
 
 impl Catalog<'_> {
-    fn validate(self, dim: usize, tags: usize) -> VcpResult<()> {
-        self.vectors.validate(STAGE)?;
+    fn validate(self, dim: usize, tags: usize, roots: usize) -> VcpResult<()> {
+        validate_unit_matrix(self.vectors, STAGE)?;
         let n = self.ids.len();
         let offsets_match = |offsets: &[u32], rows: usize, len: usize| {
             offsets.len() == rows + 1
@@ -615,8 +638,8 @@ impl Catalog<'_> {
         };
         if self.vectors.dim != dim
             || self.vectors.rows != n
-            || self.chunks.index().len() != n
-            || self.chunks.index().dimension() != dim
+            || self.document_ids.is_some_and(|ids| ids.len() != n)
+            || self.roots.iter().any(|root| root.index() >= roots)
             || self.tags.len() != self.positions.len()
             || self.tags.iter().any(|tag| tag.index() >= tags)
             || !offsets_match(self.root_offsets, n, self.roots.len())

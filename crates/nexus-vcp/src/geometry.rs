@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use nexus_core::PrecisionMode;
 use nexus_core::kernel::{batch_dot_4_f64, dot_f64, norm_sq_f64, normalize_f64, sub_4_f64};
 use nexus_core::nnls::solve_nnls_with_ids_f64;
 use nexus_core::*;
@@ -113,10 +114,10 @@ impl Default for GlobalEpaConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct LocalConeAgsInput<'asset, 'query> {
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub sequences: SequenceSliceView<'asset>,
-    pub explicit_edges: Option<&'query [(NodeId, NodeId, f64)]>,
+pub struct LocalConeAgsInput<'call> {
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub sequences: SequenceSliceView<'call>,
+    pub explicit_edges: Option<&'call [(NodeId, NodeId, f64)]>,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -148,9 +149,9 @@ pub struct GeometryState {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct GlobalEpaInput<'asset, 'query> {
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub geometry: &'query GeometryState,
+pub struct GlobalEpaInput<'call> {
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub geometry: &'call GeometryState,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -598,18 +599,18 @@ fn build_unit_vectors(
 
 impl Operator for LocalConeAgsOperator {
     type Config = LocalConeAgsConfig;
-    type Input<'asset, 'query> = LocalConeAgsInput<'asset, 'query>;
+    type Input<'call> = LocalConeAgsInput<'call>;
     type Output = GeometryState;
 
     fn name(&self) -> &'static str {
         "unified_geometry_cone_t6_ags_selected_qr_nnls"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "LocalConeAgsOperator::execute";
         let start_time = Instant::now();
@@ -752,9 +753,9 @@ impl Operator for LocalConeAgsOperator {
             }
             seq_buf.clear();
             seq_buf.extend(positions.iter().copied().zip(tags.iter().copied()));
-            let is_sorted = seq_buf.windows(2).all(|w| w[0] <= w[1]);
+            let is_sorted = seq_buf.windows(2).all(|w| w[0].0 <= w[1].0);
             if !is_sorted {
-                seq_buf.sort_unstable();
+                seq_buf.sort_by_key(|step| step.0);
             }
 
             for i in 0..seq_buf.len() {
@@ -881,7 +882,7 @@ impl Operator for LocalConeAgsOperator {
                 .iter()
                 .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
                 .collect();
-            let star_dots = dot_neighbors(target, &star_vecs, ctx.precision);
+            let star_dots = dot_neighbors(target, &star_vecs, PrecisionMode::FastSimd);
             let weighted_star: Vec<(&[f64], f64)> = star_slice
                 .iter()
                 .zip(star_vecs.iter().zip(star_dots))
@@ -908,7 +909,7 @@ impl Operator for LocalConeAgsOperator {
                 .iter()
                 .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
                 .collect();
-            let raw_dots = dot_neighbors(target, &neighbor_vecs, ctx.precision);
+            let raw_dots = dot_neighbors(target, &neighbor_vecs, PrecisionMode::FastSimd);
 
             let mut candidates = Vec::with_capacity(neighbors.len());
             let mut refs = Vec::with_capacity(neighbors.len());
@@ -964,7 +965,7 @@ impl Operator for LocalConeAgsOperator {
                 config.min_gain,
                 config.reorth_loss_threshold,
                 false,
-                ctx.precision,
+                PrecisionMode::FastSimd,
             );
 
             let selected: Vec<(i64, &[f64])> = trace
@@ -1062,18 +1063,18 @@ impl Operator for LocalConeAgsOperator {
 
 impl Operator for GlobalEpaOperator {
     type Config = GlobalEpaConfig;
-    type Input<'asset, 'query> = GlobalEpaInput<'asset, 'query>;
+    type Input<'call> = GlobalEpaInput<'call>;
     type Output = EpaBasis;
 
     fn name(&self) -> &'static str {
         "ags-global-star-t4-cached-reorth"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "GlobalEpaOperator::execute";
         let start_time = Instant::now();
@@ -1249,7 +1250,7 @@ impl Operator for GlobalEpaOperator {
             config.min_gain,
             1e-3,
             true,
-            ctx.precision,
+            PrecisionMode::FastSimd,
         );
 
         ctx.check_cancelled(STAGE)?;
@@ -1263,12 +1264,15 @@ impl Operator for GlobalEpaOperator {
                 for ((out, &val), &m) in x.iter_mut().zip(v).zip(&mean) {
                     *out = val - m;
                 }
-                energy += norm_sq_f64(&x, ctx.precision);
+                energy += norm_sq_f64(&x, PrecisionMode::FastSimd);
                 let mut axis_groups = basis_refs.chunks_exact(4);
                 let mut cap_groups = captured.chunks_exact_mut(4);
                 for (axes, cap) in (&mut axis_groups).zip(&mut cap_groups) {
-                    let sums =
-                        batch_dot_4_f64(&x, [axes[0], axes[1], axes[2], axes[3]], ctx.precision);
+                    let sums = batch_dot_4_f64(
+                        &x,
+                        [axes[0], axes[1], axes[2], axes[3]],
+                        PrecisionMode::FastSimd,
+                    );
                     cap[0] += sums[0].powi(2);
                     cap[1] += sums[1].powi(2);
                     cap[2] += sums[2].powi(2);
@@ -1279,7 +1283,7 @@ impl Operator for GlobalEpaOperator {
                     .iter_mut()
                     .zip(axis_groups.remainder())
                 {
-                    *c += dot_f64(&x, axis, ctx.precision).powi(2);
+                    *c += dot_f64(&x, axis, PrecisionMode::FastSimd).powi(2);
                 }
             }
             (energy, captured)

@@ -39,6 +39,15 @@ pub enum VcpError {
     },
     #[error("THINKING_UNAVAILABLE: {reason}")]
     ThinkingUnavailable { reason: &'static str },
+    #[error(
+        "NOT_CONVERGED at {stage}: residual {residual} after {iterations} iterations (tolerance {tolerance})"
+    )]
+    NotConverged {
+        stage: &'static str,
+        iterations: usize,
+        residual: f64,
+        tolerance: f64,
+    },
     #[error("NUMERIC_DIVERGENCE at `{stage}`: {detail}")]
     NumericDivergence { stage: &'static str, detail: String },
 }

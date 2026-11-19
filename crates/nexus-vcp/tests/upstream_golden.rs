@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use nexus_core::kernel::cosine_f32;
+use nexus_core::kernel::{cosine_f32, normalize_direction};
 use nexus_core::*;
 use nexus_vcp::*;
 use serde::de::DeserializeOwned;
@@ -40,7 +40,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
         source["revision"],
         "5adb12bb55e616e22bd0e0dbfdc13032c069941a"
     );
-    let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
+    let ctx = ExecutionContext::default();
 
     for case in rows(&source, "nnls") {
         let query: Vec<f64> = decode(&case["query"]);
@@ -133,10 +133,11 @@ fn upstream_nnls_projection_and_cone_geometry() {
 #[test]
 fn upstream_hypernym_and_dedup_contracts() {
     let source = fixture();
-    let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
+    let ctx = ExecutionContext::default();
 
     for case in rows(&source, "hypernym") {
-        let query: Vec<f32> = decode(&case["query"]);
+        let raw_query: Vec<f32> = decode(&case["query"]);
+        let query = normalize_direction(&raw_query, raw_query.len(), "test").unwrap();
         let names: Vec<String> = decode(&case["names"]);
         let names: Vec<_> = names.iter().map(String::as_str).collect();
         let vectors: Vec<Vec<f32>> = decode(&case["vectors"]);
@@ -149,7 +150,7 @@ fn upstream_hypernym_and_dedup_contracts() {
                 .enumerate()
                 .map(|(index, vector)| PyramidTagEntry {
                     node: NodeId(index as u32),
-                    similarity: cosine_f32(&query, vector, ctx.precision),
+                    similarity: cosine_f32(&query, vector, PrecisionMode::FastSimd),
                     contribution: if index == 0 {
                         decode(&case["contribution"])
                     } else {
@@ -173,10 +174,11 @@ fn upstream_hypernym_and_dedup_contracts() {
         } else {
             &[]
         };
+        let config = HypernymConfig::default();
         let result = HypernymPruneOperator
             .execute(
                 &ctx,
-                &HypernymConfig::default(),
+                &config,
                 HypernymPruneInput {
                     query: &query,
                     pyramid: &pyramid,
@@ -211,11 +213,27 @@ fn upstream_hypernym_and_dedup_contracts() {
             &decode::<Vec<_>>(&case["projection"]),
             1e-7,
         );
+        let mut confidence = decode(&case["confidence"]);
+        if case["case"] == "weak_direction" {
+            // Removing the first axis leaves the second component of the unit direction.
+            let confidence_after_projection = |vector: &[f32]| {
+                let [x, y] = [f64::from(vector[0]), f64::from(vector[1])];
+                y.abs() / (x.hypot(y) * config.differentia_confidence_scale)
+            };
+            close(
+                case,
+                "raw differentia confidence",
+                confidence_after_projection(&raw_query),
+                confidence,
+                1e-12,
+            );
+            confidence = confidence_after_projection(&query);
+        }
         close(
             case,
             "differentia confidence",
             result.differentia_confidence,
-            decode(&case["confidence"]),
+            confidence,
             1e-12,
         );
     }
@@ -264,7 +282,7 @@ fn sparse_field(value: &Value, count: usize) -> Vec<f64> {
     result
 }
 
-fn observation(input: &Value, count: usize) -> FieldState {
+fn observation(input: &Value, count: usize) -> (ObservationState, FieldValues) {
     let state = &input["queryState"];
     let calibration = &input["calibration"];
     let nodes = state["riverNodes"]
@@ -309,8 +327,8 @@ fn observation(input: &Value, count: usize) -> FieldState {
             .map(|id| NodeId(id - 1))
             .collect()
     };
-    FieldState::from_parts(
-        std::sync::Arc::new(ObservationState {
+    (
+        ObservationState {
             original_query: decode(&input["query"]["vector"]),
             epa: EpaAnalysis::default(),
             pyramid: PyramidResidual {
@@ -340,18 +358,22 @@ fn observation(input: &Value, count: usize) -> FieldState {
                     .collect(),
                 ..SenseOutput::default()
             },
-        }),
-        DualFields {
-            local_domain: ids(&state["localDomainIds"]),
-            transfer_domain: ids(&state["transferDomainIds"]),
-            local_field: sparse_field(&state["localField"], count),
-            transfer_field: sparse_field(&state["transferField"], count),
-            ..DualFields::default()
         },
-        BasinSupports {
-            local_vector: decode(&input["localVector"]),
-            transfer_vector: decode(&input["transferVector"]),
-            ..BasinSupports::default()
+        FieldValues {
+            dual_fields: DualFields {
+                local_converged: true,
+                transfer_converged: true,
+                local_domain: ids(&state["localDomainIds"]),
+                transfer_domain: ids(&state["transferDomainIds"]),
+                local_field: sparse_field(&state["localField"], count),
+                transfer_field: sparse_field(&state["transferField"], count),
+                ..DualFields::default()
+            },
+            basins: BasinSupports {
+                local_vector: decode(&input["localVector"]),
+                transfer_vector: decode(&input["transferVector"]),
+                ..BasinSupports::default()
+            },
         },
     )
 }
@@ -359,15 +381,14 @@ fn observation(input: &Value, count: usize) -> FieldState {
 #[test]
 fn upstream_river_and_cross_file_wormhole_scores() {
     let source = fixture();
-    let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
+    let ctx = ExecutionContext::default();
 
     for (case, wormhole) in rows(&source, "river")
         .iter()
         .map(|v| (v, false))
         .chain(rows(&source, "wormhole").iter().map(|v| (v, true)))
     {
-        let fields = observation(&case["input"], 5);
-        let state = fields.observation();
+        let (state, fields) = observation(&case["input"], 5);
         let tag_values: Vec<_> = decode::<Vec<Vec<f32>>>(&case["tags"])
             .into_iter()
             .flatten()
@@ -393,28 +414,25 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             }))
             .collect();
         let wormhole_flags = [wormhole];
-        let graph = CsrGraphView::new(CsrParts {
-            node_count: 5,
-            row_offsets: &[0, 1, 1, 1, 1, 1],
-            targets: &[NodeId(2)],
-            weights: &[0.8],
-            is_static_wormhole: &wormhole_flags,
-            inbound: &[0.0, 0.0, 0.8, 0.0, 0.0],
-            max_inbound: 0.8,
-            anchor_gains: &[1.0; 5],
-            target_sorted_indices: None,
-            edge_gates: None,
-        })
+        let graph = TransportGraphView::new(
+            CsrGraphView::new(CsrParts {
+                node_count: 5,
+                row_offsets: &[0, 1, 1, 1, 1, 1],
+                targets: &[NodeId(2)],
+                weights: &[0.8],
+                is_static_wormhole: &wormhole_flags,
+                inbound: &[0.0, 0.0, 0.8, 0.0, 0.0],
+                max_inbound: 0.8,
+                anchor_gains: &[1.0; 5],
+                target_sorted_indices: None,
+                edge_gates: None,
+            })
+            .unwrap(),
+        )
         .unwrap();
-        let candidates = CandidatePoolView {
+        let candidates = CandidateRowsView {
             candidate_count: 3,
-            baseline_scores: &[0.91, 0.83, 0.67],
-            union_scores: &[0.91, 0.83, 0.67],
-            union_ranks: &[1, 2, 3],
-            bm25_scores: &[0.0; 3],
-            bm25_reference: 0.0,
-            anchor_scores: &[0.0; 3],
-            curve_document_ids: &[DocumentId(0), DocumentId(1), DocumentId(2)],
+            document_ids: &[DocumentId(0), DocumentId(1), DocumentId(2)],
             candidate_vectors: VectorMatrixView::new(&body_values, 3, 3).unwrap(),
             candidate_root_offsets: &[0; 4],
             candidate_roots: &[],
@@ -423,16 +441,14 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             path_tags: &tags,
             path_positions: &positions,
         };
-        let pool = PoolCalibrateOperator
-            .execute(
-                &ctx,
-                &PoolCalibrateConfig::default(),
-                PoolCalibrateInput {
-                    fields: &fields,
-                    candidates,
-                },
-            )
-            .unwrap();
+        let query = QueryCosines::prepare(
+            &ctx,
+            candidates,
+            &state.original_query,
+            &state.fused.enhanced_query,
+        )
+        .unwrap();
+        let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
         let has_provenance: bool = decode(&case["has_provenance"]);
         let provenance = if has_provenance {
             ProvenanceView {
@@ -454,10 +470,9 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 &ctx,
                 &RiverReadoutConfig::default(),
                 RiverReadoutInput {
-                    fields: &fields,
-                    evidence: EvidencePolicy::Nous,
-                    pool: &pool,
-                    candidates,
+                    observation: &state,
+                    evidence: EvidencePolicy::DiscountWhenUnattributed,
+                    features: &features,
                     graph,
                     provenance,
                     support_groups: SupportGroupView::empty(),
@@ -474,9 +489,9 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                     &ctx,
                     &CrossFileWormholeConfig::default(),
                     CrossFileWormholeInput {
-                        observation: state,
+                        observation: &state,
                         readout: &base,
-                        candidates,
+                        features: &features,
                         graph,
                         root_facts: RootFactView {
                             root_count: 2,
@@ -539,12 +554,12 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             );
             if !has_provenance && item.candidate == CandidateId(1) {
                 // The upstream assumes complete independence when attribution
-                // is absent. The Nous contract retains only its 0.15 floor.
+                // is absent. The discount policy uses its 0.15 floor.
                 assert!(item.graph_bonus < decode::<f64>(&expected["graph_bonus"]));
                 close(
                     case,
                     &name("quality sum"),
-                    item.quality_score,
+                    item.score,
                     item.base_score + item.path_bonus + item.graph_bonus,
                     1e-12,
                 );
@@ -559,7 +574,7 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 close(
                     case,
                     &name("quality"),
-                    item.quality_score,
+                    item.score,
                     decode(&expected["score"]),
                     2e-7,
                 );

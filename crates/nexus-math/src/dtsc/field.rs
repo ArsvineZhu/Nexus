@@ -4,17 +4,27 @@ use super::{DtscFieldConfig, unit};
 use nexus_core::kernel::{cosine_f32_with_norms, norm_sq_f32};
 use nexus_core::{ExecutionContext, NodeId, Operator, PrecisionMode, VcpError, VectorMatrixView};
 
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DtscSourceType {
+    Core,
+    Seed,
+    Emergent,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct DtscNodeInput {
     pub node: NodeId,
     pub energy: f64,
     pub normalized_energy: f64,
-    pub source_type: String,
+    pub source_type: DtscSourceType,
 }
 
-pub struct DtscFieldBuildInput<'asset, 'query> {
-    pub nodes: &'query [DtscNodeInput],
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
+pub struct DtscFieldBuildInput<'call> {
+    pub nodes: &'call [DtscNodeInput],
+    pub tag_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -23,7 +33,7 @@ pub struct DtscSample {
     pub node: NodeId,
     pub potential: f64,
     pub exact: bool,
-    pub source_type: String,
+    pub source_type: DtscSourceType,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -32,25 +42,60 @@ pub struct DtscFieldNode {
     pub node: NodeId,
     pub potential: f64,
     pub vector: Vec<f32>,
-    pub source_type: String,
+    pub source_type: DtscSourceType,
 }
 
+/// Candidate-independent energy and interpolation data with its sampling parameters.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct DtscField {
-    pub exact_field: Vec<DtscSample>,
-    pub field_nodes: Vec<DtscFieldNode>,
-    pub field_entropy: f64,
-    pub field_trusted: bool,
-    pub total_energy: f64,
-    pub max_energy: f64,
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DtscFieldValues {
+    exact_field: Vec<DtscSample>,
+    field_nodes: Vec<DtscFieldNode>,
+    field_entropy: f64,
+    total_energy: f64,
+    max_energy: f64,
+    config: DtscFieldConfig,
 }
 
-pub struct DtscFieldSampleInput<'asset, 'query> {
-    pub field: &'query DtscField,
-    pub query_ids: &'query [NodeId],
-    pub query_vectors: VectorMatrixView<'query, f32>,
-    pub inbound: &'asset [f64],
+impl DtscFieldValues {
+    pub fn exact_field(&self) -> &[DtscSample] {
+        &self.exact_field
+    }
+
+    pub fn field_nodes(&self) -> &[DtscFieldNode] {
+        &self.field_nodes
+    }
+
+    pub fn field_entropy(&self) -> f64 {
+        self.field_entropy
+    }
+
+    pub fn total_energy(&self) -> f64 {
+        self.total_energy
+    }
+
+    pub fn max_energy(&self) -> f64 {
+        self.max_energy
+    }
+
+    pub fn input_node_count(&self) -> usize {
+        self.exact_field.len()
+    }
+
+    pub fn retained_node_count(&self) -> usize {
+        self.field_nodes.len()
+    }
+
+    pub fn config(&self) -> &DtscFieldConfig {
+        &self.config
+    }
+}
+
+pub struct DtscFieldSampleInput<'call> {
+    pub field: &'call DtscFieldValues,
+    pub query_ids: &'call [NodeId],
+    pub query_vectors: VectorMatrixView<'call, f32>,
+    pub inbound: &'call [f64],
 }
 
 /// Bit-exact cosine similarity under `PrecisionMode::StrictLeftFold` with `1e-12` squared-norm guard.
@@ -72,19 +117,16 @@ fn node_energy(n: &DtscNodeInput) -> f64 {
 }
 
 pub struct DtscFieldSampler<'a> {
-    pub field: &'a DtscField,
-    pub inbound: &'a [f64],
-    pub max_inbound: f64,
-    pub config: &'a DtscFieldConfig,
-    pub node_specs: Vec<(f64, f64)>,
+    field: &'a DtscFieldValues,
+    pub(super) max_inbound: f64,
+    node_specs: Vec<(f64, f64)>,
 }
 
 impl<'a> DtscFieldSampler<'a> {
-    /// Builds a sampler over `field` using dense `inbound` lookup.
-    /// Computes `max_inbound` via `f64::max` semantics (`fold(0.0, f64::max)`).
-    pub fn new(field: &'a DtscField, inbound: &'a [f64], config: &'a DtscFieldConfig) -> Self {
+    /// Builds a sampler using the field's configuration and dense inbound masses.
+    pub fn new(field: &'a DtscFieldValues, inbound: &[f64]) -> Self {
         let max_inbound = inbound.iter().copied().fold(0.0_f64, f64::max);
-        let floor = config.public_hub_floor.clamp(0.05, 1.0);
+        let floor = field.config.public_hub_floor;
         let node_specs = field
             .field_nodes
             .iter()
@@ -103,9 +145,7 @@ impl<'a> DtscFieldSampler<'a> {
             .collect();
         Self {
             field,
-            inbound,
             max_inbound,
-            config,
             node_specs,
         }
     }
@@ -122,9 +162,10 @@ impl<'a> DtscFieldSampler<'a> {
         neighbors: &mut Vec<(f64, &'s DtscFieldNode)>,
     ) -> DtscSample {
         let exact = self.field.exact_field.iter().find(|s| s.node == node);
-        let threshold = self.config.field_similarity_threshold.clamp(-1.0, 1.0);
+        let config = self.field.config();
+        let threshold = config.field_similarity_threshold;
         let vector_norm = norm_sq_f32(vector, PrecisionMode::StrictLeftFold);
-        let exponent = self.config.field_kernel_exponent.max(0.25);
+        let exponent = config.field_kernel_exponent.max(0.25);
 
         neighbors.clear();
         for (n, &(node_norm, specific)) in self.field.field_nodes.iter().zip(&self.node_specs) {
@@ -147,7 +188,7 @@ impl<'a> DtscFieldSampler<'a> {
         }
 
         neighbors.sort_by(|a, b| b.0.total_cmp(&a.0));
-        neighbors.truncate(self.config.max_field_neighbors.max(1));
+        neighbors.truncate(config.max_field_neighbors);
 
         let interpolated = if neighbors.is_empty() {
             0.0
@@ -160,9 +201,9 @@ impl<'a> DtscFieldSampler<'a> {
             potential: unit(exact.map_or(0.0, |s| s.potential).max(interpolated)),
             exact: exact.is_some(),
             source_type: exact
-                .map(|s| s.source_type.clone())
-                .or_else(|| neighbors.first().map(|(_, n)| n.source_type.clone()))
-                .unwrap_or_else(|| "unknown".into()),
+                .map(|s| s.source_type)
+                .or_else(|| neighbors.first().map(|(_, n)| n.source_type))
+                .unwrap_or(DtscSourceType::Unknown),
         }
     }
 }
@@ -171,21 +212,18 @@ pub struct DtscFieldBuildOperator;
 
 impl Operator for DtscFieldBuildOperator {
     type Config = DtscFieldConfig;
-    type Input<'asset, 'query>
-        = DtscFieldBuildInput<'asset, 'query>
-    where
-        Self: 'asset + 'query;
-    type Output = DtscField;
+    type Input<'call> = DtscFieldBuildInput<'call>;
+    type Output = DtscFieldValues;
 
     fn name(&self) -> &'static str {
         "dtsc_field_build"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> Result<Self::Output, VcpError> {
         const STAGE: &str = "dtsc_field_build";
         ctx.check_cancelled(STAGE)?;
@@ -225,11 +263,6 @@ impl Operator for DtscFieldBuildOperator {
             0.0
         };
 
-        let distribution_trusted = sorted_nodes.len() >= minimum
-            && total_energy > 0.0
-            && (!config.fallback_to_knn_on_low_trust
-                || field_entropy >= unit(config.min_field_entropy));
-
         let exact_field: Vec<DtscSample> = input_order_nodes
             .iter()
             .map(|n| DtscSample {
@@ -240,7 +273,7 @@ impl Operator for DtscFieldBuildOperator {
                     0.0
                 },
                 exact: true,
-                source_type: n.source_type.clone(),
+                source_type: n.source_type,
             })
             .collect();
 
@@ -274,7 +307,7 @@ impl Operator for DtscFieldBuildOperator {
                                 0.0
                             },
                             vector: v.to_vec(),
-                            source_type: n.source_type.clone(),
+                            source_type: n.source_type,
                         })
                 })
                 .collect()
@@ -282,15 +315,13 @@ impl Operator for DtscFieldBuildOperator {
             Vec::new()
         };
 
-        let field_trusted = distribution_trusted && field_nodes.len() >= minimum;
-
-        Ok(DtscField {
+        Ok(DtscFieldValues {
             exact_field,
             field_nodes,
             field_entropy,
-            field_trusted,
             total_energy,
             max_energy,
+            config: config.clone(),
         })
     }
 }
@@ -298,26 +329,22 @@ impl Operator for DtscFieldBuildOperator {
 pub struct DtscFieldSampleOperator;
 
 impl Operator for DtscFieldSampleOperator {
-    type Config = DtscFieldConfig;
-    type Input<'asset, 'query>
-        = DtscFieldSampleInput<'asset, 'query>
-    where
-        Self: 'asset + 'query;
+    type Config = ();
+    type Input<'call> = DtscFieldSampleInput<'call>;
     type Output = Vec<DtscSample>;
 
     fn name(&self) -> &'static str {
         "dtsc_field_sample"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        _config: &Self::Config,
+        input: Self::Input<'call>,
     ) -> Result<Self::Output, VcpError> {
         const STAGE: &str = "dtsc_field_sample";
         ctx.check_cancelled(STAGE)?;
-        config.validate()?;
         input.query_vectors.validate(STAGE)?;
         if input.query_ids.len() != input.query_vectors.rows {
             return Err(VcpError::DimensionMismatch {
@@ -327,7 +354,7 @@ impl Operator for DtscFieldSampleOperator {
             });
         }
 
-        let sampler = DtscFieldSampler::new(input.field, input.inbound, config);
+        let sampler = DtscFieldSampler::new(input.field, input.inbound);
         let mut neighbors = Vec::new();
         let mut out = Vec::with_capacity(input.query_ids.len());
         for (idx, &node) in input.query_ids.iter().enumerate() {

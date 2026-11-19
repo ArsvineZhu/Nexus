@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use nexus::math::DtscConfig;
 use nexus::*;
-use nexus_core::kernel::{cosine_f32, norm_sq_f32};
+use nexus_core::kernel::{cosine_f32, normalize_direction};
 use nexus_core::*;
-use nexus_vcp::*;
+use nexus_vcp::{EpaBasis, EvidencePolicy, ObservationConfig, ThinkingConfig};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::hint::black_box;
@@ -45,37 +46,15 @@ fn vectors(path: &Path) -> Vec<f32> {
 }
 
 struct QueryCase {
-    scores: Vec<f64>,
-    ranks: Vec<u32>,
-    recalled: Vec<Vec<(NodeId, f64)>>,
-    stage: Vec<CandidateId>,
+    recalled: Vec<Vec<u64>>,
+    stage: Vec<u64>,
 }
 
-impl Fixture {
-    fn candidates<'a>(
-        &'a self,
-        matrix: VectorMatrixView<'a>,
-        zeros: &'a [f64],
-        query: &'a QueryCase,
-    ) -> CandidatePoolView<'a> {
-        CandidatePoolView {
-            candidate_count: self.docs.len(),
-            baseline_scores: &query.scores,
-            union_scores: &query.scores,
-            union_ranks: &query.ranks,
-            bm25_scores: zeros,
-            bm25_reference: 0.0,
-            anchor_scores: zeros,
-            curve_document_ids: &self.docs,
-            candidate_vectors: matrix,
-            candidate_root_offsets: &self.candidate_root_offsets,
-            candidate_roots: &self.candidate_roots,
-            candidate_path_offsets: &self.candidate_path_offsets,
-            path_tag_offsets: &self.path_tag_offsets,
-            path_tags: &self.path_tags,
-            path_positions: &self.path_positions,
-        }
-    }
+fn directions(values: &[f32], dim: usize) -> Vec<f32> {
+    values
+        .chunks_exact(dim)
+        .flat_map(|row| normalize_direction(row, dim, "bench").unwrap())
+        .collect()
 }
 
 fn run_frozen(criterion: &mut Criterion) {
@@ -110,24 +89,11 @@ fn run_frozen(criterion: &mut Criterion) {
         pool.as_ref()
             .map_or(ParallelPolicy::Sequential, ParallelPolicy::CustomPool),
     );
-    let zeros = vec![0.0; count];
-    let norms: Vec<_> = candidate_values
-        .chunks_exact(dim)
-        .map(|row| norm_sq_f32(row, ctx.precision))
-        .collect();
-    let candidates = VectorMatrixView::new(&candidate_values, count, dim)
-        .unwrap()
-        .with_sq_norms(&norms)
-        .unwrap();
+    let candidate_values = directions(&candidate_values, dim);
+    let tag_values = directions(&tag_values, dim);
+    let matrix = VectorMatrixView::new(&candidate_values, count, dim).unwrap();
     let tags = VectorMatrixView::new(&tag_values, fixture.labels.len(), dim).unwrap();
-    let config = ObservationConfig {
-        sense: SenseConfig {
-            max_transition_records: 16_000,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let graph = CsrGraph::new(fixture.graph.clone()).unwrap();
+    let graph = TransportGraph::new(CsrGraph::new(fixture.graph.clone()).unwrap()).unwrap();
     let lexical = TagLexicalMetaView {
         node_count: tags.rows,
         names: TextRows::Strings(&fixture.labels),
@@ -146,91 +112,96 @@ fn run_frozen(criterion: &mut Criterion) {
         group_roots: &fixture.group_roots,
         group_kinds: &fixture.group_kinds,
     };
-    let assets = PreparedDataset {
-        concept_ids: &[],
+    let root_count = fixture
+        .group_roots
+        .iter()
+        .chain(&fixture.candidate_roots)
+        .map(|id| id.index() + 1)
+        .max()
+        .unwrap_or(0);
+    let source_ids: Vec<_> = (0..root_count as u64).collect();
+    let source_checksums = vec![0; root_count];
+    let source_offsets = vec![0; root_count + 1];
+    let ids: Vec<_> = (0..count as u64).collect();
+    let document_ids: Vec<_> = fixture.docs.iter().map(|id| u64::from(id.0)).collect();
+    let concept_ids: Vec<_> = (1..=tags.rows as u64).collect();
+    let nexus = Nexus::from_prepared(PreparedDataset {
+        concept_ids: &concept_ids,
+        source_ids: &source_ids,
         tags,
         graph: graph.view(),
         lexical,
         basis: fixture.basis.as_ref().map(EpaBasis::as_view),
         provenance,
         groups,
-        documents: None,
-        tag_search: None,
-        sources: RootFactView::empty(),
+        documents: Some(Catalog {
+            ids: &ids,
+            document_ids: Some(&document_ids),
+            vectors: matrix,
+            root_offsets: &fixture.candidate_root_offsets,
+            roots: &fixture.candidate_roots,
+            path_offsets: &fixture.candidate_path_offsets,
+            tag_offsets: &fixture.path_tag_offsets,
+            tags: &fixture.path_tags,
+            positions: &fixture.path_positions,
+        }),
+        // The study exports attribution groups and candidate roots but no root witness facts.
+        sources: RootFactView {
+            root_count,
+            checksum_hashes: &source_checksums,
+            root_tag_offsets: &source_offsets,
+            root_tags: &[],
+            root_req_offsets: &source_offsets,
+            root_required_roots: &[],
+        },
         counterevidence: CounterevidenceAdjView::empty(),
+    })
+    .unwrap();
+    let candidates = nexus.candidates(CandidateInput::Ids(&ids)).unwrap();
+    let config = ObservationConfig::default();
+    let thinking_config = ThinkingConfig::default();
+    let readout = RiverConfig {
+        evidence: EvidencePolicy::DiscountWhenUnattributed,
+        ..Default::default()
     };
-    let nexus = Nexus::from_prepared(assets).unwrap();
+    let dtsc_config = DtscConfig::default();
     let mut cases = Vec::with_capacity(queries.len());
     let mut route_queries = Vec::new();
-    for (index, query) in queries.iter().enumerate() {
+    for (index, vector) in queries.iter().enumerate() {
         let recorded = RefCell::new(Vec::new());
-        let recall = |_,
-                      residual: &[f32],
-                      limit,
-                      out: &mut Vec<_>,
-                      _: Option<&EpaAnalysis>,
-                      excluded: &[NodeId]| {
-            out.extend(tags.data.chunks_exact(dim).enumerate().map(|(index, row)| {
-                (
-                    NodeId(index as u32),
-                    cosine_f32(row, residual, ctx.precision),
-                )
-            }));
-            out.retain(|(node, _)| !excluded.contains(node));
-            out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            out.truncate(limit);
+        let recall = |_: &ExecutionContext<'_>, req: TagRecallRequest<'_>, out: &mut Vec<u64>| {
+            let mut hits: Vec<_> = tags
+                .data
+                .chunks_exact(dim)
+                .zip(&concept_ids)
+                .filter(|(_, id)| !req.excluded_concepts.contains(id))
+                .map(|(row, &id)| (id, cosine_f32(row, req.residual, PrecisionMode::FastSimd)))
+                .collect();
+            hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+            out.extend(hits.into_iter().take(req.limit).map(|(id, _)| id));
             recorded.borrow_mut().push(out.clone());
             Ok(())
         };
-        let observation = nexus
-            .observe_with(
-                &Query::new(query, &fixture.query_texts[index]).with_tag_recall(&recall),
-                &config,
-                &ctx,
-            )
-            .expect("observe the captured query");
-
-        let scores: Vec<_> = candidate_values
+        let query = Query::new(vector, &fixture.query_texts[index]).with_tag_recall(&recall);
+        let observation = nexus.observe(&query, &config, ctx).unwrap();
+        let evaluation = observation.evaluate(&candidates).unwrap();
+        let mut scored: Vec<_> = candidate_values
             .chunks_exact(dim)
-            .map(|row| cosine_f32(row, query, ctx.precision))
+            .zip(&ids)
+            .map(|(row, &id)| (id, cosine_f32(row, vector, PrecisionMode::StrictLeftFold)))
             .collect();
-        let mut ranks = vec![0; count];
-        let mut ordered: Vec<_> = (0..count).collect();
-        ordered.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-        for (rank, &candidate) in ordered.iter().enumerate() {
-            ranks[candidate] = rank as u32 + 1;
-        }
-        let mut case = QueryCase {
-            recalled: recorded.into_inner(),
-            scores,
-            ranks,
-            stage: Vec::new(),
-        };
-        // One real host stage drawn from the strongest dense candidates, with
-        // length bounded by the public Thinking contract.
-        case.stage = ordered
-            .into_iter()
-            .take(256)
-            .map(|index| CandidateId(index as u32))
-            .collect();
-        let stage = [ThinkingStageInputView {
-            stage_label: "frozen",
-            k: 1,
-            candidates: &case.stage,
-        }];
-        let input = ThinkingInput {
-            trace: observation.complete_trace().unwrap(),
-            candidates: fixture.candidates(candidates, &zeros, &case),
-            query_cosines: Some(&case.scores),
-            stages: &stage,
-            graph: assets.graph,
-            provenance,
-            support_groups: groups,
-            tag_vectors: tags,
-        };
-        let thinking = ThinkingPlanOperator
-            .execute(&ctx, &ThinkingConfig::default(), input)
-            .expect("read the frozen Thinking stage");
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let stage: Vec<_> = scored.into_iter().take(256).map(|(id, _)| id).collect();
+        let thinking = evaluation
+            .thinking(
+                &[Stage {
+                    name: "frozen",
+                    limit: 1,
+                    candidates: &stage,
+                }],
+                &thinking_config,
+            )
+            .unwrap();
         if thinking.stages[0]
             .results
             .iter()
@@ -238,164 +209,62 @@ fn run_frozen(criterion: &mut Criterion) {
         {
             route_queries.push(index);
         }
-        cases.push(case);
+        cases.push(QueryCase {
+            recalled: recorded.into_inner(),
+            stage,
+        });
     }
     eprintln!(
-        "Frozen cohort: {} queries, {count} × {dim} candidates, {} queries with a grounded Thinking route, {threads} threads",
+        "Frozen cohort: {} queries, {count} x {dim} candidates, {} grounded Thinking queries, {threads} threads",
         cases.len(),
         route_queries.len()
     );
 
-    let candidate_ids: Vec<_> = (0..count as u64).collect();
-    let readout = RiverConfig {
-        evidence: EvidencePolicy::Nous,
-        ..Default::default()
-    };
-    let preset = RiverPipelineConfig {
-        observation: config.clone(),
-        readout: readout.clone(),
-        ..Default::default()
-    };
     let execute = |fanout: bool, index: usize| {
         let case = &cases[index];
-        let recall = |level: usize,
-                      _: &[f32],
-                      limit: usize,
-                      out: &mut Vec<_>,
-                      _: Option<&EpaAnalysis>,
-                      _: &[NodeId]| {
-            if let Some(layer) = case.recalled.get(level) {
-                out.extend(layer.iter().take(limit).copied());
+        let recall = |_: &ExecutionContext<'_>, req: TagRecallRequest<'_>, out: &mut Vec<u64>| {
+            if let Some(hits) = case.recalled.get(req.layer) {
+                out.extend(hits.iter().copied().take(req.limit));
             }
             Ok(())
         };
-        let pool = fixture.candidates(candidates, &zeros, case);
-        let stages = [ThinkingStageInputView {
-            stage_label: "frozen",
-            k: 1,
-            candidates: &case.stage,
-        }];
         let query =
             Query::new(queries[index], &fixture.query_texts[index]).with_tag_recall(&recall);
-        let selection = Candidates::Borrowed {
-            ids: &candidate_ids,
-            pool: &pool,
-        };
-        if !fanout {
-            let result = nexus
-                .run_with(&query, &selection, Pipeline::river(), &preset, &ctx)
-                .expect("read River with host recall and candidates");
-            assert_eq!(result.scores.items.len(), count);
-            black_box(result);
-            return;
+        let observation = nexus.observe(&query, &config, ctx).unwrap();
+        let evaluation = observation.evaluate(&candidates).unwrap();
+        let fields = observation.fields(&Default::default()).unwrap();
+        let river = evaluation.river(&fields, &readout).unwrap();
+        assert_eq!(river.items.len(), count);
+        black_box(river);
+        if fanout {
+            let field = observation.dtsc_field(&dtsc_config.field).unwrap();
+            black_box(evaluation.dtsc(&field, &dtsc_config.scoring).unwrap());
+            let thinking = evaluation
+                .thinking(
+                    &[Stage {
+                        name: "frozen",
+                        limit: 1,
+                        candidates: &case.stage,
+                    }],
+                    &thinking_config,
+                )
+                .unwrap();
+            assert!(
+                thinking.stages[0]
+                    .results
+                    .iter()
+                    .any(|item| item.route.is_some())
+            );
+            black_box(thinking);
         }
-        let batch = nexus
-            .candidates_with(query.vector, &selection, Default::default(), &ctx)
-            .expect("prepare one batch for the readouts");
-        let pool = batch.view();
-        let mut plan = Plan::new();
-        let observation = plan
-            .add(ObserveQuery, config.clone(), (), |_| {
-                Ok(QueryInput {
-                    nexus: &nexus,
-                    query,
-                })
-            })
-            .unwrap();
-        let fields = plan
-            .add(
-                ComputeFields,
-                FieldConfig::default(),
-                observation,
-                |inputs| Ok(nexus.field_input(inputs.get())),
-            )
-            .unwrap();
-        let calibration = plan
-            .add(
-                PoolCalibrateOperator,
-                PoolCalibrateConfig {
-                    precision: Some(PrecisionMode::StrictLeftFold),
-                    ..PoolCalibrateConfig::default()
-                },
-                fields,
-                |inputs| {
-                    Ok(PoolCalibrateInput {
-                        fields: inputs.get(),
-                        candidates: pool,
-                    })
-                },
-            )
-            .unwrap();
-        let river = plan
-            .add(
-                ReadRiver,
-                readout.clone(),
-                (fields, calibration),
-                |inputs| {
-                    let (fields, calibrated) = inputs.get();
-                    Ok(RiverInput {
-                        assets,
-                        fields,
-                        pool: calibrated,
-                        candidates: pool,
-                    })
-                },
-            )
-            .unwrap();
-        let dtsc = plan
-            .add(
-                ReadDtsc,
-                nexus::math::DtscConfig::default(),
-                (observation, calibration),
-                |inputs| {
-                    let (observation, calibrated) = inputs.get();
-                    Ok(ObservedDtscInput {
-                        assets,
-                        observation,
-                        pool: Some(calibrated),
-                        candidates: pool,
-                    })
-                },
-            )
-            .unwrap();
-        let thinking = plan
-            .add(
-                ThinkingPlanOperator,
-                ThinkingConfig::default(),
-                observation,
-                |inputs| {
-                    Ok(ThinkingInput {
-                        trace: inputs.get().complete_trace()?,
-                        candidates: pool,
-                        query_cosines: Some(&case.scores),
-                        stages: &stages,
-                        graph: assets.graph,
-                        provenance,
-                        support_groups: groups,
-                        tag_vectors: tags,
-                    })
-                },
-            )
-            .unwrap();
-        let result = plan
-            .run((river, dtsc, thinking), &ctx)
-            .expect("run the unified plan");
-        assert_eq!(result.get(river).unwrap().items.len(), count);
-        assert!(
-            result.get(thinking).unwrap().stages[0]
-                .results
-                .iter()
-                .any(|item| item.route.is_some())
-        );
-        black_box(result);
     };
 
-    let report_quantiles = |name: &str, fanout: bool, indices: &[usize]| {
+    let report = |name: &str, fanout: bool, indices: &[usize]| {
         let mut samples: Vec<_> = indices
             .iter()
-            .map(|&index| {
+            .map(|&i| {
                 let start = Instant::now();
-                execute(fanout, index);
+                execute(fanout, i);
                 start.elapsed().as_secs_f64() * 1e3
             })
             .collect();
@@ -407,9 +276,9 @@ fn run_frozen(criterion: &mut Criterion) {
             samples.len()
         );
     };
-    report_quantiles("same_pool", false, &(0..queries.len()).collect::<Vec<_>>());
+    report("same_pool", false, &(0..queries.len()).collect::<Vec<_>>());
     if !route_queries.is_empty() {
-        report_quantiles("shared_river_dtsc_thinking", true, &route_queries);
+        report("shared_river_dtsc_thinking", true, &route_queries);
     }
     let mut group = criterion.benchmark_group(format!("frozen_{threads}t"));
     group.throughput(Throughput::Elements(count as u64));

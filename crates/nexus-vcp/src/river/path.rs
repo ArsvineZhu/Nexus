@@ -2,7 +2,9 @@
 
 use super::{PathEvidence, QueryMode, QueryMorphology, RiverReadoutConfig, RiverReadoutInput};
 use nexus_core::kernel::{cosine_f32, cosine_f32_with_norms, norm_sq_f32};
-use nexus_core::{CandidateId, ExecutionContext, NodeId, PathId, VcpError, VcpResult};
+use nexus_core::{
+    CandidateId, ExecutionContext, NodeId, PathId, PrecisionMode, VcpError, VcpResult,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone, Copy)]
@@ -39,8 +41,8 @@ struct GraphEvidence {
 }
 
 #[derive(Clone)]
-pub(super) struct ReadoutWorkspace<'r, 'asset, 'query, 'ctx> {
-    pub(super) input: RiverReadoutInput<'asset, 'query>,
+pub(super) struct ReadoutWorkspace<'r, 'call, 'ctx> {
+    pub(super) input: RiverReadoutInput<'call>,
     pub(super) config: &'r RiverReadoutConfig,
     pub(super) active: &'r HashMap<(NodeId, NodeId), f64>,
     pub(super) topology_edges: &'r [(crate::ObservationEdge, usize, f64)],
@@ -53,51 +55,64 @@ pub(super) struct ReadoutWorkspace<'r, 'asset, 'query, 'ctx> {
     pub(super) path_gate: f64,
     pub(super) field_mix: [bool; 2],
     pub(super) fields: [&'r [f64]; 2],
-    pub(super) tag_norms: &'r [f64],
+    pub(super) tag_norms: HashMap<NodeId, f64>,
     pub(super) ctx: &'r ExecutionContext<'ctx>,
     pub(super) pair_cosines: HashMap<(NodeId, NodeId), f64>,
     pub(super) contacts: HashMap<NodeId, FieldContact>,
 }
 
-impl ReadoutWorkspace<'_, '_, '_, '_> {
+impl<'call> ReadoutWorkspace<'_, 'call, '_> {
+    fn tag_norm(&mut self, node: NodeId) -> VcpResult<(&'call [f32], f64)> {
+        let matrix = self.input.tag_vectors;
+        let vector = matrix
+            .row(node.index())
+            .ok_or_else(|| super::invalid("river.paths", "path node is outside the tag matrix"))?;
+        let norm = *self.tag_norms.entry(node).or_insert_with(|| {
+            matrix
+                .sq_norm_f64(node.index())
+                .unwrap_or_else(|| norm_sq_f32(vector, PrecisionMode::FastSimd))
+        });
+        if !norm.is_finite() {
+            return Err(super::invalid(
+                "river.paths",
+                "path node vector must be finite",
+            ));
+        }
+        Ok((vector, norm))
+    }
+
     fn pair(&mut self, a: NodeId, b: NodeId) -> VcpResult<f64> {
         const STAGE: &str = "river.readout";
         let key = (a.min(b), a.max(b));
+        if let Some(&cosine) = self.pair_cosines.get(&key) {
+            return Ok(cosine);
+        }
         let count = self.pair_cosines.len();
         let limit = self.ctx.limits.pair_work_limit;
-        Ok(match self.pair_cosines.entry(key) {
-            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                if count >= limit {
-                    return Err(VcpError::ResourceLimitExceeded {
-                        stage: STAGE,
-                        limit_name: "pair_work_limit",
-                        actual: count.saturating_add(1),
-                        limit,
-                    });
-                }
-                let matrix = self.input.tag_vectors;
-                *entry.insert(cosine_f32_with_norms(
-                    matrix.row(a.index()).unwrap(),
-                    matrix.row(b.index()).unwrap(),
-                    self.tag_norms[a.index()],
-                    self.tag_norms[b.index()],
-                    self.ctx.precision,
-                    1e-12,
-                ))
-            }
-        })
+        if count >= limit {
+            return Err(VcpError::ResourceLimitExceeded {
+                stage: STAGE,
+                limit_name: "pair_work_limit",
+                actual: count.saturating_add(1),
+                limit,
+            });
+        }
+        let (a, a_norm) = self.tag_norm(a)?;
+        let (b, b_norm) = self.tag_norm(b)?;
+        let cosine = cosine_f32_with_norms(a, b, a_norm, b_norm, PrecisionMode::FastSimd, 1e-12);
+        self.pair_cosines.insert(key, cosine);
+        Ok(cosine)
     }
 
     fn contact(&mut self, tag: NodeId) -> VcpResult<FieldContact> {
         if let Some(value) = self.contacts.get(&tag) {
             return Ok(*value);
         }
-        let state = self.input.fields.observation();
+        let state = self.input.observation;
         let fields = self.fields;
         let domains = [
-            &self.input.fields.dual_fields.local_domain,
-            &self.input.fields.dual_fields.transfer_domain,
+            &self.input.features.fields().dual_fields.local_domain,
+            &self.input.features.fields().dual_fields.transfer_domain,
         ];
         let mut result = FieldContact {
             potential: fields.map(|field| field[tag.index()]),
@@ -134,8 +149,8 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let graph = self.input.graph;
         let fields = self.fields;
         let domains = [
-            &self.input.fields.dual_fields.local_domain,
-            &self.input.fields.dual_fields.transfer_domain,
+            &self.input.features.fields().dual_fields.local_domain,
+            &self.input.features.fields().dual_fields.transfer_domain,
         ];
         let mut used = HashSet::new();
         let mut quality = 0.0;
@@ -203,7 +218,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         if steps.is_empty() {
             return Ok(GraphEvidence::default());
         }
-        let state = self.input.fields.observation();
+        let state = self.input.observation;
         let mut bindings = Vec::new();
         let mut total_node = 0.0;
         let threshold = self.config.tag_align_min_cos;
@@ -276,7 +291,12 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
             .first()
             .zip(steps.last())
             .map_or(1, |(a, b)| a.position.abs_diff(b.position).max(1)) as f64;
-        let roots = self.input.candidates.candidate_roots(candidate);
+        let roots = self
+            .input
+            .features
+            .query()
+            .rows()
+            .candidate_roots(candidate);
         let [
             mut total_edge,
             mut matched_edge,
@@ -299,7 +319,8 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
             } else {
                 0.25
             };
-            let independent = if self.input.evidence == super::EvidencePolicy::Vcp
+            let independent = if self.input.evidence
+                == super::EvidencePolicy::FullWeightWhenUnattributed
                 && self.input.provenance.edge_prov_offsets[index]
                     == self.input.provenance.edge_prov_offsets[index + 1]
             {
@@ -344,8 +365,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let mut contacts = Vec::new();
         for seed in self
             .input
-            .fields
-            .observation()
+            .observation
             .sense
             .nodes
             .iter()
@@ -393,17 +413,13 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
     ) -> VcpResult<PathEvidence> {
         let input = self.input;
         let cfg = self.config;
-        let state = input.fields.observation();
-        let vector = input
-            .candidates
-            .candidate_vectors
-            .row(candidate.index())
-            .unwrap();
-        let precision = self.ctx.precision;
-        let (tags, positions) =
-            path.map_or((&[][..], &[][..]), |path| input.candidates.path_steps(path));
+        let state = input.observation;
+        let candidates = input.features.query().rows();
+        let vector = candidates.candidate_vectors.row(candidate.index()).unwrap();
+        let precision = PrecisionMode::FastSimd;
+        let (tags, positions) = path.map_or((&[][..], &[][..]), |path| candidates.path_steps(path));
         let differentia = &state.disambiguated.differentia_q_perp;
-        let raw = input.pool.query_cosines[candidate.index()].clamp(0.0, 1.0);
+        let raw = input.features.query().original_cosines()[candidate.index()].clamp(0.0, 1.0);
         if tags.is_empty() && differentia.is_none() {
             return Ok(PathEvidence {
                 path,
@@ -419,30 +435,32 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
                 anchor_contacts: 0,
             });
         }
-        let candidate_norm = input
-            .candidates
+        let candidate_norm = candidates
             .candidate_vectors
             .sq_norm_f64(candidate.index())
             .unwrap_or_else(|| norm_sq_f32(vector, precision));
-        let closure = |node: NodeId| {
-            cosine_f32_with_norms(
-                input.tag_vectors.row(node.index()).unwrap(),
+        let closure = |workspace: &mut Self, node| -> VcpResult<f64> {
+            let (tag_vector, tag_norm) = workspace.tag_norm(node)?;
+            Ok(cosine_f32_with_norms(
+                tag_vector,
                 vector,
-                self.tag_norms[node.index()],
+                tag_norm,
                 candidate_norm,
                 precision,
                 1e-12,
-            )
+            ))
         };
         let steps: Vec<_> = tags
             .iter()
             .zip(positions)
-            .map(|(&node, &position)| Step {
-                node,
-                position,
-                closure: closure(node).clamp(0.0, 1.0),
+            .map(|(&node, &position)| {
+                Ok(Step {
+                    node,
+                    position,
+                    closure: closure(self, node)?.clamp(0.0, 1.0),
+                })
             })
-            .collect();
+            .collect::<VcpResult<_>>()?;
         let mut genus = 1.0_f64;
         if differentia.is_some()
             && state.disambiguated.differentia_confidence > 0.0
@@ -451,7 +469,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
                 .any(|step| self.focus_targets.contains(&step.node))
         {
             for &parent in &state.disambiguated.pruned_hypernyms {
-                let mut affinity = closure(parent);
+                let mut affinity = closure(self, parent)?;
                 for step in &steps {
                     affinity = affinity.max(if step.node == parent {
                         1.0
@@ -501,8 +519,9 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let transfer_weight = if self.field_mix[1] { 0.1 } else { 0.0 };
         let mass: f64 = local_weight + transfer_weight;
         let resonance = if mass > 0.0 {
-            (local_weight * input.pool.local_cosines[candidate.index()].clamp(0.0, 1.0)
-                + transfer_weight * input.pool.transfer_cosines[candidate.index()].clamp(0.0, 1.0))
+            (local_weight * input.features.local_cosines()[candidate.index()].clamp(0.0, 1.0)
+                + transfer_weight
+                    * input.features.transfer_cosines()[candidate.index()].clamp(0.0, 1.0))
                 / mass
         } else {
             query

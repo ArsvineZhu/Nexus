@@ -10,7 +10,6 @@ pub struct DtscFieldConfig {
     pub min_field_entropy: f64,
     pub field_energy_mass_ratio: f64,
     pub max_field_nodes: usize,
-    pub fallback_to_knn_on_low_trust: bool,
     pub field_similarity_threshold: f64,
     pub field_kernel_exponent: f64,
     pub max_field_neighbors: usize,
@@ -24,7 +23,6 @@ impl Default for DtscFieldConfig {
             min_field_entropy: 0.12,
             field_energy_mass_ratio: 0.95,
             max_field_nodes: 48,
-            fallback_to_knn_on_low_trust: true,
             field_similarity_threshold: 0.5,
             field_kernel_exponent: 2.0,
             max_field_neighbors: 4,
@@ -206,12 +204,44 @@ impl Default for DtscAuxConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DtscConfig {
     pub field: DtscFieldConfig,
+    pub scoring: DtscScoringConfig,
+}
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DtscScoringConfig {
+    pub evidence: DtscEvidenceConfig,
+    pub readout: DtscReadoutConfig,
+}
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DtscEvidenceConfig {
     pub curve: DtscCurveConfig,
     pub sparse: DtscSparseConfig,
     pub reward: DtscRewardConfig,
-    pub trust: DtscTrustConfig,
     pub auxiliary: Option<DtscAuxConfig>,
+}
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DtscReadoutConfig {
+    pub trust: DtscTrustConfig,
     pub top_k: usize,
+    pub fallback_on_low_trust: bool,
+}
+
+impl Default for DtscReadoutConfig {
+    fn default() -> Self {
+        Self {
+            trust: DtscTrustConfig::default(),
+            top_k: 0,
+            fallback_on_low_trust: true,
+        }
+    }
 }
 
 fn require(condition: bool, name: &str, constraint: &str) -> VcpResult<()> {
@@ -234,7 +264,7 @@ fn range(name: &str, value: f64, lower: f64, upper: f64) -> VcpResult<()> {
 }
 
 impl DtscFieldConfig {
-    pub(crate) fn validate(&self) -> VcpResult<()> {
+    pub fn validate(&self) -> VcpResult<()> {
         require(
             self.min_field_tags > 0 && self.min_field_tags <= self.max_field_nodes,
             "min_field_tags",
@@ -270,6 +300,13 @@ impl DtscFieldConfig {
 impl DtscConfig {
     pub fn validate(&self) -> VcpResult<()> {
         self.field.validate()?;
+        self.scoring.evidence.validate()?;
+        self.scoring.readout.validate()
+    }
+}
+
+impl DtscEvidenceConfig {
+    pub fn validate(&self) -> VcpResult<()> {
         let c = &self.curve;
         range(
             "curve.strong_contact_threshold",
@@ -338,12 +375,6 @@ impl DtscConfig {
                 r.direct_semantic_min_potential,
             ),
             ("reward.direct_confidence_floor", r.direct_confidence_floor),
-            (
-                "trust.min_candidate_coverage",
-                self.trust.min_candidate_coverage,
-            ),
-            ("trust.min_geo_score", self.trust.min_geo_score),
-            ("trust.min_geo_spread", self.trust.min_geo_spread),
         ] {
             range(name, value, 0.0, 1.0)?;
         }
@@ -363,11 +394,6 @@ impl DtscConfig {
             r.direct_semantic_min_contacts > 0,
             "reward.direct_semantic_min_contacts",
             "be positive",
-        )?;
-        require(
-            self.trust.min_strong_evidence.is_finite() && self.trust.min_strong_evidence >= 0.0,
-            "trust.min_strong_evidence",
-            "be finite and nonnegative",
         )?;
         if let Some(a) = &self.auxiliary {
             range("auxiliary.max_aux_bonus", a.max_aux_bonus, 0.0, 0.05)?;
@@ -396,5 +422,24 @@ impl DtscConfig {
             }
         }
         Ok(())
+    }
+}
+
+impl DtscReadoutConfig {
+    pub fn validate(&self) -> VcpResult<()> {
+        let trust = &self.trust;
+        range(
+            "trust.min_candidate_coverage",
+            trust.min_candidate_coverage,
+            0.0,
+            1.0,
+        )?;
+        range("trust.min_geo_score", trust.min_geo_score, 0.0, 1.0)?;
+        range("trust.min_geo_spread", trust.min_geo_spread, 0.0, 1.0)?;
+        require(
+            trust.min_strong_evidence.is_finite() && trust.min_strong_evidence >= 0.0,
+            "trust.min_strong_evidence",
+            "be finite and nonnegative",
+        )
     }
 }

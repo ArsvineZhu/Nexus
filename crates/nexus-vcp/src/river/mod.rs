@@ -10,11 +10,11 @@ pub use ranking::*;
 pub use wormhole::*;
 
 use crate::observation::{finite_vector, invalid};
-use crate::{FieldState, SeedSourceKind, SenseOutput};
+use crate::{ObservationState, SeedSourceKind, SenseOutput};
 use nexus_core::kernel::norm_sq_f32;
 use nexus_core::{
-    CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, Operator, PathId,
-    ProvenanceView, SupportGroupView, VcpResult, VectorMatrixView,
+    CandidateId, Diagnostics, ExecutionContext, Operator, PathId, PrecisionMode, ProvenanceView,
+    SupportGroupView, TransportGraphView, VcpResult, VectorMatrixView,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -50,22 +50,21 @@ impl Default for RiverReadoutConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RiverReadoutInput<'asset, 'query> {
-    pub fields: &'query FieldState,
+pub struct RiverReadoutInput<'call> {
+    pub observation: &'call ObservationState,
+    pub features: &'call RiverFeatures<'call>,
     pub evidence: EvidencePolicy,
-    pub pool: &'query PreparedCandidatePool,
-    pub candidates: CandidatePoolView<'asset>,
-    pub graph: CsrGraphView<'asset>,
-    pub provenance: ProvenanceView<'asset>,
-    pub support_groups: SupportGroupView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
+    pub graph: TransportGraphView<'call>,
+    pub provenance: ProvenanceView<'call>,
+    pub support_groups: SupportGroupView<'call>,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub enum EvidencePolicy {
     #[default]
-    Vcp,
-    Nous,
+    FullWeightWhenUnattributed,
+    DiscountWhenUnattributed,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,8 +104,7 @@ pub struct ReadoutItem {
     pub path_bonus: f64,
     /// Graph and transmission evidence after applying the shared budget (G).
     pub graph_bonus: f64,
-    pub quality_score: f64,
-    pub ranking_score: f64,
+    pub score: f64,
     pub topology_bonus: f64,
     pub genus_gate: f64,
     pub direct_anchor_contacts: u8,
@@ -117,6 +115,7 @@ pub struct PathEvidence {
     pub path: Option<PathId>,
     pub base: f64,
     pub path_bonus: f64,
+    /// Raw graph request before the shared topology budget and transport are applied.
     pub graph_bonus: f64,
     pub path_quality: f64,
     pub field_support: f64,
@@ -128,30 +127,57 @@ pub struct PathEvidence {
 }
 
 impl PathEvidence {
-    fn item(self, candidate: CandidateId, cap: f64, cross_file: f64) -> ReadoutItem {
+    fn validate(self, cap: f64) -> VcpResult<()> {
+        let scalars = [
+            self.base,
+            self.path_quality,
+            self.field_support,
+            self.node_alignment,
+            self.edge_coverage,
+            self.genus_gate,
+        ];
+        if scalars.iter().any(|value| !(0.0..=1.0).contains(value))
+            || !(0.0..=cap).contains(&self.path_bonus)
+            || !self.graph_bonus.is_finite()
+            || self.graph_bonus < 0.0
+            || !(0.0..=1.0).contains(&self.ordinary_transport)
+        {
+            return Err(invalid("river.paths", "invalid path evidence"));
+        }
+        Ok(())
+    }
+
+    fn item(self, candidate: CandidateId, cap: f64, cross_file: f64) -> VcpResult<ReadoutItem> {
+        self.validate(cap)?;
+        if !(0.0..=1.0).contains(&cross_file) {
+            return Err(invalid("river.paths", "invalid cross-file transport"));
+        }
+
+        let remaining = cap - self.path_bonus;
         let transport = cap * self.ordinary_transport.max(cross_file);
-        let graph = self.graph_bonus.min((cap - self.path_bonus).max(0.0));
-        let merged = if transport <= 0.0 {
+        let graph = self.graph_bonus.min(remaining);
+        let merged = if transport == 0.0 {
             graph
-        } else if graph <= 0.0 {
+        } else if graph == 0.0 {
             transport
         } else {
             cap * (1.0 - (1.0 - graph / cap) * (1.0 - transport / cap))
         };
-        let bonus = merged.min((cap - self.path_bonus).max(0.0));
-        let score = (self.base + self.path_bonus + bonus).clamp(0.0, 1.0);
-        ReadoutItem {
+        let mut bonus = merged.min(remaining);
+        if self.path_bonus + bonus > cap {
+            bonus = bonus.next_down();
+        }
+        Ok(ReadoutItem {
             candidate,
             chosen_path: self.path,
             base_score: self.base,
             path_bonus: self.path_bonus,
             graph_bonus: bonus,
-            quality_score: score,
-            ranking_score: score,
+            score: (self.base + self.path_bonus + bonus).clamp(0.0, 1.0),
             topology_bonus: self.path_bonus + bonus,
             genus_gate: self.genus_gate,
             direct_anchor_contacts: self.anchor_contacts,
-        }
+        })
     }
 }
 
@@ -364,7 +390,7 @@ pub struct RiverReadoutOperator;
 
 impl Operator for AnalyzeRiverPaths {
     type Config = RiverReadoutConfig;
-    type Input<'asset, 'query> = RiverReadoutInput<'asset, 'query>;
+    type Input<'call> = RiverReadoutInput<'call>;
     type Output = RiverPathAnalysis;
 
     fn name(&self) -> &'static str {
@@ -375,11 +401,10 @@ impl Operator for AnalyzeRiverPaths {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
-        input.candidates.validate(stage)?;
         input.tag_vectors.validate(stage)?;
         input.provenance.validate(input.graph.nnz(), stage)?;
         input.support_groups.validate(stage)?;
@@ -402,25 +427,15 @@ impl Operator for AnalyzeRiverPaths {
 
         let n = input.graph.node_count;
         let vectors = input.tag_vectors;
-        let state = input.fields.observation();
-        let count = input.candidates.candidate_count;
-        let pool = input.pool;
+        let state = input.observation;
+        let fields = input.features.fields();
+        let candidates = input.features.query().rows();
+        let count = candidates.candidate_count;
         if vectors.rows != n
-            || vectors.dim != input.candidates.candidate_vectors.dim
-            || pool.candidate_count != count
-            || [
-                pool.query_cosines.as_slice(),
-                &pool.denoised_cosines,
-                &pool.local_cosines,
-                &pool.transfer_cosines,
-            ]
-            .into_iter()
-            .any(|column| column.len() != count || column.iter().any(|v| !v.is_finite()))
-            || input
-                .candidates
-                .path_tags
-                .iter()
-                .any(|node| node.index() >= n)
+            || vectors.dim != candidates.candidate_vectors.dim
+            || state.original_query != input.features.query().original_query()
+            || !fields.dual_fields.local_converged
+            || !fields.dual_fields.transfer_converged
             || state.sense.nodes.iter().any(|node| node.node.index() >= n)
             || state
                 .sense
@@ -428,14 +443,14 @@ impl Operator for AnalyzeRiverPaths {
                 .iter()
                 .any(|edge| edge.source.index() >= n || edge.target.index() >= n)
             || [
-                &input.fields.dual_fields.local_field,
-                &input.fields.dual_fields.transfer_field,
+                &fields.dual_fields.local_field,
+                &fields.dual_fields.transfer_field,
             ]
             .into_iter()
             .any(|field| field.len() != n || field.iter().any(|v| !v.is_finite() || *v < 0.0))
             || [
-                &input.fields.dual_fields.local_domain,
-                &input.fields.dual_fields.transfer_domain,
+                &fields.dual_fields.local_domain,
+                &fields.dual_fields.transfer_domain,
                 &state.disambiguated.pruned_hypernyms,
             ]
             .into_iter()
@@ -529,21 +544,11 @@ impl Operator for AnalyzeRiverPaths {
         } else {
             0.0
         };
-        let field_mix = [
-            &input.fields.basins.local_vector,
-            &input.fields.basins.transfer_vector,
-        ]
-        .map(|vector| norm_sq_f32(vector, ctx.precision) > 1e-12);
-        let tag_norms: Vec<_> = (0..vectors.rows)
-            .map(|index| {
-                vectors
-                    .sq_norm_f64(index)
-                    .unwrap_or_else(|| norm_sq_f32(vectors.row(index).unwrap(), ctx.precision))
-            })
-            .collect();
+        let field_mix = [&fields.basins.local_vector, &fields.basins.transfer_vector]
+            .map(|vector| norm_sq_f32(vector, PrecisionMode::FastSimd) > 1e-12);
         let fields = [
-            &input.fields.dual_fields.local_field,
-            &input.fields.dual_fields.transfer_field,
+            &fields.dual_fields.local_field,
+            &fields.dual_fields.transfer_field,
         ]
         .map(|field| {
             let peak = field.iter().copied().fold(0.0, f64::max);
@@ -567,17 +572,15 @@ impl Operator for AnalyzeRiverPaths {
             path_gate,
             field_mix,
             fields: fields.each_ref().map(Vec::as_slice),
-            tag_norms: &tag_norms,
+            tag_norms: HashMap::new(),
             ctx,
             pair_cosines: HashMap::new(),
             contacts: HashMap::new(),
         };
-        let score = |workspace: &mut path::ReadoutWorkspace<'_, '_, '_, '_>,
-                     index|
-         -> VcpResult<_> {
+        let score = |workspace: &mut path::ReadoutWorkspace<'_, '_, '_>, index| -> VcpResult<_> {
             ctx.check_cancelled(stage)?;
             let candidate = CandidateId::from_index(index, stage)?;
-            let paths = input.candidates.candidate_paths(candidate);
+            let paths = candidates.candidate_paths(candidate);
             let mut variants = Vec::with_capacity(paths.len().max(1));
             for path in paths {
                 variants.push(workspace.score(candidate, Some(PathId::from_index(path, stage)?))?);
@@ -610,7 +613,7 @@ impl Operator for AnalyzeRiverPaths {
 
 impl Operator for RiverReadoutOperator {
     type Config = RiverReadoutConfig;
-    type Input<'asset, 'query> = RiverReadoutInput<'asset, 'query>;
+    type Input<'call> = RiverReadoutInput<'call>;
     type Output = RiverReadoutOutput;
 
     fn name(&self) -> &'static str {
@@ -621,7 +624,7 @@ impl Operator for RiverReadoutOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let start = std::time::Instant::now();
         let analysis = AnalyzeRiverPaths.execute(ctx, config, input)?;
@@ -630,15 +633,15 @@ impl Operator for RiverReadoutOperator {
             .iter()
             .enumerate()
             .map(|(index, paths)| {
-                Ok(select_path(
+                select_path(
                     CandidateId::from_index(index, self.name())?,
                     paths,
                     config.unified_budget_ct,
                     |_| 0.0,
-                ))
+                )
             })
             .collect::<VcpResult<Vec<_>>>()?;
-        sort_items(&mut items, input.candidates);
+        sort_items(&mut items);
         Ok(RiverReadoutOutput {
             items,
             omega: analysis.omega,
@@ -667,26 +670,32 @@ fn select_path(
     variants: &[PathEvidence],
     cap: f64,
     evidence: impl Fn(Option<PathId>) -> f64,
-) -> ReadoutItem {
-    variants
+) -> VcpResult<ReadoutItem> {
+    let mut items = variants
         .iter()
-        .map(|&path| path.item(candidate, cap, evidence(path.path)))
-        .max_by(|a, b| {
-            a.topology_bonus
-                .total_cmp(&b.topology_bonus)
-                .then_with(|| b.chosen_path.cmp(&a.chosen_path))
-        })
-        .expect("a candidate has at least its pathless fallback")
+        .map(|&path| path.item(candidate, cap, evidence(path.path)));
+    let mut best = items
+        .next()
+        .ok_or_else(|| invalid("river.paths", "candidate has no path evidence"))??;
+    for item in items {
+        let item = item?;
+        if item
+            .score
+            .total_cmp(&best.score)
+            .then_with(|| item.topology_bonus.total_cmp(&best.topology_bonus))
+            .then_with(|| best.chosen_path.cmp(&item.chosen_path))
+            .is_gt()
+        {
+            best = item;
+        }
+    }
+    Ok(best)
 }
 
-fn sort_items(items: &mut [ReadoutItem], pool: CandidatePoolView<'_>) {
+fn sort_items(items: &mut [ReadoutItem]) {
     items.sort_unstable_by(|a, b| {
-        let ai = a.candidate.index();
-        let bi = b.candidate.index();
-        b.ranking_score
-            .total_cmp(&a.ranking_score)
-            .then_with(|| pool.union_scores[bi].total_cmp(&pool.union_scores[ai]))
-            .then_with(|| pool.union_ranks[ai].cmp(&pool.union_ranks[bi]))
+        b.score
+            .total_cmp(&a.score)
             .then(a.candidate.cmp(&b.candidate))
     });
 }

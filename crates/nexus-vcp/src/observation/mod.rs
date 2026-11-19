@@ -15,11 +15,10 @@ pub use projection::*;
 pub use sensing::*;
 
 use nexus_core::{
-    CsrGraphView, EpaBasisView, ExecutionContext, NodeId, Operator, TagLexicalMetaView, VcpError,
-    VcpResult, VectorMatrixView,
+    EpaBasisView, ExecutionContext, NodeId, Operator, TagLexicalMetaView, TransportGraphView,
+    VcpError, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 pub(crate) fn invalid(stage: &'static str, detail: &'static str) -> VcpError {
     VcpError::InvalidInput {
@@ -47,6 +46,17 @@ pub(crate) fn finite_vector(stage: &'static str, vector: &[f32], dim: usize) -> 
         return Err(invalid(stage, "vector must be finite"));
     }
     Ok(())
+}
+
+pub(crate) fn unit_direction(stage: &'static str, vector: &[f32], dim: usize) -> VcpResult<()> {
+    if vector.len() != dim {
+        return Err(VcpError::DimensionMismatch {
+            stage,
+            expected: dim,
+            actual: vector.len(),
+        });
+    }
+    nexus_core::kernel::validate_unit_direction(vector, stage)
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -78,17 +88,17 @@ impl Default for ObservationConfig {
 }
 
 #[derive(Clone, Copy)]
-pub struct ObservationInput<'asset> {
-    pub query: &'asset [f32],
-    pub query_text: &'asset str,
-    pub candidates: &'asset PyramidCandidates<'asset>,
-    pub graph: CsrGraphView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub lexical_meta: TagLexicalMetaView<'asset>,
-    pub epa_basis: Option<EpaBasisView<'asset>>,
-    pub core_tags: &'asset [NodeId],
-    pub ghost_vectors: Option<VectorMatrixView<'asset, f32>>,
-    pub ghost_is_core: &'asset [bool],
+pub struct ObservationInput<'call> {
+    pub query: &'call [f32],
+    pub query_text: &'call str,
+    pub candidates: &'call PyramidCandidates<'call>,
+    pub graph: TransportGraphView<'call>,
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub lexical_meta: TagLexicalMetaView<'call>,
+    pub epa_basis: Option<EpaBasisView<'call>>,
+    pub core_tags: &'call [NodeId],
+    pub ghost_vectors: Option<VectorMatrixView<'call, f32>>,
+    pub ghost_is_core: &'call [bool],
 }
 
 /// The owned intermediate state shared by readouts and planning for one query.
@@ -108,8 +118,8 @@ pub struct Observe;
 
 impl Operator for Observe {
     type Config = ObservationConfig;
-    type Input<'asset, 'query> = ObservationInput<'asset>;
-    type Output = Arc<ObservationState>;
+    type Input<'call> = ObservationInput<'call>;
+    type Output = ObservationState;
 
     fn name(&self) -> &'static str {
         "observe"
@@ -119,7 +129,7 @@ impl Operator for Observe {
         &self,
         ctx: &ExecutionContext<'_>,
         cfg: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let epa = EpaAnalyzeOperator.execute(
             ctx,
@@ -189,7 +199,7 @@ impl Operator for Observe {
                 tag_vectors: input.tag_vectors,
             },
         )?;
-        Ok(Arc::new(ObservationState {
+        Ok(ObservationState {
             original_query: input.query.to_vec(),
             epa,
             pyramid,
@@ -197,7 +207,7 @@ impl Operator for Observe {
             gated_seeds,
             sense,
             fused,
-        }))
+        })
     }
 }
 
@@ -210,44 +220,24 @@ pub struct FieldConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FieldState {
-    observation: Arc<ObservationState>,
+pub struct FieldValues {
     pub dual_fields: DualFields,
     pub basins: BasinSupports,
 }
 
-impl FieldState {
-    /// Import a field solution and basin projection alongside the observation they used.
-    pub fn from_parts(
-        observation: Arc<ObservationState>,
-        dual_fields: DualFields,
-        basins: BasinSupports,
-    ) -> Self {
-        Self {
-            observation,
-            dual_fields,
-            basins,
-        }
-    }
-
-    pub fn observation(&self) -> &ObservationState {
-        &self.observation
-    }
-}
-
 #[derive(Clone, Copy)]
-pub struct FieldInput<'asset, 'query> {
-    pub graph: CsrGraphView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset>,
-    pub observation: &'query Arc<ObservationState>,
+pub struct FieldInput<'call> {
+    pub graph: TransportGraphView<'call>,
+    pub tag_vectors: VectorMatrixView<'call>,
+    pub observation: &'call ObservationState,
 }
 
 pub struct ComputeFields;
 
 impl Operator for ComputeFields {
     type Config = FieldConfig;
-    type Input<'asset, 'query> = FieldInput<'asset, 'query>;
-    type Output = FieldState;
+    type Input<'call> = FieldInput<'call>;
+    type Output = FieldValues;
 
     fn name(&self) -> &'static str {
         "fields"
@@ -257,16 +247,39 @@ impl Operator for ComputeFields {
         &self,
         ctx: &ExecutionContext<'_>,
         cfg: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let dual_fields = DualFieldSolveOperator.execute(
             ctx,
             &cfg.solve,
             DualFieldSolveInput {
                 graph: input.graph,
-                fused: &input.observation.fused,
+                source_field: &input.observation.sense.source_field,
             },
         )?;
+        for (stage, converged, residual, tolerance) in [
+            (
+                "field.local",
+                dual_fields.local_converged,
+                dual_fields.local_residual,
+                cfg.solve.local_tolerance,
+            ),
+            (
+                "field.transfer",
+                dual_fields.transfer_converged,
+                dual_fields.transfer_residual,
+                cfg.solve.transfer_tolerance,
+            ),
+        ] {
+            if !converged {
+                return Err(VcpError::NotConverged {
+                    stage,
+                    iterations: dual_fields.iterations,
+                    residual,
+                    tolerance,
+                });
+            }
+        }
         let basins = BasinProjectionOperator.execute(
             ctx,
             &cfg.basins,
@@ -277,10 +290,9 @@ impl Operator for ComputeFields {
                 dual_fields: &dual_fields,
             },
         )?;
-        Ok(FieldState::from_parts(
-            Arc::clone(input.observation),
+        Ok(FieldValues {
             dual_fields,
             basins,
-        ))
+        })
     }
 }

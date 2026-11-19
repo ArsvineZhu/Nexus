@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{ExecutionContext, Operator, VcpError, VcpResult};
+use crate::{ExecutionContext, VcpError, VcpResult};
 use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,19 +132,12 @@ impl<'request> Plan<'request> {
         }
     }
 
-    /// The binder receives the typed results of the requested dependencies.
-    pub fn add<O, D, F>(
-        &mut self,
-        operator: O,
-        config: O::Config,
-        dependencies: D,
-        bind: F,
-    ) -> VcpResult<Handle<O::Output>>
+    /// Execute a closure while its typed dependencies are borrowed.
+    pub fn add<T, D, F>(&mut self, dependencies: D, run: F) -> VcpResult<Handle<T>>
     where
-        O: Operator + 'static,
-        O::Config: 'request,
+        T: Send + Sync + 'static,
         D: Dependencies + 'request,
-        F: for<'results> FnOnce(Inputs<'results, D>) -> VcpResult<O::Input<'request, 'results>>
+        F: for<'results> FnOnce(&ExecutionContext<'_>, Inputs<'results, D>) -> VcpResult<T>
             + 'request,
     {
         let mut inputs = Vec::new();
@@ -153,11 +146,14 @@ impl<'request> Plan<'request> {
         self.steps.push(Step {
             inputs,
             run: Box::new(move |ctx, slots| {
-                ctx.check_cancelled(operator.name())?;
-                let input = bind(Inputs {
-                    values: dependencies.borrow(slots)?,
-                })?;
-                Ok(Box::new(operator.execute(ctx, &config, input)?))
+                ctx.check_cancelled("plan")?;
+                let result = run(
+                    ctx,
+                    Inputs {
+                        values: dependencies.borrow(slots)?,
+                    },
+                )?;
+                Ok(Box::new(result))
             }),
         });
         Ok(Handle {

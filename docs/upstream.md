@@ -9,6 +9,9 @@ See the [golden comparisons](vcp-conformance.md) for the covered numerical behav
 
 ## Research definitions
 
-The [upstream TagMemo archive](https://github.com/lioensky/VCPToolBox/tree/5adb12bb55e616e22bd0e0dbfdc13032c069941a/docs/archive/tagmemoV10) preserves direct-anchor readout, relative topology matching and alternative path scoring equations for research. The executable TagMemo preset in Nexus is the composition of the shared observation and a cosine readout against its enhanced query. DTSC's optional evidence channels and the conditional RRF operators have their own executable inputs.
+The [upstream TagMemo archive](https://github.com/lioensky/VCPToolBox/tree/5adb12bb55e616e22bd0e0dbfdc13032c069941a/docs/archive/tagmemoV10) preserves direct-anchor readout, relative topology matching and alternative path scoring equations for research. TagMemo reads the shared enhanced-query cosine column. DTSC exposes field, evidence and pool stages with optional auxiliary and identity terms. The Ω weight function can feed independent business-ID RRF; Wormhole route ranking keeps its maximum-route contribution.
 
-For River, paths expose quality, field support, node and edge alignment, direct contacts and the three continuous scoring components. The `AnalyzeRiverPaths` operator returns this evidence for all paths. `analyze_river_network` returns Ω and the shape probabilities without requiring a candidate pool.
+For River, paths expose quality, field support, node and edge alignment, direct contacts and the three continuous scoring components. The `AnalyzeRiverPaths` operator returns this evidence for all paths. `analyze_river_network` returns Ω and the morphology weights without requiring candidate rows.
+
+
+Semantic inputs at the host boundary are finite unit directions after preparation. Domain transport uses effective nonnegative CSR weights with each row summing to at most one. Dual fields use propagated SpikeSense source mass, and field preparation requires both fixed points to converge before projection. EPA's spectral concentration is axis-energy concentration discounted by the domain gate. Without a basis, 0.5 is a neutral initialization and cache availability is false.

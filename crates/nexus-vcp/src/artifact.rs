@@ -95,12 +95,12 @@ impl Default for ProvenanceConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct FactMatrixInput<'asset, 'query> {
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub sequences: SequenceSliceView<'asset>,
-    pub anchor_gains: &'query [f64],
-    pub positive_relations: Option<PositiveRelationView<'asset>>,
-    pub negative_relations: Option<NegativeRelationView<'asset>>,
+pub struct FactMatrixInput<'call> {
+    pub tag_vectors: VectorMatrixView<'call, f32>,
+    pub sequences: SequenceSliceView<'call>,
+    pub anchor_gains: &'call [f64],
+    pub positive_relations: Option<PositiveRelationView<'call>>,
+    pub negative_relations: Option<NegativeRelationView<'call>>,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -146,39 +146,25 @@ pub struct FactMatrixOutput {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TransportCalibrateInput<'query> {
-    pub fact_matrix: &'query FactMatrix,
-    pub anchor_gains: &'query [f64],
-    pub edge_gates: Option<&'query [f64]>,
+pub struct TransportCalibrateInput<'call> {
+    pub fact_matrix: &'call FactMatrix,
+    pub anchor_gains: &'call [f64],
+    pub edge_gates: Option<&'call [f64]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TransportGraph {
-    pub graph: nexus_core::CsrGraph,
+pub struct TransportCalibration {
+    pub graph: TransportGraph,
     pub diagnostics: Diagnostics,
 }
 
-impl TransportGraph {
-    pub fn as_csr_view(&self) -> CsrGraphView<'_> {
-        self.graph.view()
-    }
-}
-
-impl std::ops::Deref for TransportGraph {
-    type Target = nexus_core::CsrGraph;
-
-    fn deref(&self) -> &Self::Target {
-        &self.graph
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
-pub struct ProvenanceBuildInput<'asset, 'query> {
-    pub transport_row_offsets: &'query [usize],
-    pub transport_targets: &'query [NodeId],
-    pub sequences: SequenceSliceView<'asset>,
-    pub positive_relations: Option<PositiveRelationView<'asset>>,
-    pub support_groups: Option<SupportGroupView<'asset>>,
+pub struct ProvenanceBuildInput<'call> {
+    pub transport_row_offsets: &'call [usize],
+    pub transport_targets: &'call [NodeId],
+    pub sequences: SequenceSliceView<'call>,
+    pub positive_relations: Option<PositiveRelationView<'call>>,
+    pub support_groups: Option<SupportGroupView<'call>>,
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -242,18 +228,18 @@ fn stable_sum_edges(mut entries: Vec<(NodeId, NodeId, f64)>) -> Vec<(NodeId, Nod
 
 impl Operator for FactMatrixOperator {
     type Config = FactMatrixConfig;
-    type Input<'asset, 'query> = FactMatrixInput<'asset, 'query>;
+    type Input<'call> = FactMatrixInput<'call>;
     type Output = FactMatrixOutput;
 
     fn name(&self) -> &'static str {
         "fact_matrix"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "FactMatrixOperator::execute";
         let start_time = Instant::now();
@@ -382,7 +368,7 @@ impl Operator for FactMatrixOperator {
                 .get(a.index())
                 .and_then(|o| o.as_deref())
                 .zip(unit_vecs.get(b.index()).and_then(|o| o.as_deref()))
-                .map(|(va, vb)| dot_f64(va, vb, ctx.precision).clamp(-1.0, 1.0))
+                .map(|(va, vb)| dot_f64(va, vb, PrecisionMode::FastSimd).clamp(-1.0, 1.0))
                 .unwrap_or(low_fallback);
             if sim < 0.15 {
                 0.4 + sim
@@ -413,8 +399,8 @@ impl Operator for FactMatrixOperator {
             }
             seq_buf.clear();
             seq_buf.extend(positions.iter().copied().zip(tags.iter().copied()));
-            if !seq_buf.windows(2).all(|w| w[0] <= w[1]) {
-                seq_buf.sort_unstable();
+            if !seq_buf.windows(2).all(|w| w[0].0 <= w[1].0) {
+                seq_buf.sort_by_key(|step| step.0);
             }
 
             let count = seq_buf.len() as f64;
@@ -536,18 +522,18 @@ impl Operator for FactMatrixOperator {
 
 impl Operator for TransportCalibrateOperator {
     type Config = TransportConfig;
-    type Input<'asset, 'query> = TransportCalibrateInput<'query>;
-    type Output = TransportGraph;
+    type Input<'call> = TransportCalibrateInput<'call>;
+    type Output = TransportCalibration;
 
     fn name(&self) -> &'static str {
         "transport_calibrate"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "TransportCalibrateOperator::execute";
         let start_time = Instant::now();
@@ -829,8 +815,8 @@ impl Operator for TransportCalibrateOperator {
             Some(sorted)
         };
 
-        let out = TransportGraph {
-            graph: nexus_core::CsrGraph::new(nexus_core::CsrStorage {
+        let out = TransportCalibration {
+            graph: TransportGraph::new(CsrGraph::new(CsrStorage {
                 node_count,
                 row_offsets,
                 targets,
@@ -840,7 +826,7 @@ impl Operator for TransportCalibrateOperator {
                 max_inbound,
                 anchor_gains: input.anchor_gains.to_vec(),
                 target_sorted_indices,
-            })?,
+            })?)?,
             diagnostics: Diagnostics {
                 truncated: false,
                 truncation_reason: None,
@@ -853,18 +839,18 @@ impl Operator for TransportCalibrateOperator {
 
 impl Operator for ProvenanceBuildOperator {
     type Config = ProvenanceConfig;
-    type Input<'asset, 'query> = ProvenanceBuildInput<'asset, 'query>;
+    type Input<'call> = ProvenanceBuildInput<'call>;
     type Output = ProvenanceData;
 
     fn name(&self) -> &'static str {
         "provenance_build"
     }
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "ProvenanceBuildOperator::execute";
         let start_time = Instant::now();
@@ -973,8 +959,8 @@ impl Operator for ProvenanceBuildOperator {
 
             seq_buf.clear();
             seq_buf.extend(positions.iter().copied().zip(tags.iter().copied()));
-            if !seq_buf.windows(2).all(|w| w[0] <= w[1]) {
-                seq_buf.sort_unstable();
+            if !seq_buf.windows(2).all(|w| w[0].0 <= w[1].0) {
+                seq_buf.sort_by_key(|step| step.0);
             }
 
             for i in 0..seq_buf.len() {

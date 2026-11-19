@@ -104,45 +104,45 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
     let ctx = ExecutionContext::default();
 
     let tag_vectors = VectorMatrixView::new(&[1., 0., 1., 0., 0., 1., 0., 1.], 4, 2).unwrap();
-    let graph = CsrGraphView::new(CsrParts {
-        node_count: 4,
-        row_offsets: &[0, 1, 1, 1, 1],
-        targets: &[NodeId(2)],
-        weights: &[0.8],
-        is_static_wormhole: &[true],
-        inbound: &[0., 0., 0.8, 0.],
-        max_inbound: 0.8,
-        anchor_gains: &[0.0; 4],
-        target_sorted_indices: None,
-        edge_gates: None,
-    })
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            node_count: 4,
+            row_offsets: &[0, 1, 1, 1, 1],
+            targets: &[NodeId(2)],
+            weights: &[0.8],
+            is_static_wormhole: &[true],
+            inbound: &[0., 0., 0.8, 0.],
+            max_inbound: 0.8,
+            anchor_gains: &[0.0; 4],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap(),
+    )
     .unwrap();
     let recall = |_, _: &[f32], _, out: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
-        out.push((NodeId(0), 1.0));
+        out.push(NodeId(0));
         Ok(())
     };
+    let observation_input = ObservationInput {
+        graph,
+        tag_vectors,
+        query: &[1., 0.],
+        candidates: &recall,
+        query_text: "source",
+        lexical_meta: TagLexicalMetaView {
+            names: TextRows::Borrowed(&["source", "focus", "target", "bridge"]),
+            node_count: 4,
+            alias_offsets: &[0; 5],
+            aliases: TextRows::Borrowed(&[]),
+        },
+        epa_basis: None,
+        core_tags: &[NodeId(0), NodeId(1)],
+        ghost_vectors: None,
+        ghost_is_core: &[],
+    };
     let observation = Observe
-        .execute(
-            &ctx,
-            &ObservationConfig::default(),
-            ObservationInput {
-                graph,
-                tag_vectors,
-                query: &[1., 0.],
-                candidates: &recall,
-                query_text: "source",
-                lexical_meta: TagLexicalMetaView {
-                    names: TextRows::Borrowed(&["source", "focus", "target", "bridge"]),
-                    node_count: 4,
-                    alias_offsets: &[0; 5],
-                    aliases: TextRows::Borrowed(&[]),
-                },
-                epa_basis: None,
-                core_tags: &[NodeId(0), NodeId(1)],
-                ghost_vectors: None,
-                ghost_is_core: &[],
-            },
-        )
+        .execute(&ctx, &ObservationConfig::default(), observation_input)
         .unwrap();
     let fields = ComputeFields
         .execute(
@@ -155,15 +155,9 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             },
         )
         .unwrap();
-    let candidates = CandidatePoolView {
+    let candidates = CandidateRowsView {
         candidate_count: 2,
-        baseline_scores: &[0.0; 2],
-        union_scores: &[0.0; 2],
-        union_ranks: &[1, 2],
-        bm25_scores: &[0.0; 2],
-        bm25_reference: 0.0,
-        anchor_scores: &[0.0; 2],
-        curve_document_ids: &[DocumentId(0), DocumentId(1)],
+        document_ids: &[DocumentId(0), DocumentId(1)],
         candidate_vectors: VectorMatrixView::new(&[0.0, 1.0, 0.0, 1.0], 2, 2).unwrap(),
         candidate_root_offsets: &[0, 1, 1],
         candidate_roots: &[RootId(0)],
@@ -172,41 +166,35 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
         path_tags: &[NodeId(2), NodeId(2)],
         path_positions: &[0, 0],
     };
-    let pool = PoolCalibrateOperator
-        .execute(
-            &ctx,
-            &PoolCalibrateConfig::default(),
-            PoolCalibrateInput {
-                fields: &fields,
-                candidates,
-            },
-        )
-        .unwrap();
+    let query = QueryCosines::prepare(
+        &ctx,
+        candidates,
+        &observation.original_query,
+        &observation.fused.enhanced_query,
+    )
+    .unwrap();
+    let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
+    let river_input = RiverReadoutInput {
+        observation: &observation,
+        evidence: EvidencePolicy::DiscountWhenUnattributed,
+        features: &features,
+        graph,
+        tag_vectors,
+        provenance: ProvenanceView {
+            edge_count: 1,
+            edge_prov_offsets: &[0, 0],
+            prov_groups: &[],
+            prov_masses: &[],
+        },
+        support_groups: SupportGroupView::empty(),
+    };
     let river = RiverReadoutOperator
-        .execute(
-            &ctx,
-            &RiverReadoutConfig::default(),
-            RiverReadoutInput {
-                fields: &fields,
-                evidence: EvidencePolicy::Nous,
-                pool: &pool,
-                candidates,
-                graph,
-                tag_vectors,
-                provenance: ProvenanceView {
-                    edge_count: 1,
-                    edge_prov_offsets: &[0, 0],
-                    prov_groups: &[],
-                    prov_masses: &[],
-                },
-                support_groups: SupportGroupView::empty(),
-            },
-        )
+        .execute(&ctx, &RiverReadoutConfig::default(), river_input)
         .unwrap();
     let input = CrossFileWormholeInput {
         observation: &observation,
         readout: &river,
-        candidates,
+        features: &features,
         graph,
         tag_vectors,
         root_facts: RootFactView {
@@ -241,26 +229,372 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             assert!(item.graph_bonus > baseline.graph_bonus);
         }
         assert!(item.path_bonus + item.graph_bonus <= 0.08);
+        assert_eq!(
+            item.score,
+            (item.base_score + item.path_bonus + item.graph_bonus).clamp(0.0, 1.0)
+        );
     }
+    let repeated = CrossFileWormholeOperator
+        .execute(
+            &ctx,
+            &CrossFileWormholeConfig::default(),
+            CrossFileWormholeInput {
+                readout: &augmented,
+                ..input
+            },
+        )
+        .unwrap();
+    assert_eq!(repeated.items, augmented.items);
+
+    let zero = RiverReadoutOperator
+        .execute(
+            &ctx,
+            &RiverReadoutConfig {
+                unified_budget_ct: 0.0,
+                ..Default::default()
+            },
+            river_input,
+        )
+        .unwrap();
+    let zero = CrossFileWormholeOperator
+        .execute(
+            &ctx,
+            &CrossFileWormholeConfig::default(),
+            CrossFileWormholeInput {
+                readout: &zero,
+                ..input
+            },
+        )
+        .unwrap();
+    for item in zero.items {
+        assert_eq!(item.path_bonus, 0.0);
+        assert_eq!(item.graph_bonus, 0.0);
+        assert_eq!(item.score, item.base_score.clamp(0.0, 1.0));
+    }
+
+    let mut forged = river.clone();
+    forged.path_evidence[0][0].path_bonus = f64::NAN;
+    assert!(matches!(
+        CrossFileWormholeOperator.execute(
+            &ctx,
+            &CrossFileWormholeConfig::default(),
+            CrossFileWormholeInput {
+                readout: &forged,
+                ..input
+            }
+        ),
+        Err(VcpError::InvalidInput { .. })
+    ));
+
     let reranked = WormholeRrfFuseOperator
         .execute(&ctx, &WormholeRrfFuseConfig::default(), input)
         .unwrap();
-    assert!(reranked.rrf_active);
+    assert!(reranked.active);
     for item in &reranked.items {
         let index = river
             .items
             .iter()
             .position(|row| row.candidate == item.candidate)
             .unwrap();
-        let prior = &river.items[index];
         let route = if item.candidate == CandidateId(1) {
             river.omega.omega / 61.0
         } else {
             0.0
         };
-        assert!((item.ranking_score - (1.0 / (61.0 + index as f64) + route)).abs() <= 1e-15);
-        assert_eq!(item.quality_score.to_bits(), prior.quality_score.to_bits());
+        assert!((item.score - (1.0 / (61.0 + index as f64) + route)).abs() <= 1e-15);
     }
+    let inactive = WormholeRrfFuseOperator
+        .execute(
+            &ctx,
+            &WormholeRrfFuseConfig::default(),
+            CrossFileWormholeInput {
+                root_facts: RootFactView::empty(),
+                ..input
+            },
+        )
+        .unwrap();
+    assert!(!inactive.active);
+    for (item, prior) in inactive.items.iter().zip(&river.items) {
+        assert_eq!(item.candidate, prior.candidate);
+        assert_eq!(item.score, prior.score);
+    }
+
+    let two_paths = CandidateRowsView {
+        candidate_vectors: VectorMatrixView::new(&[0.0, 1.0, 0.6, 0.8], 2, 2).unwrap(),
+        candidate_path_offsets: &[0, 1, 3],
+        path_tag_offsets: &[0, 1, 2, 3],
+        path_tags: &[NodeId(2), NodeId(0), NodeId(2)],
+        path_positions: &[0; 3],
+        ..candidates
+    };
+    let two_paths = QueryCosines::prepare(
+        &ctx,
+        two_paths,
+        &observation.original_query,
+        &observation.fused.enhanced_query,
+    )
+    .unwrap();
+    let two_paths = RiverFeatures::prepare(&ctx, &two_paths, &fields).unwrap();
+    let baseline = RiverReadoutOperator
+        .execute(
+            &ctx,
+            &RiverReadoutConfig::default(),
+            RiverReadoutInput {
+                features: &two_paths,
+                ..river_input
+            },
+        )
+        .unwrap();
+    let recomposed = CrossFileWormholeOperator
+        .execute(
+            &ctx,
+            &CrossFileWormholeConfig::default(),
+            CrossFileWormholeInput {
+                features: &two_paths,
+                readout: &baseline,
+                ..input
+            },
+        )
+        .unwrap();
+    let before = baseline
+        .items
+        .iter()
+        .find(|item| item.candidate == CandidateId(1))
+        .unwrap();
+    let after = recomposed
+        .items
+        .iter()
+        .find(|item| item.candidate == CandidateId(1))
+        .unwrap();
+    assert_eq!(before.chosen_path, Some(PathId(1)));
+    assert_eq!(after.chosen_path, Some(PathId(2)));
+    let supported = baseline.path_evidence[1][1];
+    let remaining = TOPOLOGY_BUDGET - supported.path_bonus;
+    let graph_request = supported.graph_bonus.min(remaining);
+    let [x, y] = [0.6_f32, 0.8_f32].map(f64::from);
+    let transport = baseline.omega.omega * y / x.hypot(y);
+    let graph_bonus = (TOPOLOGY_BUDGET
+        * (1.0 - (1.0 - graph_request / TOPOLOGY_BUDGET) * (1.0 - transport)))
+        .min(remaining);
+    assert!((after.score - (supported.base + supported.path_bonus + graph_bonus)).abs() < 1e-14);
+    assert_eq!(after.direct_anchor_contacts, supported.anchor_contacts);
+
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            row_offsets: &[0, 1, 2, 2, 2],
+            targets: &[NodeId(2), NodeId(2)],
+            weights: &[0.8, 0.8],
+            is_static_wormhole: &[true; 2],
+            inbound: &[0.0, 0.0, 1.6, 0.0],
+            max_inbound: 1.6,
+            ..*graph.as_csr()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let observation = Observe
+        .execute(
+            &ctx,
+            &ObservationConfig::default(),
+            ObservationInput {
+                graph,
+                ..observation_input
+            },
+        )
+        .unwrap();
+    let [first, second] = observation.sense.edges.as_slice() else {
+        panic!(
+            "expected two witnessed routes: {:?}",
+            observation.sense.edges
+        );
+    };
+    assert!(first.wormhole && second.wormhole);
+    assert_ne!(first.source, second.source);
+    assert!(first.flow.min(second.flow) >= 0.5 * first.flow.max(second.flow));
+    let fields = ComputeFields
+        .execute(
+            &ctx,
+            &FieldConfig::default(),
+            FieldInput {
+                graph,
+                tag_vectors,
+                observation: &observation,
+            },
+        )
+        .unwrap();
+    let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
+    let river = RiverReadoutOperator
+        .execute(
+            &ctx,
+            &RiverReadoutConfig::default(),
+            RiverReadoutInput {
+                graph,
+                observation: &observation,
+                features: &features,
+                provenance: ProvenanceView {
+                    edge_count: 2,
+                    edge_prov_offsets: &[0, 0, 0],
+                    ..river_input.provenance
+                },
+                ..river_input
+            },
+        )
+        .unwrap();
+    let reranked = WormholeRrfFuseOperator
+        .execute(
+            &ctx,
+            &WormholeRrfFuseConfig::default(),
+            CrossFileWormholeInput {
+                observation: &observation,
+                features: &features,
+                graph,
+                readout: &river,
+                root_facts: RootFactView {
+                    root_tags: &[
+                        NodeId(0),
+                        NodeId(1),
+                        NodeId(2),
+                        NodeId(3),
+                        NodeId(0),
+                        NodeId(1),
+                        NodeId(2),
+                        NodeId(3),
+                    ],
+                    root_tag_offsets: &[0, 4, 8],
+                    ..input.root_facts
+                },
+                ..input
+            },
+        )
+        .unwrap();
+    let baseline_rank = river
+        .items
+        .iter()
+        .position(|item| item.candidate == CandidateId(1))
+        .unwrap()
+        + 1;
+    let score = reranked
+        .items
+        .iter()
+        .find(|item| item.candidate == CandidateId(1))
+        .unwrap()
+        .score;
+    assert!(reranked.active);
+    assert!((score - 1.0 / (60 + baseline_rank) as f64 - river.omega.omega / 61.0).abs() < 1e-15);
+}
+
+#[test]
+fn river_selects_the_complete_path_score_before_topology() {
+    let ctx = ExecutionContext::default();
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            node_count: 2,
+            row_offsets: &[0; 3],
+            targets: &[],
+            weights: &[],
+            is_static_wormhole: &[],
+            inbound: &[0.0; 2],
+            max_inbound: 0.0,
+            anchor_gains: &[0.0; 2],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let tag_values = [1.0, 0.0, 0.66, (1.0 - 0.66_f64.powi(2)).sqrt() as f32];
+    let tag_vectors = VectorMatrixView::new(&tag_values, 2, 2).unwrap();
+    let recall = |layer, _: &[f32], _, out: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
+        if layer == 0 {
+            out.extend([NodeId(0), NodeId(1)]);
+        }
+        Ok(())
+    };
+    let observation = Observe
+        .execute(
+            &ctx,
+            &ObservationConfig::default(),
+            ObservationInput {
+                query: &[1.0, 0.0],
+                query_text: "narrow concept",
+                candidates: &recall,
+                graph,
+                tag_vectors,
+                lexical_meta: TagLexicalMetaView {
+                    names: TextRows::Borrowed(&["narrow concept", "concept"]),
+                    node_count: 2,
+                    alias_offsets: &[0; 3],
+                    aliases: TextRows::Borrowed(&[]),
+                },
+                epa_basis: None,
+                core_tags: &[],
+                ghost_vectors: None,
+                ghost_is_core: &[],
+            },
+        )
+        .unwrap();
+    let fields = ComputeFields
+        .execute(
+            &ctx,
+            &FieldConfig::default(),
+            FieldInput {
+                graph,
+                tag_vectors,
+                observation: &observation,
+            },
+        )
+        .unwrap();
+    let candidates = CandidateRowsView {
+        candidate_count: 2,
+        document_ids: &[DocumentId(0), DocumentId(1)],
+        candidate_vectors: VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0], 2, 2).unwrap(),
+        candidate_root_offsets: &[0; 3],
+        candidate_roots: &[],
+        candidate_path_offsets: &[0, 3, 4],
+        path_tag_offsets: &[0, 1, 2, 3, 4],
+        path_tags: &[NodeId(1), NodeId(0), NodeId(1), NodeId(1)],
+        path_positions: &[0; 4],
+    };
+    let query = QueryCosines::prepare(
+        &ctx,
+        candidates,
+        &observation.original_query,
+        &observation.fused.enhanced_query,
+    )
+    .unwrap();
+    let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
+    let result = RiverReadoutOperator
+        .execute(
+            &ctx,
+            &RiverReadoutConfig::default(),
+            RiverReadoutInput {
+                observation: &observation,
+                features: &features,
+                evidence: EvidencePolicy::default(),
+                graph,
+                provenance: ProvenanceView::empty(),
+                support_groups: SupportGroupView::empty(),
+                tag_vectors,
+            },
+        )
+        .unwrap();
+    let item = &result.items[0];
+    let paths = &result.path_evidence[0];
+    let score = |evidence: &PathEvidence| {
+        let remaining = TOPOLOGY_BUDGET - evidence.path_bonus;
+        (evidence.base + evidence.path_bonus + evidence.graph_bonus.min(remaining)).clamp(0.0, 1.0)
+    };
+    assert!(paths[1].path_bonus + paths[1].graph_bonus > item.topology_bonus);
+    assert!(score(&paths[1]) < score(&paths[0]));
+    assert_eq!(score(&paths[0]), score(&paths[2]));
+    assert_eq!(item.candidate, CandidateId(0));
+    assert_eq!(result.items[1].candidate, CandidateId(1));
+    assert_eq!(item.chosen_path, Some(PathId(0)));
+    assert_eq!(item.base_score, paths[0].base);
+    assert_eq!(item.genus_gate, paths[0].genus_gate);
+    assert_eq!(item.direct_anchor_contacts, paths[0].anchor_contacts);
+    assert_eq!(item.score, score(&paths[0]));
+    assert_eq!(item.score, result.items[1].score);
 }
 
 // The only path to node 2 is a verified ordinary hop from the exact query focus.
@@ -269,21 +603,24 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
     let ctx = ExecutionContext::default();
 
     let tag_vectors = VectorMatrixView::new(&[1., 0., 0.8, 0.6, 0., 1., 0., 1.], 4, 2).unwrap();
-    let graph = CsrGraphView::new(CsrParts {
-        node_count: 4,
-        row_offsets: &[0, 0, 1, 1, 1],
-        targets: &[NodeId(2)],
-        weights: &[0.8],
-        is_static_wormhole: &[false],
-        inbound: &[0., 0., 0.8, 0.],
-        max_inbound: 0.8,
-        anchor_gains: &[0.0; 4],
-        target_sorted_indices: None,
-        edge_gates: None,
-    })
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            node_count: 4,
+            row_offsets: &[0, 0, 1, 1, 1],
+            targets: &[NodeId(2)],
+            weights: &[0.8],
+            is_static_wormhole: &[false],
+            inbound: &[0., 0., 0.8, 0.],
+            max_inbound: 0.8,
+            anchor_gains: &[0.0; 4],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap(),
+    )
     .unwrap();
     let recall = |_, _: &[f32], _, out: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
-        out.extend([(NodeId(1), 1.0), (NodeId(0), 0.8)]);
+        out.extend([NodeId(1), NodeId(0)]);
         Ok(())
     };
     let observation = Observe
@@ -322,15 +659,9 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
         .unwrap();
     assert_eq!(observation.disambiguated.pruned_hypernyms, [NodeId(0)]);
     assert_eq!(observation.gated_seeds.exact_focus, Some(NodeId(1)));
-    let candidates = CandidatePoolView {
+    let candidates = CandidateRowsView {
         candidate_count: 2,
-        baseline_scores: &[0.0; 2],
-        union_scores: &[0.0; 2],
-        union_ranks: &[1, 2],
-        bm25_scores: &[0.0; 2],
-        bm25_reference: 0.0,
-        anchor_scores: &[0.0; 2],
-        curve_document_ids: &[DocumentId(0), DocumentId(1)],
+        document_ids: &[DocumentId(0), DocumentId(1)],
         candidate_vectors: VectorMatrixView::new(&[0.0, 1.0, 0.0, 1.0], 2, 2).unwrap(),
         candidate_root_offsets: &[0; 3],
         candidate_roots: &[],
@@ -339,25 +670,22 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
         path_tags: &[NodeId(2), NodeId(3)],
         path_positions: &[0, 0],
     };
-    let pool = PoolCalibrateOperator
-        .execute(
-            &ctx,
-            &PoolCalibrateConfig::default(),
-            PoolCalibrateInput {
-                fields: &fields,
-                candidates,
-            },
-        )
-        .unwrap();
+    let query = QueryCosines::prepare(
+        &ctx,
+        candidates,
+        &observation.original_query,
+        &observation.fused.enhanced_query,
+    )
+    .unwrap();
+    let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
     let result = RiverReadoutOperator
         .execute(
             &ctx,
             &RiverReadoutConfig::default(),
             RiverReadoutInput {
-                fields: &fields,
-                evidence: EvidencePolicy::Nous,
-                pool: &pool,
-                candidates,
+                observation: &observation,
+                evidence: EvidencePolicy::DiscountWhenUnattributed,
+                features: &features,
                 graph,
                 tag_vectors,
                 provenance: ProvenanceView {

@@ -5,7 +5,7 @@
 pub use crate::warped_geometry::{WarpedProfile, clairaut_distance, clairaut_lower_bound};
 use crate::{EpaAnalysis, IntrinsicResidual};
 use nexus_core::kernel::{dot_f32, norm_sq_f32};
-use nexus_core::{ExecutionContext, NodeId, PrecisionMode, VcpError, VcpResult, VectorMatrixView};
+use nexus_core::{ExecutionContext, PrecisionMode, VcpError, VcpResult, VectorMatrixView};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -294,7 +294,7 @@ impl WarpedIndex {
                         dot_f32(
                             directions[slot].as_slice(),
                             directions[i].as_slice(),
-                            ctx.precision,
+                            PrecisionMode::FastSimd,
                         ),
                     )
                 };
@@ -384,8 +384,9 @@ impl WarpedIndex {
         let count = (0..self.slots.len()).filter(|&i| admitted(i)).count();
         let profile = self.config.profile();
         let query_norm = norm_sq_f32(&query, FOLD).sqrt();
-        let cosine =
-            |i: usize| dot_f32(&query, &self.directions[i], ctx.precision).clamp(-1.0, 1.0);
+        let cosine = |i: usize| {
+            dot_f32(&query, &self.directions[i], PrecisionMode::FastSimd).clamp(-1.0, 1.0)
+        };
         let points: Vec<usize> = if count <= config.exact_scope {
             (0..self.slots.len()).filter(|&i| admitted(i)).collect()
         } else {
@@ -578,8 +579,9 @@ pub fn residual_radius(epa: Option<&EpaAnalysis>, level: usize, energy_ratio: f6
     let Some(epa) = epa.filter(|value| value.cache_available) else {
         return f64::from(to_radius(0.25 + 0.25 * level as f64));
     };
-    let base_radius =
-        to_radius(0.55 * epa.in_domain_gate * (1.0 - epa.entropy) + 0.30 * epa.logic_depth);
+    let base_radius = to_radius(
+        0.55 * epa.in_domain_gate * (1.0 - epa.entropy) + 0.30 * epa.spectral_concentration,
+    );
     if level == 0 {
         return f64::from(base_radius);
     }
@@ -587,11 +589,4 @@ pub fn residual_radius(epa: Option<&EpaAnalysis>, level: usize, energy_ratio: f6
     f64::from(to_radius(
         base + 0.75 * (1.0 - base) * (1.0 - energy_ratio.clamp(0.0, 1.0).powf(0.35)),
     ))
-}
-
-pub fn tag_hits(hits: Vec<SearchHit>, output: &mut Vec<(NodeId, f64)>) -> VcpResult<()> {
-    for hit in hits {
-        output.push((NodeId::from_index(hit.slot, STAGE)?, -hit.distance));
-    }
-    Ok(())
 }

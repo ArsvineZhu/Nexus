@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::observation::invalid;
-use crate::{ObservationState, ObservationTransition, SenseOutput};
+use crate::{ObservationTransition, SenseOutput};
 use nexus_core::kernel::cosine_f32;
 use nexus_core::{
-    CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, Operator, PathId,
-    ProvenanceView, SupportGroupView, ThinkingStageInputView, VcpError, VcpResult,
-    VectorMatrixView,
+    CandidateId, Diagnostics, ExecutionContext, Operator, PathId, PrecisionMode, ProvenanceView,
+    QueryCosines, SupportGroupView, ThinkingStageInputView, TransportGraphView, VcpError,
+    VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -34,50 +34,34 @@ impl Default for ThinkingConfig {
     }
 }
 
-/// Records all retained transitions from a completed propagation and its original query.
+/// Records all retained transitions from a completed propagation.
 #[derive(Clone, Copy, Debug)]
 pub struct CompleteTrace<'a> {
-    query: &'a [f32],
     transitions: &'a [ObservationTransition],
 }
 
-impl<'a> CompleteTrace<'a> {
-    pub fn query(self) -> &'a [f32] {
-        self.query
-    }
-}
-
 impl SenseOutput {
-    pub fn complete_trace<'a>(&'a self, query: &'a [f32]) -> VcpResult<CompleteTrace<'a>> {
+    pub fn complete_trace(&self) -> VcpResult<CompleteTrace<'_>> {
         if !self.transitions_recorded || self.transitions_truncated || self.state_truncations > 0 {
             return Err(VcpError::ThinkingUnavailable {
                 reason: "propagation trace unavailable or incomplete",
             });
         }
         Ok(CompleteTrace {
-            query,
             transitions: &self.transitions,
         })
     }
 }
 
-impl ObservationState {
-    pub fn complete_trace(&self) -> VcpResult<CompleteTrace<'_>> {
-        self.sense.complete_trace(&self.original_query)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
-pub struct ThinkingInput<'asset, 'query> {
-    pub trace: CompleteTrace<'query>,
-    pub candidates: CandidatePoolView<'asset>,
-    /// Query cosines for this pool and execution precision, when already calibrated.
-    pub query_cosines: Option<&'asset [f64]>,
-    pub stages: &'asset [ThinkingStageInputView<'asset>],
-    pub graph: CsrGraphView<'asset>,
-    pub provenance: ProvenanceView<'asset>,
-    pub support_groups: SupportGroupView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
+pub struct ThinkingInput<'call> {
+    pub trace: CompleteTrace<'call>,
+    pub query: &'call QueryCosines<'call, 'call>,
+    pub stages: &'call [ThinkingStageInputView<'call>],
+    pub graph: TransportGraphView<'call>,
+    pub provenance: ProvenanceView<'call>,
+    pub support_groups: SupportGroupView<'call>,
+    pub tag_vectors: VectorMatrixView<'call>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,36 +128,32 @@ fn follows(left: ObservationTransition, right: ObservationTransition) -> bool {
 
 fn build_module(
     ctx: &ExecutionContext<'_>,
-    input: ThinkingInput<'_, '_>,
+    input: ThinkingInput<'_>,
     config: &ThinkingConfig,
     candidate: CandidateId,
     maximum: f64,
     edges: &HashMap<nexus_core::NodeId, Vec<(usize, ObservationTransition, usize)>>,
 ) -> VcpResult<Module> {
     const STAGE: &str = "thinking.plan";
-    let vector = input
-        .candidates
+    let candidates = input.query.rows();
+    let vector = candidates
         .candidate_vectors
         .row(candidate.index())
-        .ok_or_else(|| invalid(STAGE, "stage candidate is outside the candidate pool"))?;
-    let precision = ctx.precision;
-    let relevance = input.query_cosines.map_or_else(
-        || cosine_f32(vector, input.trace.query, precision),
-        |scores| scores[candidate.index()],
-    );
+        .ok_or_else(|| invalid(STAGE, "stage candidate is outside the candidate set"))?;
+    let relevance = input.query.original_cosines()[candidate.index()];
     let mut routes = Vec::new();
-    let roots = input.candidates.candidate_roots(candidate);
-    for index in input.candidates.candidate_paths(candidate) {
+    let roots = candidates.candidate_roots(candidate);
+    for index in candidates.candidate_paths(candidate) {
         ctx.check_cancelled(STAGE)?;
         let path = PathId::from_index(index, STAGE)?;
-        let (nodes, positions) = input.candidates.path_steps(path);
+        let (nodes, positions) = candidates.path_steps(path);
         let mut stamps = HashMap::<_, Vec<_>>::new();
         for (&node, &position) in nodes.iter().zip(positions) {
             let tag = input
                 .tag_vectors
                 .row(node.index())
                 .ok_or_else(|| invalid(STAGE, "path node is outside the graph"))?;
-            let closure = cosine_f32(vector, tag, precision);
+            let closure = cosine_f32(vector, tag, PrecisionMode::FastSimd);
             if closure >= config.min_closure {
                 stamps.entry(node).or_default().push((position, closure));
             }
@@ -224,7 +204,7 @@ pub struct ThinkingPlanOperator;
 
 impl Operator for ThinkingPlanOperator {
     type Config = ThinkingConfig;
-    type Input<'asset, 'query> = ThinkingInput<'asset, 'query>;
+    type Input<'call> = ThinkingInput<'call>;
     type Output = ThinkingPlan;
 
     fn name(&self) -> &'static str {
@@ -235,18 +215,17 @@ impl Operator for ThinkingPlanOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         let start = std::time::Instant::now();
         input.provenance.validate(input.graph.nnz(), stage)?;
         input.support_groups.validate(stage)?;
-        input.candidates.validate(stage)?;
         input.tag_vectors.validate(stage)?;
+        let rows = input.query.rows();
         if input.graph.node_count != input.tag_vectors.rows
-            || input.tag_vectors.dim != input.candidates.candidate_vectors.dim
-            || input.tag_vectors.dim != input.trace.query.len()
+            || input.tag_vectors.dim != rows.candidate_vectors.dim
             || ![
                 config.min_closure,
                 config.relevance_weight,
@@ -256,10 +235,6 @@ impl Operator for ThinkingPlanOperator {
             ]
             .into_iter()
             .all(|v| (0.0..=1.0).contains(&v))
-            || input.query_cosines.is_some_and(|scores| {
-                scores.len() != input.candidates.candidate_count
-                    || scores.iter().any(|score| !score.is_finite())
-            })
             || input.stages.is_empty()
             || input.stages.len() > 32
             || input.stages.iter().any(|stage| {
@@ -311,9 +286,7 @@ impl Operator for ThinkingPlanOperator {
                 ctx.check_cancelled(stage)?;
                 let mut best = None::<ThinkingSelection>;
                 for &candidate in &candidates {
-                    if used_documents
-                        .contains(&input.candidates.curve_document_ids[candidate.index()])
-                    {
+                    if used_documents.contains(&rows.document_ids[candidate.index()]) {
                         continue;
                     }
                     let module = &modules[&candidate];
@@ -379,8 +352,7 @@ impl Operator for ThinkingPlanOperator {
                     }
                 }
                 let Some(choice) = best else { break };
-                used_documents
-                    .insert(input.candidates.curve_document_ids[choice.candidate.index()]);
+                used_documents.insert(rows.document_ids[choice.candidate.index()]);
                 if let Some(edge) = choice.route {
                     used_edges.insert(route_key(edge));
                 }

@@ -68,10 +68,10 @@ fn sparse(
     isolated_mass: f64,
     ctx: &DtscCurveContext<'_>,
     connected_flags: &mut Vec<bool>,
-) -> (usize, f64) {
+) -> f64 {
     let cfg = &ctx.config.sparse;
     if !cfg.enabled || isolated.len() < cfg.min_contacts {
-        return (0, 0.0);
+        return 0.0;
     }
 
     connected_flags.clear();
@@ -124,15 +124,13 @@ fn sparse(
         .map(|(i, _)| samples[i].mass * samples[i].field.potential)
         .sum();
 
-    let confidence = if pairs > 0 && isolated_mass > 0.0 {
+    if pairs > 0 && isolated_mass > 0.0 {
         unit(connected_mass / isolated_mass)
             * unit(pairs as f64 / cfg.pair_saturation as f64)
             * unit(quality_sum / pairs as f64)
     } else {
         0.0
-    };
-
-    (pairs, confidence)
+    }
 }
 
 pub(super) fn path(
@@ -186,13 +184,10 @@ pub(super) fn path(
     } else {
         unit(score.geo_max_potential * 0.35)
     };
-    score.geo_raw_isolated_ratio = unit(isolated_mass / weighted_potential.max(1e-12));
-
-    let (pairs, confidence) = sparse(samples, isolated_buf, isolated_mass, ctx, connected_flags);
-    score.geo_sparse_association_pairs = pairs;
-    score.geo_sparse_association_confidence = confidence;
+    let isolated_ratio = unit(isolated_mass / weighted_potential.max(1e-12));
+    let confidence = sparse(samples, isolated_buf, isolated_mass, ctx, connected_flags);
     score.geo_isolated_ratio =
-        unit(score.geo_raw_isolated_ratio * (1.0 - ctx.config.sparse.max_relief * confidence));
+        unit(isolated_ratio * (1.0 - ctx.config.sparse.max_relief * confidence));
 
     score.geo_action_quality = if sums[2] > 0.0 {
         unit((-sums[3] / sums[2].max(0.15)).exp())
@@ -214,7 +209,6 @@ pub(super) fn shadow(
     score: &mut DtscEval,
 ) {
     let lift = b - a;
-    score.geo_vector_lift = lift;
     score.geo_closure_score = unit(
         0.25 * a + 0.35 * b + 0.30 * score.geo_closure_quality + 0.10 * unit(0.5 + lift * 5.0),
     );
@@ -258,13 +252,13 @@ pub(super) fn shadow(
 
     let g = &ctx.geometry;
     let weights = [
-        0.45 + 0.35 * unit(g.epa_logic_depth) + 0.2 * unit(g.pyramid_coverage),
+        0.45 + 0.35 * unit(g.epa_spectral_concentration) + 0.2 * unit(g.pyramid_coverage),
         0.35 + 0.3 * unit(g.pyramid_depth)
             + 0.25 * unit(g.pyramid_novelty)
             + 0.1 * unit(g.epa_resonance),
         0.2 + 0.35 * unit(g.epa_entropy)
             + 0.3 * unit(g.epa_resonance)
-            + 0.15 * (1.0 - unit(g.epa_logic_depth)),
+            + 0.15 * (1.0 - unit(g.epa_spectral_concentration)),
     ];
     let total = weights.iter().sum::<f64>().max(1e-12);
 

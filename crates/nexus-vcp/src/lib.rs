@@ -22,8 +22,8 @@ pub use thinking::*;
 pub use artifact::{
     CounterevidenceAdj, FactMatrix, FactMatrixConfig, FactMatrixInput, FactMatrixOperator,
     FactMatrixOutput, ProvenanceBuildInput, ProvenanceBuildOperator, ProvenanceConfig,
-    ProvenanceData, TransportCalibrateInput, TransportCalibrateOperator, TransportConfig,
-    TransportGraph,
+    ProvenanceData, TransportCalibrateInput, TransportCalibrateOperator, TransportCalibration,
+    TransportConfig,
 };
 pub use geometry::{
     EpaBasis, GeometryState, GlobalEpaCandidateMode, GlobalEpaConfig, GlobalEpaInput,

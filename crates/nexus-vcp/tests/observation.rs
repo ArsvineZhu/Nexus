@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use nexus_core::kernel::csr_spmv_dual;
+use nexus_core::kernel::{csr_spmv_dual, normalize_direction};
 use nexus_core::*;
 use nexus_vcp::*;
 use std::cell::RefCell;
 
 #[test]
 fn observes_m2_transport_with_residual_search_and_temporal_gates() {
-    let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
+    let ctx = ExecutionContext::default();
 
     let graph = TransportCalibrateOperator
         .execute(
@@ -25,7 +25,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             },
         )
         .unwrap();
-    let graph = graph.as_csr_view();
+    let graph = graph.graph.view();
     let matrix =
         VectorMatrixView::new(&[1., 0., 0., 0.8, 0.6, 0., 0., 0., 1., 0., 1., 0.], 4, 3).unwrap();
     let seen = RefCell::new(Vec::new());
@@ -39,14 +39,15 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
         assert!(output.is_empty());
         seen.borrow_mut().push(residual.to_vec());
         match level {
-            0 => output.extend([(NodeId(1), 0.9), (NodeId(0), 0.7)]),
-            1 => output.push((NodeId(2), 1.0)),
+            0 => output.extend([NodeId(1), NodeId(0)]),
+            1 => output.push(NodeId(2)),
             _ => panic!("search continued after capturing the tail"),
         }
         Ok(())
     };
+    let query = normalize_direction(&[0.8, 0.6, 0.5], 3, "test").unwrap();
     let input = ObservationInput {
-        query: &[0.8, 0.6, 0.5],
+        query: &query,
         query_text: "car engine",
         candidates: &search,
         graph,
@@ -73,7 +74,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     assert!(!observed.epa.cache_available);
     assert!(observed.epa.in_domain_gate.is_finite());
     assert_eq!(seen.borrow().len(), 2);
-    assert!((seen.borrow()[1][2] - 0.5).abs() < 1e-7);
+    assert!((seen.borrow()[1][2] - query[2]).abs() < 1e-7);
     assert!(seen.borrow()[1][..2].iter().all(|value| value.abs() < 1e-7));
     assert_eq!(observed.disambiguated.pruned_hypernyms, [NodeId(0)]);
     assert!(observed.disambiguated.differentia_q_perp.as_ref().unwrap()[0].abs() < 1e-12);
@@ -137,7 +138,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     let mut local = [0.0; 4];
     let mut transfer = [0.0; 4];
     csr_spmv_dual(
-        &graph,
+        &graph.as_csr(),
         &fields.local_field,
         &fields.transfer_field,
         &mut local,
@@ -146,7 +147,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     )
     .unwrap();
     let mut source = [0.0; 4];
-    for &(node, mass) in &observed.fused.source_field {
+    for &(node, mass) in &observed.sense.source_field {
         source[node.index()] += mass;
     }
     for (alpha, field, propagated) in [
@@ -186,11 +187,151 @@ fn pyramid_propagates_host_failure() {
 }
 
 #[test]
+fn prepared_query_contract_rejects_non_unit_inputs_and_fusion_rejects_cancellation() {
+    let ctx = ExecutionContext::default();
+    for query in [&[2.0_f32, 0.0], &[0.0, 0.0], &[f32::NAN, 0.0]] {
+        let result = EpaAnalyzeOperator.execute(
+            &ctx,
+            &EpaConfig::default(),
+            EpaAnalyzeInput { query, basis: None },
+        );
+        assert!(matches!(result, Err(VcpError::InvalidInput { .. })));
+    }
+
+    let mut gated = GatedSeeds {
+        effective_tag_boost: 0.5,
+        ..Default::default()
+    };
+    let tags = VectorMatrixView::new(&[-1.0, 0.0], 1, 2).unwrap();
+    let sense = SenseOutput::default();
+    let fuse = |gated: &GatedSeeds| {
+        ObservationFuseOperator.execute(
+            &ctx,
+            &ObservationFuseConfig::default(),
+            ObservationFuseInput {
+                query: &[1.0, 0.0],
+                tag_vectors: tags,
+                sense: &sense,
+                gated,
+                core_tags: &[],
+                ghost_vectors: None,
+                ghost_is_core: &[],
+            },
+        )
+    };
+    assert_eq!(fuse(&gated).unwrap().enhanced_query, [1.0, 0.0]);
+    gated.seeds.push(GatedSeed {
+        node: NodeId(0),
+        weight: 1.0,
+        is_core: true,
+        lexical: true,
+        residual_level: 0,
+    });
+    assert!(matches!(
+        fuse(&gated),
+        Err(VcpError::InvalidInput {
+            stage: "observation.fuse",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn fixed_point_reports_the_returned_iterate_and_fields_require_convergence() {
+    let ctx = ExecutionContext::default();
+    let graph = TransportGraphView::new(
+        CsrGraphView::new(CsrParts {
+            node_count: 2,
+            row_offsets: &[0, 1, 2],
+            targets: &[NodeId(1), NodeId(0)],
+            weights: &[0.9, 0.9],
+            is_static_wormhole: &[false; 2],
+            inbound: &[0.9, 0.9],
+            max_inbound: 0.9,
+            anchor_gains: &[0.0; 2],
+            target_sorted_indices: None,
+            edge_gates: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let source_field = [(NodeId(0), 0.25), (NodeId(0), 0.75)];
+    let solve = |config: &DualFieldConfig| {
+        DualFieldSolveOperator.execute(
+            &ctx,
+            config,
+            DualFieldSolveInput {
+                graph,
+                source_field: &source_field,
+            },
+        )
+    };
+    let solution = solve(&DualFieldConfig::default()).unwrap();
+    assert!(solution.local_converged && solution.transfer_converged);
+    let fixed = 0.45_f64 / (1.0 - (0.55_f64 * 0.9).powi(2));
+    assert!((solution.transfer_field[0] - fixed).abs() < 1e-9);
+    assert!((solution.transfer_field[1] - fixed * 0.55 * 0.9).abs() < 1e-9);
+
+    let limited = DualFieldConfig {
+        local_alpha: 0.0,
+        transfer_alpha: 0.99,
+        max_iterations: 1,
+        ..Default::default()
+    };
+    let solution = solve(&limited).unwrap();
+    assert!(solution.local_converged && !solution.transfer_converged);
+    let a = 0.99 * 0.9;
+    let after = [1.0 - 0.99, a];
+    assert_eq!(solution.transfer_field, after);
+    let residual = (a * after[1]).abs() + (a * after[0] - after[1]).abs();
+    assert!((solution.transfer_residual - residual).abs() < 1e-14);
+    let observation = ObservationState {
+        original_query: vec![1.0, 0.0],
+        epa: EpaAnalysis::default(),
+        pyramid: PyramidResidual::default(),
+        disambiguated: DisambiguatedTags::default(),
+        gated_seeds: GatedSeeds::default(),
+        sense: SenseOutput {
+            source_field: source_field.to_vec(),
+            ..Default::default()
+        },
+        fused: FusedObservation::default(),
+    };
+    let result = ComputeFields.execute(
+        &ctx,
+        &FieldConfig {
+            solve: limited.clone(),
+            ..Default::default()
+        },
+        FieldInput {
+            graph,
+            tag_vectors: VectorMatrixView::new(&[1.0, 0.0, 0.0, 1.0], 2, 2).unwrap(),
+            observation: &observation,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(VcpError::NotConverged { stage: "field.transfer", iterations: 1, residual: actual, tolerance })
+            if (actual - residual).abs() < 1e-14 && tolerance == limited.transfer_tolerance
+    ));
+
+    for transfer_alpha in [1.0, -0.1, f64::INFINITY, f64::NAN] {
+        assert!(matches!(
+            solve(&DualFieldConfig {
+                transfer_alpha,
+                ..limited
+            }),
+            Err(VcpError::InvalidInput { .. })
+        ));
+    }
+}
+
+#[test]
 fn composes_epa_and_pyramid_with_borrowed_query_and_host_recall() -> VcpResult<()> {
     let query = vec![1.0_f32, 0.0];
     let tag = vec![1.0_f32, 0.0];
     let tag_vectors = VectorMatrixView::new(&tag, 1, 2)?;
-    let hits = [(NodeId(0), 1.0)];
+    let hits = [NodeId(0)];
     let recall =
         |layer, _: &[f32], _, out: &mut Vec<_>, epa: Option<&EpaAnalysis>, _: &[NodeId]| {
             assert!(epa.is_some());
@@ -200,25 +341,28 @@ fn composes_epa_and_pyramid_with_borrowed_query_and_host_recall() -> VcpResult<(
             Ok(())
         };
     let mut plan = Plan::new();
-    let epa = plan.add(EpaAnalyzeOperator, EpaConfig::default(), (), |_| {
-        Ok(EpaAnalyzeInput {
-            query: &query,
-            basis: None,
-        })
+    let epa = plan.add((), |ctx, _| {
+        EpaAnalyzeOperator.execute(
+            ctx,
+            &EpaConfig::default(),
+            EpaAnalyzeInput {
+                query: &query,
+                basis: None,
+            },
+        )
     })?;
-    let pyramid = plan.add(
-        PyramidAnalyzeOperator,
-        PyramidConfig::default(),
-        epa,
-        |inputs| {
-            Ok(PyramidAnalyzeInput {
+    let pyramid = plan.add(epa, |ctx, inputs| {
+        PyramidAnalyzeOperator.execute(
+            ctx,
+            &PyramidConfig::default(),
+            PyramidAnalyzeInput {
                 query: &query,
                 candidates: &recall,
                 epa: Some(inputs.get()),
                 tag_vectors,
-            })
-        },
-    )?;
+            },
+        )
+    })?;
     let result = plan.run(pyramid, &ExecutionContext::default())?;
     let pyramid = result.get(pyramid)?;
     assert_eq!(pyramid.levels[0].tags[0].node, NodeId(0));

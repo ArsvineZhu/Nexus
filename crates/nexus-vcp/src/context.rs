@@ -3,7 +3,8 @@
 use crate::observation::{finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::{dot_f32, norm_sq_f32, normalize_f64};
 use nexus_core::{
-    ContextFragmentsView, Diagnostics, ExecutionContext, Operator, VcpResult, VectorMatrixView,
+    ContextFragmentsView, Diagnostics, ExecutionContext, Operator, PrecisionMode, VcpResult,
+    VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -42,10 +43,10 @@ impl Default for ContextConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ContextAggregateInput<'asset, 'query> {
-    pub raw_query: Option<&'query [f32]>,
-    pub fragments: ContextFragmentsView<'asset>,
-    pub fragment_vectors: VectorMatrixView<'asset, f32>,
+pub struct ContextAggregateInput<'call> {
+    pub raw_query: Option<&'call [f32]>,
+    pub fragments: ContextFragmentsView<'call>,
+    pub fragment_vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,7 +139,7 @@ pub struct ContextAggregateOperator;
 
 impl Operator for ContextAggregateOperator {
     type Config = ContextConfig;
-    type Input<'asset, 'query> = ContextAggregateInput<'asset, 'query>;
+    type Input<'call> = ContextAggregateInput<'call>;
     type Output = ContextAggregation;
 
     fn name(&self) -> &'static str {
@@ -149,7 +150,7 @@ impl Operator for ContextAggregateOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -195,7 +196,7 @@ impl Operator for ContextAggregateOperator {
             }
             let vector = input.fragment_vectors.row(row).unwrap();
             finite_vector(stage, vector, dim)?;
-            *scale = norm_sq_f32(vector, ctx.precision).sqrt();
+            *scale = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
             if *scale > 1e-12 && seen.insert(key) {
                 groups
                     .entry((phase, role))
@@ -269,7 +270,7 @@ impl Operator for ContextAggregateOperator {
         let has_context = combined.iter().any(|v| *v != 0.0);
         let query_origin = if let Some(query) = input.raw_query {
             finite_vector(stage, query, dim)?;
-            let scale = norm_sq_f32(query, ctx.precision).sqrt();
+            let scale = norm_sq_f32(query, PrecisionMode::FastSimd).sqrt();
             if scale <= 1e-12 {
                 return Err(invalid(stage, "raw query has no direction"));
             }
@@ -280,7 +281,7 @@ impl Operator for ContextAggregateOperator {
         } else {
             "context"
         };
-        if !normalize_f64(combined, 1e-12, ctx.precision) {
+        if !normalize_f64(combined, 1e-12, PrecisionMode::FastSimd) {
             return Err(invalid(stage, "query signals have no net direction"));
         }
         Ok(ContextAggregation {
@@ -309,8 +310,8 @@ impl Default for ContextSegmentConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ContextSegmentInput<'asset> {
-    pub vectors: VectorMatrixView<'asset, f32>,
+pub struct ContextSegmentInput<'call> {
+    pub vectors: VectorMatrixView<'call, f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +330,7 @@ pub struct ContextSegmentOperator;
 
 impl Operator for ContextSegmentOperator {
     type Config = ContextSegmentConfig;
-    type Input<'asset, 'query> = ContextSegmentInput<'asset>;
+    type Input<'call> = ContextSegmentInput<'call>;
     type Output = ContextSegments;
 
     fn name(&self) -> &'static str {
@@ -340,7 +341,7 @@ impl Operator for ContextSegmentOperator {
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'_, '_>,
+        input: Self::Input<'_>,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -361,7 +362,7 @@ impl Operator for ContextSegmentOperator {
                       mean: &mut [f64],
                       result: &mut ContextSegments|
          -> VcpResult<()> {
-            if !normalize_f64(mean, 1e-12, ctx.precision) {
+            if !normalize_f64(mean, 1e-12, PrecisionMode::FastSimd) {
                 return Err(invalid(stage, "segment mean has no direction"));
             }
             result
@@ -374,12 +375,12 @@ impl Operator for ContextSegmentOperator {
         for (index, vector) in vectors.data.chunks_exact(vectors.dim).enumerate() {
             ctx.check_cancelled(stage)?;
             finite_vector(stage, vector, vectors.dim)?;
-            let norm = norm_sq_f32(vector, ctx.precision).sqrt();
+            let norm = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
             if norm <= 1e-12 {
                 return Err(invalid(stage, "segment vector has no direction"));
             }
             if let Some((prior, prior_norm)) = previous {
-                let cosine = dot_f32(vector, prior, ctx.precision) / (norm * prior_norm);
+                let cosine = dot_f32(vector, prior, PrecisionMode::FastSimd) / (norm * prior_norm);
                 if cosine < config.similarity_threshold {
                     append(SegmentRange { start, end: index }, mean, &mut result)?;
                     start = index;

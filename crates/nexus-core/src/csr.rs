@@ -22,7 +22,7 @@ pub struct CsrParts<'a> {
     pub edge_gates: Option<&'a [f64]>,
 }
 
-/// A structurally validated transport view. The backing arrays remain immutable.
+/// A structurally validated CSR view. The backing arrays remain immutable.
 #[derive(Clone, Copy, Debug)]
 pub struct CsrGraphView<'a>(CsrParts<'a>);
 
@@ -63,7 +63,7 @@ impl<'a> std::ops::Deref for CsrGraphView<'a> {
     }
 }
 
-/// Owns the backing arrays for a prepared transport graph.
+/// Owns the backing arrays for a validated CSR graph.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CsrGraph(CsrStorage);
 
@@ -332,5 +332,61 @@ impl<'a> CsrParts<'a> {
         }
 
         Ok(())
+    }
+}
+
+/// A nonnegative CSR graph with at most unit effective mass in every source row.
+#[derive(Clone, Copy, Debug)]
+pub struct TransportGraphView<'a>(CsrGraphView<'a>);
+
+impl<'a> TransportGraphView<'a> {
+    pub fn new(graph: CsrGraphView<'a>) -> crate::VcpResult<Self> {
+        for (row, offsets) in graph.row_offsets.windows(2).enumerate() {
+            let mass =
+                (offsets[0]..offsets[1]).fold(0.0, |sum, edge| sum + graph.effective_weight(edge));
+            if mass > 1.0 {
+                return Err(VcpError::InvalidInput {
+                    stage: "transport.prepare",
+                    detail: format!("source row {row} has effective mass {mass}, exceeding 1"),
+                });
+            }
+        }
+        Ok(Self(graph))
+    }
+
+    pub fn with_edge_gates(self, gates: &'a [f64]) -> crate::VcpResult<Self> {
+        Self::new(self.0.with_edge_gates(gates)?)
+    }
+
+    pub fn as_csr(self) -> CsrGraphView<'a> {
+        self.0
+    }
+}
+
+impl<'a> std::ops::Deref for TransportGraphView<'a> {
+    type Target = CsrGraphView<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransportGraph(CsrGraph);
+
+impl TransportGraph {
+    pub fn new(graph: CsrGraph) -> crate::VcpResult<Self> {
+        TransportGraphView::new(graph.view())?;
+        Ok(Self(graph))
+    }
+
+    pub fn view(&self) -> TransportGraphView<'_> {
+        TransportGraphView(self.0.view())
+    }
+}
+
+impl std::ops::Deref for TransportGraph {
+    type Target = CsrGraph;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

@@ -75,8 +75,8 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
             &ctx,
             &ProvenanceConfig::default(),
             ProvenanceBuildInput {
-                transport_row_offsets: &transport.row_offsets,
-                transport_targets: &transport.targets,
+                transport_row_offsets: transport.graph.view().row_offsets,
+                transport_targets: transport.graph.view().targets,
                 sequences: seqs,
                 positive_relations: Some(pos_rel),
                 support_groups: None,
@@ -84,7 +84,7 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
         )
         .unwrap();
 
-    let csr = transport.as_csr_view();
+    let csr = transport.graph.view().as_csr();
     let edge_idx = csr.find_edge(NodeId(0), NodeId(1)).unwrap();
     let prov_view = prov.as_view();
     let empty_sg = SupportGroupView::empty();
@@ -183,8 +183,8 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
             &ctx,
             &ProvenanceConfig::default(),
             ProvenanceBuildInput {
-                transport_row_offsets: &transport.row_offsets,
-                transport_targets: &transport.targets,
+                transport_row_offsets: transport.graph.view().row_offsets,
+                transport_targets: transport.graph.view().targets,
                 sequences: SequenceSliceView::empty(),
                 positive_relations: Some(pos_rel),
                 support_groups: Some(sg),
@@ -192,7 +192,7 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
         )
         .unwrap();
 
-    let csr = transport.as_csr_view();
+    let csr = transport.graph.view().as_csr();
     let edge_idx = csr.find_edge(NodeId(0), NodeId(1)).unwrap();
     let prov_view = prov.as_view();
 
@@ -406,17 +406,41 @@ fn counterevidence_zero_bit_isolation() {
         )
         .unwrap();
 
-    assert_eq!(tr_clean.row_offsets, tr_neg.row_offsets);
-    assert_eq!(tr_clean.targets, tr_neg.targets);
-    assert_eq!(tr_clean.is_static_wormhole, tr_neg.is_static_wormhole);
-    assert_eq!(tr_clean.target_sorted_indices, tr_neg.target_sorted_indices);
-    for (a, b) in tr_clean.weights.iter().zip(&tr_neg.weights) {
+    assert_eq!(
+        tr_clean.graph.view().row_offsets,
+        tr_neg.graph.view().row_offsets
+    );
+    assert_eq!(tr_clean.graph.view().targets, tr_neg.graph.view().targets);
+    assert_eq!(
+        tr_clean.graph.view().is_static_wormhole,
+        tr_neg.graph.view().is_static_wormhole
+    );
+    assert_eq!(
+        tr_clean.graph.view().target_sorted_indices,
+        tr_neg.graph.view().target_sorted_indices
+    );
+    for (a, b) in tr_clean
+        .graph
+        .view()
+        .weights
+        .iter()
+        .zip(tr_neg.graph.view().weights)
+    {
         assert_eq!(a.to_bits(), b.to_bits());
     }
-    for (a, b) in tr_clean.inbound.iter().zip(&tr_neg.inbound) {
+    for (a, b) in tr_clean
+        .graph
+        .view()
+        .inbound
+        .iter()
+        .zip(tr_neg.graph.view().inbound)
+    {
         assert_eq!(a.to_bits(), b.to_bits());
     }
-    assert_eq!(tr_clean.max_inbound.to_bits(), tr_neg.max_inbound.to_bits());
+    assert_eq!(
+        tr_clean.graph.view().max_inbound.to_bits(),
+        tr_neg.graph.view().max_inbound.to_bits()
+    );
 }
 
 #[test]
@@ -712,7 +736,7 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
             },
         )
         .unwrap();
-    let view_sorted = transport.as_csr_view();
+    let view_sorted = transport.graph.view().as_csr();
     let view_linear = CsrGraphView::new(CsrParts {
         target_sorted_indices: None,
         ..*view_sorted
@@ -738,7 +762,7 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     // Row mass conservation (0.95 outbound total on every non-empty row).
     for u in 0..4_u32 {
         let range = view_sorted.row_range(NodeId(u));
-        let row_sum: f64 = transport.weights[range].iter().sum();
+        let row_sum: f64 = transport.graph.view().weights[range].iter().sum();
         assert!((row_sum - 0.95).abs() < 1e-13, "row {u} sum = {row_sum}");
     }
 
@@ -757,7 +781,13 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
             },
         )
         .unwrap();
-    for (a, b) in transport.weights.iter().zip(&tr_pos_exp.weights) {
+    for (a, b) in transport
+        .graph
+        .view()
+        .weights
+        .iter()
+        .zip(tr_pos_exp.graph.view().weights)
+    {
         assert_eq!(a.to_bits(), b.to_bits());
     }
 
@@ -775,7 +805,7 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
             },
         )
         .unwrap();
-    let view_gated = tr_gated.as_csr_view();
+    let view_gated = tr_gated.graph.view().as_csr();
     view_gated.validate("test_gated").unwrap();
 
     let w01_base = view_sorted.edge_weight(NodeId(0), NodeId(1));
@@ -1056,15 +1086,15 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
             &seq_ctx,
             &ProvenanceConfig::default(),
             ProvenanceBuildInput {
-                transport_row_offsets: &tr.row_offsets,
-                transport_targets: &tr.targets,
+                transport_row_offsets: tr.graph.view().row_offsets,
+                transport_targets: tr.graph.view().targets,
                 sequences: seqs,
                 positive_relations: None,
                 support_groups: None,
             },
         )
         .unwrap();
-    assert_eq!(prov.edge_count, tr.targets.len());
+    assert_eq!(prov.edge_count, tr.graph.view().targets.len());
     assert_eq!(
         prov.as_view()
             .independent_support_fraction(0, &[RootId(50)], &SupportGroupView::empty()),

@@ -1,21 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::config::{DtscConfig, DtscIdentityConfig};
-use super::field::{DtscField, DtscFieldSampler, DtscSample};
+use super::config::{DtscEvidenceConfig, DtscIdentityConfig};
+use super::evidence::DtscItem;
+use super::field::{DtscSample, DtscSourceType};
 use super::path_scoring::{contacts, path, shadow};
 use super::{positive, unit};
-use nexus_core::kernel::{batch_cosines_f32, cosine_f32_with_norms, norm_sq_f32};
+use nexus_core::kernel::cosine_f32_with_norms;
 use nexus_core::{
-    CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator,
-    PathId, PrecisionMode, VcpError, VectorMatrixView,
+    CandidateId, NodeId, PathId, PrecisionMode, TransportGraphView, VectorMatrixView,
 };
 use std::cmp::Ordering;
-use std::time::Instant;
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DtscGeometryState {
-    pub epa_logic_depth: f64,
+    pub epa_spectral_concentration: f64,
     pub epa_entropy: f64,
     pub epa_resonance: f64,
     pub pyramid_coverage: f64,
@@ -26,7 +25,7 @@ pub struct DtscGeometryState {
 impl Default for DtscGeometryState {
     fn default() -> Self {
         Self {
-            epa_logic_depth: 0.5,
+            epa_spectral_concentration: 0.5,
             epa_entropy: 0.5,
             epa_resonance: 0.0,
             pyramid_coverage: 0.5,
@@ -44,89 +43,12 @@ pub struct AuxiliaryEvidence {
     pub identity_floor: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DtscOrder {
-    Score,
-    Input,
-}
-
-pub struct DtscReadoutInput<'asset, 'query> {
-    pub field: &'query DtscField,
-    pub candidates: CandidatePoolView<'query>,
-    pub graph: CsrGraphView<'asset>,
-    pub tag_vectors: VectorMatrixView<'asset, f32>,
-    pub original_query: &'query [f32],
-    pub enhanced_query: &'query [f32],
-    pub geometry: DtscGeometryState,
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DtscItem {
-    pub candidate: CandidateId,
-    pub score: f64,
-    pub original_knn_score: f64,
-    pub geo_score: f64,
-    pub normalized_geo: f64,
-    pub geo_bonus: f64,
-    pub geo_base_bonus: f64,
-    pub geo_aux_bonus: f64,
-    pub auxiliary_evidence: Option<AuxiliaryEvidence>,
-    pub geo_effect: &'static str,
-    pub geo_evidence_class: &'static str,
-    pub geo_reward_eligible: bool,
-    pub geo_confidence: f64,
-    pub geo_exact_hits: usize,
-    pub geo_strong_hits: usize,
-    pub geo_hit_count: usize,
-    pub geo_continuity: f64,
-    pub geo_isolated_ratio: f64,
-}
-
-impl Default for DtscItem {
-    fn default() -> Self {
-        Self {
-            candidate: CandidateId(0),
-            score: 0.0,
-            original_knn_score: 0.0,
-            geo_score: 0.0,
-            normalized_geo: 0.0,
-            geo_bonus: 0.0,
-            geo_base_bonus: 0.0,
-            geo_aux_bonus: 0.0,
-            auxiliary_evidence: None,
-            geo_effect: "",
-            geo_evidence_class: "",
-            geo_reward_eligible: false,
-            geo_confidence: 0.0,
-            geo_exact_hits: 0,
-            geo_strong_hits: 0,
-            geo_hit_count: 0,
-            geo_continuity: 0.0,
-            geo_isolated_ratio: 0.0,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DtscOutput {
-    pub results: Vec<DtscItem>,
-    pub field_trusted: bool,
-    pub field_entropy: f64,
-    pub order: DtscOrder,
-    pub available: usize,
-    pub fallback_used: bool,
-    pub fallback_reason: Option<&'static str>,
-    pub diagnostics: Diagnostics,
-}
-
-pub struct DtscReadoutOperator;
-
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DtscEval {
     pub candidate: CandidateId,
+    pub chosen_path: Option<PathId>,
     pub score: f64,
-    pub original_knn_score: f64,
+    pub original_cosine: f64,
     pub geo_score: f64,
     pub normalized_geo: f64,
     pub geo_bonus: f64,
@@ -149,13 +71,9 @@ pub(super) struct DtscEval {
     pub geo_max_potential: f64,
     pub geo_continuity: f64,
     pub geo_isolated_ratio: f64,
-    pub geo_raw_isolated_ratio: f64,
-    pub geo_sparse_association_confidence: f64,
-    pub geo_sparse_association_pairs: usize,
     pub geo_action_quality: f64,
     pub geo_closure_quality: f64,
     pub geo_direction_consistency: f64,
-    pub geo_vector_lift: f64,
     pub geo_direct_score: f64,
     pub geo_structural_score: f64,
     pub geo_thematic_score: f64,
@@ -167,8 +85,9 @@ impl Default for DtscEval {
     fn default() -> Self {
         Self {
             candidate: CandidateId(0),
+            chosen_path: None,
             score: 0.0,
-            original_knn_score: 0.0,
+            original_cosine: 0.0,
             geo_score: 0.0,
             normalized_geo: 0.0,
             geo_bonus: 0.0,
@@ -191,13 +110,9 @@ impl Default for DtscEval {
             geo_max_potential: 0.0,
             geo_continuity: 0.0,
             geo_isolated_ratio: 0.0,
-            geo_raw_isolated_ratio: 0.0,
-            geo_sparse_association_confidence: 0.0,
-            geo_sparse_association_pairs: 0,
             geo_action_quality: 0.0,
             geo_closure_quality: 0.0,
             geo_direction_consistency: 0.0,
-            geo_vector_lift: 0.0,
             geo_direct_score: 0.0,
             geo_structural_score: 0.0,
             geo_thematic_score: 0.0,
@@ -208,11 +123,12 @@ impl Default for DtscEval {
 }
 
 impl DtscEval {
-    fn into_item(self) -> DtscItem {
+    pub(super) fn into_item(self) -> DtscItem {
         DtscItem {
             candidate: self.candidate,
+            chosen_path: self.chosen_path,
             score: self.score,
-            original_knn_score: self.original_knn_score,
+            original_cosine: self.original_cosine,
             geo_score: self.geo_score,
             normalized_geo: self.normalized_geo,
             geo_bonus: self.geo_bonus,
@@ -233,9 +149,10 @@ impl DtscEval {
 }
 
 pub(super) struct DtscCurveContext<'a> {
-    pub config: &'a DtscConfig,
+    pub config: &'a DtscEvidenceConfig,
+    pub hub_floor: f64,
     pub field_samples: &'a [Option<(DtscSample, f64)>],
-    pub graph: &'a CsrGraphView<'a>,
+    pub graph: TransportGraphView<'a>,
     pub tag_vectors: &'a VectorMatrixView<'a, f32>,
     pub geometry: &'a DtscGeometryState,
     pub max_inbound: f64,
@@ -252,21 +169,20 @@ pub(super) struct Sample<'a> {
 
 #[inline]
 pub(super) fn is_direct(s: &Sample<'_>) -> bool {
-    matches!(s.field.source_type.as_str(), "seed" | "core")
+    matches!(
+        s.field.source_type,
+        DtscSourceType::Seed | DtscSourceType::Core
+    )
 }
 
-fn empty_eval(candidate: CandidateId, original_knn_score: f64, [a, b]: [f64; 2]) -> DtscEval {
-    let lift = b - a;
+pub(super) fn empty_eval(candidate: CandidateId, original_cosine: f64) -> DtscEval {
     DtscEval {
         candidate,
-        score: original_knn_score,
-        original_knn_score,
+        score: original_cosine,
+        original_cosine,
         geo_effect: "neutral",
         geo_evidence_class: "neutral",
         geo_isolated_ratio: 1.0,
-        geo_raw_isolated_ratio: 1.0,
-        geo_vector_lift: lift,
-        geo_closure_score: unit(0.35 * a + 0.45 * b + 0.2 * unit(0.5 + lift * 5.0)),
         ..Default::default()
     }
 }
@@ -281,7 +197,6 @@ fn collect_samples<'a>(
 ) {
     out.clear();
     let cfg = &ctx.config.curve;
-    let hub_floor = ctx.config.field.public_hub_floor.clamp(0.05, 1.0);
     let closure_denom = (1.0 - cfg.min_closure_similarity).max(1e-6);
 
     for (&tag, &pos) in tags.iter().zip(positions.iter()) {
@@ -303,7 +218,8 @@ fn collect_samples<'a>(
         let specificity = if ctx.max_inbound <= 0.0 {
             1.0
         } else {
-            hub_floor.max(1.0 - unit(ctx.graph.inbound_mass(tag) / ctx.max_inbound).sqrt())
+            ctx.hub_floor
+                .max(1.0 - unit(ctx.graph.inbound_mass(tag) / ctx.max_inbound).sqrt())
         };
         let anchor = ctx.graph.anchor_gain(tag).clamp(0.5, 2.0);
         let positional = (-cfg.position_decay * positive(f64::from(pos) - 1.0)).exp();
@@ -439,7 +355,7 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
         });
     }
     score.geo_bonus = cap.min(score.geo_base_bonus + score.geo_aux_bonus);
-    score.score = score.original_knn_score + score.geo_bonus;
+    score.score = score.original_cosine + score.geo_bonus;
     score.geo_effect = if score.geo_bonus > 0.0 {
         "boost"
     } else {
@@ -448,7 +364,7 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_path<'a>(
+pub(super) fn eval_path<'a>(
     base: DtscEval,
     query_closures: [f64; 2],
     chunk_vector: &[f32],
@@ -512,284 +428,4 @@ fn eval_path<'a>(
     }
     reward(samples_buf, ctx, &mut score);
     score
-}
-
-fn fallback(scores: &[DtscEval], field: &DtscField, config: &DtscConfig) -> Option<&'static str> {
-    if !field.field_trusted {
-        return Some("query-energy-field-low-trust");
-    }
-
-    let contributors: Vec<&DtscEval> = scores.iter().filter(|s| s.geo_score > 0.0).collect();
-    if contributors.is_empty() {
-        return Some("no-candidate-curve-contacted-query-field");
-    }
-    if !config.field.fallback_to_knn_on_low_trust {
-        return None;
-    }
-
-    let maximum = contributors.iter().map(|s| s.geo_score).fold(0.0, f64::max);
-    let minimum = contributors
-        .iter()
-        .map(|s| s.geo_score)
-        .fold(f64::INFINITY, f64::min);
-    let evidence: f64 = contributors
-        .iter()
-        .map(|s| s.geo_strong_hits as f64 + 0.75 * s.geo_exact_hits as f64)
-        .sum();
-    let low = maximum < config.trust.min_geo_score.max(0.0)
-        && evidence < config.trust.min_strong_evidence.max(0.0);
-
-    if low
-        && (contributors.len() as f64 / (scores.len().max(1) as f64))
-            < config.trust.min_candidate_coverage.clamp(0.0, 1.0)
-    {
-        Some("candidate-curve-readout-jointly-low-trust")
-    } else if low
-        && contributors.len() > 1
-        && maximum - minimum < config.trust.min_geo_spread.max(0.0)
-    {
-        Some("candidate-curve-scores-lack-discrimination")
-    } else {
-        None
-    }
-}
-
-impl Operator for DtscReadoutOperator {
-    type Config = DtscConfig;
-    type Input<'asset, 'query>
-        = DtscReadoutInput<'asset, 'query>
-    where
-        Self: 'asset + 'query;
-    type Output = DtscOutput;
-
-    fn name(&self) -> &'static str {
-        "dtsc_readout"
-    }
-
-    fn execute<'asset, 'query>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
-    ) -> Result<Self::Output, VcpError> {
-        self.readout(ctx, config, input, None)
-    }
-}
-
-impl DtscReadoutOperator {
-    /// Reuse strict left-fold cosine columns in the candidate matrix's row order.
-    /// Columns must use the same normalization and squared-norm cutoff as DTSC.
-    pub fn execute_with_query_cosines(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &DtscConfig,
-        input: DtscReadoutInput<'_, '_>,
-        query_cosines: [&[f64]; 2],
-    ) -> Result<DtscOutput, VcpError> {
-        self.readout(ctx, config, input, Some(query_cosines))
-    }
-
-    fn readout(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &DtscConfig,
-        input: DtscReadoutInput<'_, '_>,
-        query_cosines: Option<[&[f64]; 2]>,
-    ) -> Result<DtscOutput, VcpError> {
-        const STAGE: &str = "dtsc_readout";
-        let start = Instant::now();
-        ctx.check_cancelled(STAGE)?;
-
-        input.candidates.validate(STAGE)?;
-        input.tag_vectors.validate(STAGE)?;
-
-        let dim = input.tag_vectors.dim;
-        if dim == 0 {
-            return Err(VcpError::InvalidInput {
-                stage: STAGE,
-                detail: "DTSC dimension must be positive".into(),
-            });
-        }
-        if input.candidates.candidate_vectors.dim != dim {
-            return Err(VcpError::DimensionMismatch {
-                stage: STAGE,
-                expected: dim,
-                actual: input.candidates.candidate_vectors.dim,
-            });
-        }
-        if input.original_query.len() != dim {
-            return Err(VcpError::DimensionMismatch {
-                stage: STAGE,
-                expected: dim,
-                actual: input.original_query.len(),
-            });
-        }
-        if input.enhanced_query.len() != dim {
-            return Err(VcpError::DimensionMismatch {
-                stage: STAGE,
-                expected: dim,
-                actual: input.enhanced_query.len(),
-            });
-        }
-
-        config.validate()?;
-        let sampler = DtscFieldSampler::new(input.field, input.graph.inbound, &config.field);
-        let max_inbound = sampler.max_inbound;
-        let mut field_samples = vec![None; input.tag_vectors.rows];
-        let mut neighbors = Vec::new();
-        for &node in input.candidates.path_tags {
-            if let Some(slot) = field_samples.get_mut(node.index())
-                && slot.is_none()
-            {
-                ctx.check_cancelled(STAGE)?;
-                let row = input.tag_vectors.row(node.index()).unwrap();
-                *slot = Some((
-                    sampler.sample_with_buf(node, row, &mut neighbors),
-                    norm_sq_f32(row, PrecisionMode::StrictLeftFold),
-                ));
-            }
-        }
-        let candidates = input.candidates.candidate_count;
-        let (mut original_buffer, mut enhanced_buffer);
-        let [original, enhanced] = if let Some(columns) = query_cosines {
-            for column in columns {
-                if column.len() != candidates {
-                    return Err(VcpError::DimensionMismatch {
-                        stage: STAGE,
-                        expected: candidates,
-                        actual: column.len(),
-                    });
-                }
-            }
-            columns
-        } else {
-            original_buffer = vec![0.0; candidates];
-            let original = original_buffer.as_mut_slice();
-            enhanced_buffer = vec![0.0; candidates];
-            let enhanced = enhanced_buffer.as_mut_slice();
-            // A host may have calculated the norms under a different precision policy.
-            let candidate_matrix = VectorMatrixView {
-                sq_norms_f64: None,
-                ..input.candidates.candidate_vectors
-            };
-            batch_cosines_f32(
-                &candidate_matrix,
-                &[input.original_query, input.enhanced_query],
-                &mut [&mut *original, &mut *enhanced],
-                PrecisionMode::StrictLeftFold,
-                1e-12,
-                ctx.parallel,
-            )?;
-            [&*original, &*enhanced]
-        };
-        ctx.check_cancelled(STAGE)?;
-        let curve_ctx = DtscCurveContext {
-            config,
-            field_samples: &field_samples,
-            graph: &input.graph,
-            tag_vectors: &input.tag_vectors,
-            geometry: &input.geometry,
-            max_inbound,
-        };
-
-        let mut evals = Vec::with_capacity(input.candidates.candidate_count);
-        let mut samples_buf = Vec::new();
-        let mut isolated_buf = Vec::new();
-        let mut connected_flags = Vec::new();
-
-        for c in 0..input.candidates.candidate_count {
-            if c % 32 == 0 {
-                ctx.check_cancelled(STAGE)?;
-            }
-            let cand = CandidateId(c as u32);
-            let original_knn_score = input.candidates.baseline_scores[c];
-            let chunk_vector = input.candidates.candidate_vectors.row(c).unwrap_or(&[]);
-            let closures = [original[c], enhanced[c]].map(|cosine| unit((cosine + 1.0) / 2.0));
-            let base = empty_eval(cand, original_knn_score, closures);
-            let paths = input.candidates.candidate_paths(cand);
-
-            if paths.is_empty() {
-                evals.push(base);
-            } else {
-                let chunk_norm = norm_sq_f32(chunk_vector, PrecisionMode::StrictLeftFold);
-                let mut best: Option<DtscEval> = None;
-                for p in paths {
-                    let (tags, positions) = input.candidates.path_steps(PathId(p as u32));
-                    let cand_eval = eval_path(
-                        base,
-                        closures,
-                        chunk_vector,
-                        chunk_norm,
-                        tags,
-                        positions,
-                        &curve_ctx,
-                        &mut samples_buf,
-                        &mut isolated_buf,
-                        &mut connected_flags,
-                    );
-                    match best {
-                        None => best = Some(cand_eval),
-                        Some(ref prev) => {
-                            let cmp = cand_eval
-                                .score
-                                .total_cmp(&prev.score)
-                                .then_with(|| cand_eval.geo_score.total_cmp(&prev.geo_score));
-                            if cmp == Ordering::Greater {
-                                best = Some(cand_eval);
-                            }
-                        }
-                    }
-                }
-                if let Some(chosen) = best {
-                    evals.push(chosen);
-                }
-            }
-        }
-
-        let reason = fallback(&evals, input.field, config);
-        if reason.is_some() {
-            for s in &mut evals {
-                s.geo_bonus = 0.0;
-                s.geo_base_bonus = 0.0;
-                s.geo_aux_bonus = 0.0;
-                s.score = s.original_knn_score;
-                s.geo_effect = "neutral";
-            }
-        } else {
-            evals.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| b.original_knn_score.total_cmp(&a.original_knn_score))
-            });
-        }
-
-        let available = evals.len();
-        let limit = if config.top_k == 0 {
-            evals.len()
-        } else {
-            config.top_k
-        };
-        evals.truncate(limit.max(1));
-
-        let results = evals.into_iter().map(DtscEval::into_item).collect();
-
-        Ok(DtscOutput {
-            results,
-            field_trusted: input.field.field_trusted,
-            field_entropy: input.field.field_entropy,
-            order: if reason.is_some() {
-                DtscOrder::Input
-            } else {
-                DtscOrder::Score
-            },
-            available,
-            fallback_used: reason.is_some(),
-            fallback_reason: reason,
-            diagnostics: Diagnostics {
-                truncated: false,
-                truncation_reason: None,
-                elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-            },
-        })
-    }
 }

@@ -102,7 +102,6 @@ impl Default for ResourceLimits {
 
 #[derive(Clone, Copy)]
 pub struct ExecutionContext<'a> {
-    pub precision: PrecisionMode,
     pub parallel: ParallelPolicy<'a>,
     pub cancel: CancellationToken<'a>,
     pub limits: ResourceLimits,
@@ -111,7 +110,6 @@ pub struct ExecutionContext<'a> {
 impl Default for ExecutionContext<'_> {
     fn default() -> Self {
         Self {
-            precision: PrecisionMode::default(),
             parallel: ParallelPolicy::Sequential,
             cancel: CancellationToken::none(),
             limits: ResourceLimits::default(),
@@ -120,12 +118,6 @@ impl Default for ExecutionContext<'_> {
 }
 
 impl<'a> ExecutionContext<'a> {
-    #[inline]
-    pub fn with_precision(mut self, precision: PrecisionMode) -> Self {
-        self.precision = precision;
-        self
-    }
-
     #[inline]
     pub fn with_parallel(mut self, parallel: ParallelPolicy<'a>) -> Self {
         self.parallel = parallel;
@@ -140,17 +132,17 @@ impl<'a> ExecutionContext<'a> {
 
 pub trait Operator: Send + Sync {
     type Config: Send + Sync;
-    type Input<'asset, 'query>
+    type Input<'call>
     where
-        Self: 'asset + 'query;
+        Self: 'call;
     type Output: Send + Sync + 'static;
 
     fn name(&self) -> &'static str;
 
-    fn execute<'asset, 'query>(
+    fn execute<'call>(
         &self,
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
-        input: Self::Input<'asset, 'query>,
+        input: Self::Input<'call>,
     ) -> Result<Self::Output, VcpError>;
 }

@@ -824,17 +824,11 @@ impl<'a> TagLexicalMetaView<'a> {
     }
 }
 
-/// Unified candidate pool borrowed view with multi-root and multi-path CSR projections.
+/// Static candidate rows with multi-root and multi-path CSR projections.
 #[derive(Clone, Copy, Debug)]
-pub struct CandidatePoolView<'a> {
+pub struct CandidateRowsView<'a> {
     pub candidate_count: usize,
-    pub baseline_scores: &'a [f64],
-    pub union_scores: &'a [f64],
-    pub union_ranks: &'a [u32],
-    pub bm25_scores: &'a [f64],
-    pub bm25_reference: f64,
-    pub anchor_scores: &'a [f64],
-    pub curve_document_ids: &'a [DocumentId],
+    pub document_ids: &'a [DocumentId],
     pub candidate_vectors: VectorMatrixView<'a, f32>,
     pub candidate_root_offsets: &'a [u32],
     pub candidate_roots: &'a [RootId],
@@ -844,16 +838,11 @@ pub struct CandidatePoolView<'a> {
     pub path_positions: &'a [u32],
 }
 
-impl<'a> CandidatePoolView<'a> {
+impl<'a> CandidateRowsView<'a> {
     pub fn validate(&self, stage: &'static str) -> Result<(), VcpError> {
         let n = self.candidate_count;
         for (name, len) in [
-            ("baseline_scores", self.baseline_scores.len()),
-            ("union_scores", self.union_scores.len()),
-            ("union_ranks", self.union_ranks.len()),
-            ("bm25_scores", self.bm25_scores.len()),
-            ("anchor_scores", self.anchor_scores.len()),
-            ("curve_document_ids", self.curve_document_ids.len()),
+            ("document_ids", self.document_ids.len()),
             ("candidate_vectors.rows", self.candidate_vectors.rows),
         ] {
             if len != n {
@@ -864,12 +853,6 @@ impl<'a> CandidatePoolView<'a> {
             }
         }
         self.candidate_vectors.validate(stage)?;
-        if !self.bm25_reference.is_finite() || self.bm25_reference < 0.0 {
-            return Err(VcpError::InvalidInput {
-                stage,
-                detail: "bm25_reference must be finite and non-negative".into(),
-            });
-        }
         check_csr_u32_offsets(
             self.candidate_root_offsets,
             n,

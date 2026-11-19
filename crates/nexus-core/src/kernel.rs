@@ -657,3 +657,40 @@ pub fn normalize_f32_via_f64(
     }
     true
 }
+
+/// Prepare a finite, nonzero input as a unit semantic direction.
+pub fn normalize_direction(
+    vector: &[f32],
+    dim: usize,
+    stage: &'static str,
+) -> crate::VcpResult<Vec<f32>> {
+    if vector.len() != dim {
+        return Err(VcpError::DimensionMismatch {
+            stage,
+            expected: dim,
+            actual: vector.len(),
+        });
+    }
+    let norm = norm_sq_f32(vector, PrecisionMode::StrictLeftFold).sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+        return Err(VcpError::InvalidInput {
+            stage,
+            detail: "semantic direction must be finite and nonzero".into(),
+        });
+    }
+    Ok(vector
+        .iter()
+        .map(|&value| (f64::from(value) / norm) as f32)
+        .collect())
+}
+
+pub fn validate_unit_direction(vector: &[f32], stage: &'static str) -> crate::VcpResult<()> {
+    let norm_sq = norm_sq_f32(vector, PrecisionMode::StrictLeftFold);
+    if !norm_sq.is_finite() || (norm_sq - 1.0).abs() > 1e-6 {
+        return Err(VcpError::InvalidInput {
+            stage,
+            detail: format!("expected a unit direction, squared norm {norm_sq}"),
+        });
+    }
+    Ok(())
+}

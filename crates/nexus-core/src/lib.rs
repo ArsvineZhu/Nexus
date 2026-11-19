@@ -9,9 +9,10 @@ pub mod kernel;
 pub mod nnls;
 pub mod operator;
 pub mod plan;
+mod query_cosines;
 pub mod view;
 
-pub use csr::{CsrGraph, CsrGraphView, CsrParts, CsrStorage};
+pub use csr::{CsrGraph, CsrGraphView, CsrParts, CsrStorage, TransportGraph, TransportGraphView};
 pub use epoch::EpochTable;
 pub use error::{Diagnostics, VcpError, VcpResult};
 pub use id::{CandidateId, DocumentId, GroupId, NodeId, PathId, RootId, SequenceId};
@@ -21,8 +22,9 @@ pub use operator::{
     CancellationToken, ExecutionContext, Operator, ParallelPolicy, PrecisionMode, ResourceLimits,
 };
 pub use plan::{Handle, Plan};
+pub use query_cosines::QueryCosines;
 pub use view::{
-    CandidatePoolView, ContextFragmentsView, CounterevidenceAdjView, EpaBasisView,
+    CandidateRowsView, ContextFragmentsView, CounterevidenceAdjView, EpaBasisView,
     NegativeRelationView, PositiveRelationView, ProvenanceView, RelationPolarity, RootFactView,
     SequenceSliceView, SupportGroupView, SupportKind, TagLexicalMetaView, TextRows,
     ThinkingStageInputView, VectorMatrixView,

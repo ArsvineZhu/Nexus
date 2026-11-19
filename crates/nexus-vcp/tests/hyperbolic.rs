@@ -81,7 +81,7 @@ fn tag_radii_and_new_residual_radius_match_pinned_geometry() {
     let epa = EpaAnalysis {
         cache_available: true,
         in_domain_gate: 0.6,
-        logic_depth: 0.4,
+        spectral_concentration: 0.4,
         entropy: 0.2,
         ..Default::default()
     };
