@@ -19,6 +19,7 @@ use nexus_core::{
     VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub(crate) fn invalid(stage: &'static str, detail: &'static str) -> VcpError {
     VcpError::InvalidInput {
@@ -108,7 +109,7 @@ pub struct Observe;
 impl Operator for Observe {
     type Config = ObservationConfig;
     type Input<'asset, 'query> = ObservationInput<'asset>;
-    type Output = ObservationState;
+    type Output = Arc<ObservationState>;
 
     fn name(&self) -> &'static str {
         "observe"
@@ -188,7 +189,7 @@ impl Operator for Observe {
                 tag_vectors: input.tag_vectors,
             },
         )?;
-        Ok(ObservationState {
+        Ok(Arc::new(ObservationState {
             original_query: input.query.to_vec(),
             epa,
             pyramid,
@@ -196,7 +197,7 @@ impl Operator for Observe {
             gated_seeds,
             sense,
             fused,
-        })
+        }))
     }
 }
 
@@ -210,16 +211,35 @@ pub struct FieldConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldState {
+    observation: Arc<ObservationState>,
     pub dual_fields: DualFields,
     pub basins: BasinSupports,
+}
+
+impl FieldState {
+    /// Import a field solution and basin projection alongside the observation they used.
+    pub fn from_parts(
+        observation: Arc<ObservationState>,
+        dual_fields: DualFields,
+        basins: BasinSupports,
+    ) -> Self {
+        Self {
+            observation,
+            dual_fields,
+            basins,
+        }
+    }
+
+    pub fn observation(&self) -> &ObservationState {
+        &self.observation
+    }
 }
 
 #[derive(Clone, Copy)]
 pub struct FieldInput<'asset, 'query> {
     pub graph: CsrGraphView<'asset>,
     pub tag_vectors: VectorMatrixView<'asset>,
-    pub sense: &'query SenseOutput,
-    pub fused: &'query FusedObservation,
+    pub observation: &'query Arc<ObservationState>,
 }
 
 pub struct ComputeFields;
@@ -244,7 +264,7 @@ impl Operator for ComputeFields {
             &cfg.solve,
             DualFieldSolveInput {
                 graph: input.graph,
-                fused: input.fused,
+                fused: &input.observation.fused,
             },
         )?;
         let basins = BasinProjectionOperator.execute(
@@ -253,13 +273,14 @@ impl Operator for ComputeFields {
             BasinProjectionInput {
                 graph: input.graph,
                 tag_vectors: input.tag_vectors,
-                sense: input.sense,
+                sense: &input.observation.sense,
                 dual_fields: &dual_fields,
             },
         )?;
-        Ok(FieldState {
+        Ok(FieldState::from_parts(
+            Arc::clone(input.observation),
             dual_fields,
             basins,
-        })
+        ))
     }
 }

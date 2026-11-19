@@ -31,12 +31,12 @@ impl Default for ObservationFuseConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ObservationFuseInput<'asset, 'query> {
-    pub query: &'query [f32],
+    pub query: &'asset [f32],
     pub gated: &'query GatedSeeds,
     pub sense: &'query SenseOutput,
-    pub core_tags: &'query [NodeId],
-    pub ghost_vectors: Option<VectorMatrixView<'query, f32>>,
-    pub ghost_is_core: &'query [bool],
+    pub core_tags: &'asset [NodeId],
+    pub ghost_vectors: Option<VectorMatrixView<'asset, f32>>,
+    pub ghost_is_core: &'asset [bool],
     pub tag_vectors: VectorMatrixView<'asset, f32>,
 }
 

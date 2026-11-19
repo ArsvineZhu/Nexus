@@ -10,7 +10,7 @@ pub use ranking::*;
 pub use wormhole::*;
 
 use crate::observation::{finite_vector, invalid};
-use crate::{FieldState, ObservationState, SeedSourceKind, SenseOutput};
+use crate::{FieldState, SeedSourceKind, SenseOutput};
 use nexus_core::kernel::norm_sq_f32;
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, Operator, PathId,
@@ -51,11 +51,10 @@ impl Default for RiverReadoutConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RiverReadoutInput<'asset, 'query> {
-    pub observation: &'query ObservationState,
     pub fields: &'query FieldState,
     pub evidence: EvidencePolicy,
     pub pool: &'query PreparedCandidatePool,
-    pub candidates: CandidatePoolView<'query>,
+    pub candidates: CandidatePoolView<'asset>,
     pub graph: CsrGraphView<'asset>,
     pub provenance: ProvenanceView<'asset>,
     pub support_groups: SupportGroupView<'asset>,
@@ -403,7 +402,7 @@ impl Operator for AnalyzeRiverPaths {
 
         let n = input.graph.node_count;
         let vectors = input.tag_vectors;
-        let state = input.observation;
+        let state = input.fields.observation();
         let count = input.candidates.candidate_count;
         let pool = input.pool;
         if vectors.rows != n

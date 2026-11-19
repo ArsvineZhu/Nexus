@@ -30,8 +30,6 @@ impl Default for PoolCalibrateConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PoolCalibrateInput<'asset, 'query> {
-    pub original_query: &'query [f32],
-    pub enhanced_query: &'query [f32],
     pub fields: &'query FieldState,
     pub candidates: CandidatePoolView<'asset>,
 }
@@ -65,9 +63,10 @@ impl PoolCalibrateOperator {
         let pool = input.candidates;
         pool.validate(stage)?;
         let fields = input.fields;
+        let observation = fields.observation();
         let queries = [
-            input.original_query,
-            input.enhanced_query,
+            observation.original_query.as_slice(),
+            observation.fused.enhanced_query.as_slice(),
             fields.basins.local_vector.as_slice(),
             fields.basins.transfer_vector.as_slice(),
         ];

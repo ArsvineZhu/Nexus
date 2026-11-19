@@ -92,8 +92,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             FieldInput {
                 graph,
                 tag_vectors: matrix,
-                sense: &observed.sense,
-                fused: &observed.fused,
+                observation: &observed,
             },
         )
         .unwrap();
@@ -128,8 +127,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             FieldInput {
                 graph: graph.with_edge_gates(&[0.0]).unwrap(),
                 tag_vectors: matrix,
-                sense: &explicit.sense,
-                fused: &explicit.fused,
+                observation: &explicit,
             },
         )
         .unwrap();
@@ -185,4 +183,45 @@ fn pyramid_propagates_host_failure() {
         },
     );
     assert!(matches!(result, Err(VcpError::Cancelled { stage: "host" })));
+}
+
+#[test]
+fn composes_epa_and_pyramid_with_borrowed_query_and_host_recall() -> VcpResult<()> {
+    let query = vec![1.0_f32, 0.0];
+    let tag = vec![1.0_f32, 0.0];
+    let tag_vectors = VectorMatrixView::new(&tag, 1, 2)?;
+    let hits = [(NodeId(0), 1.0)];
+    let recall =
+        |layer, _: &[f32], _, out: &mut Vec<_>, epa: Option<&EpaAnalysis>, _: &[NodeId]| {
+            assert!(epa.is_some());
+            if layer == 0 {
+                out.extend_from_slice(&hits);
+            }
+            Ok(())
+        };
+    let mut plan = Plan::new();
+    let epa = plan.add(EpaAnalyzeOperator, EpaConfig::default(), (), |_| {
+        Ok(EpaAnalyzeInput {
+            query: &query,
+            basis: None,
+        })
+    })?;
+    let pyramid = plan.add(
+        PyramidAnalyzeOperator,
+        PyramidConfig::default(),
+        epa,
+        |inputs| {
+            Ok(PyramidAnalyzeInput {
+                query: &query,
+                candidates: &recall,
+                epa: Some(inputs.get()),
+                tag_vectors,
+            })
+        },
+    )?;
+    let result = plan.run(pyramid, &ExecutionContext::default())?;
+    let pyramid = result.get(pyramid)?;
+    assert_eq!(pyramid.levels[0].tags[0].node, NodeId(0));
+    assert!((pyramid.coverage - 1.0).abs() < 1e-12);
+    Ok(())
 }

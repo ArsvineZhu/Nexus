@@ -24,8 +24,8 @@ pub struct EpaConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct EpaAnalyzeInput<'asset, 'query> {
-    pub query: &'query [f32],
+pub struct EpaAnalyzeInput<'asset> {
+    pub query: &'asset [f32],
     pub basis: Option<EpaBasisView<'asset>>,
 }
 
@@ -84,7 +84,7 @@ pub struct EpaAnalyzeOperator;
 
 impl Operator for EpaAnalyzeOperator {
     type Config = EpaConfig;
-    type Input<'asset, 'query> = EpaAnalyzeInput<'asset, 'query>;
+    type Input<'asset, 'query> = EpaAnalyzeInput<'asset>;
     type Output = EpaAnalysis;
 
     fn name(&self) -> &'static str {
@@ -253,8 +253,8 @@ impl Default for PyramidConfig {
 
 #[derive(Clone, Copy)]
 pub struct PyramidAnalyzeInput<'asset, 'query> {
-    pub query: &'query [f32],
-    pub candidates: &'query PyramidCandidates<'query>,
+    pub query: &'asset [f32],
+    pub candidates: &'asset PyramidCandidates<'asset>,
     pub epa: Option<&'query EpaAnalysis>,
     pub tag_vectors: VectorMatrixView<'asset, f32>,
 }

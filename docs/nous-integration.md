@@ -10,10 +10,34 @@ The host handles permissions, time views, model calls and persistence. Set the v
 
 ## Observe, read out and combine
 
-Call `nexus.observe` to retain query geometry, residual layers, seed decisions, the river network and the enhanced vector. Call `nexus.fields` when you also need the dual response fields and projection supports. `nexus.river` reads those results and `nexus.dtsc` reads the observation. `nexus.thinking` takes a complete retained trace and named candidate stages. Use `ObservationConfig::sense.max_transition_records` to configure the retention limit.
+For a preset with host-provided Tag recall, put the callback on the query. The same query works with `observe` and `ObserveQuery` in a custom plan.
 
-For host-provided Tag recall, call `observe_with_recall`. The callback receives the layer, current residual, limit, empty candidate buffer, initial EPA analysis and previously accepted Tag IDs. Fill the buffer in retrieval order. An empty buffer ends decomposition.
+~~~rust
+let nexus = Nexus::from_prepared(assets)?;
+let query = Query::new(vector, text).with_tag_recall(&recall);
+let candidates = Candidates::Borrowed { ids, pool: &pool };
+let result = nexus.run(&query, &candidates, Pipeline::river(), &Default::default())?;
+~~~
 
-Use `Plan::add` with an operator, its config, and typed handles from earlier calls. Its binder takes those results and fills the same Rust input used by a direct call. `Plan::run` accepts one handle or a tuple of result handles. The example builds one observation and feeds it to River, DTSC and Thinking. [Example](../crates/nexus/examples/live_retrieval.rs)
+The callback receives the layer, current residual, limit, reusable candidate buffer, initial EPA analysis and previously accepted Tag IDs. Fill the buffer with `(NodeId, score)` pairs in retrieval order. An empty buffer ends decomposition. An error ends the query and is returned to the caller.
+
+When you want intermediate results or multiple readouts, prepare the candidate selection once.
+
+~~~rust
+let batch = nexus.candidates(query.vector, &candidates)?;
+let observation = nexus.observe(&query, &Default::default())?;
+let fields = nexus.fields(&observation, &Default::default())?;
+let river = nexus.river(&fields, &batch, &Default::default())?;
+let dtsc = nexus.dtsc(&observation, &batch, &Default::default())?;
+let thinking = nexus.thinking(&observation, &batch, &stages, &Default::default())?;
+~~~
+
+The field result retains the observation it was computed from. `fields.observation()` gives access to its geometry, residuals, seeds, river network and enhanced vector. Thinking takes stages named by the caller, with document IDs from the batch. Set `ObservationConfig::sense.max_transition_records` to retain the complete propagation trace used by Thinking.
+
+## Compose operators
+
+`Plan::add` takes an operator, its configuration and handles from previous steps. Use `inputs.get()` in the binder to fill the same typed input you would pass to `Operator::execute`. For example, a `PyramidAnalyzeOperator` step can take the handle of `EpaAnalyzeOperator`, then combine that EPA result with the original query vector and the host callback. `Plan::run` accepts one output handle or a tuple of handles.
+
+For River and DTSC together, the [Rust example](../crates/nexus/examples/live_retrieval.rs) shares one observation, candidate batch and `PoolCalibrateOperator` result. Set `PoolCalibrateConfig::precision` to `StrictLeftFold` to share the two query cosine columns with DTSC. The calibration configuration belongs to the calibration step. `RiverConfig` controls scoring, evidence and Wormhole.
 
 Use an `ExecutionContext` with the host's cancellation source and optional Rayon pool for request-scoped controls. Sense has an optional caller-owned `SenseWorkspace` for allocation reuse. Budgets that leave propagation incomplete are surfaced in its diagnostics. DTSC exposes the number of available results and the actual ranking basis separately from diagnostic truncation.

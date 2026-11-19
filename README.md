@@ -20,7 +20,7 @@ fn retrieve(data: Dataset, vector: &[f32]) -> nexus::core::VcpResult<()> {
 }
 ```
 
-Use `Pipeline::tag_memo()` for enhanced-query cosine ranking or `Pipeline::dtsc()` for curve-based scoring. `observe`, `fields`, `river`, `dtsc` and `thinking` expose the intermediate steps. `Plan` composes typed operator outputs within one request.
+Use `Pipeline::tag_memo()` for enhanced-query cosine ranking or `Pipeline::dtsc()` for curve-based scoring. For multiple readouts, prepare a candidate batch with `nexus.candidates` and share it across `river`, `dtsc` and `thinking`. `observe` and `fields` expose the intermediate results. `Plan` composes typed operator outputs within one request.
 
 - [Algorithm map](INDEX.md) links mathematical definitions and public entry points.
 - [Borrowed assets and custom composition](docs/nous-integration.md) covers asset preparation and host integration.

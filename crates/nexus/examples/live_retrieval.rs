@@ -2,7 +2,6 @@
 
 use nexus::core::{CandidateId, PrecisionMode, ThinkingStageInputView};
 use nexus::math::DtscConfig;
-use nexus::vcp::hyperbolic::SearchConfig;
 use nexus::vcp::{
     ComputeFields, FieldConfig, ObservationConfig, PoolCalibrateInput, PoolCalibrateOperator,
     ThinkingConfig, ThinkingInput, ThinkingPlanOperator,
@@ -93,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let borrowed = Nexus::from_prepared(assets)?;
     let ctx = ExecutionContext::default();
     let mut config = RiverPipelineConfig::default();
-    config.readout.calibration.precision = Some(PrecisionMode::StrictLeftFold);
+    config.calibration.precision = Some(PrecisionMode::StrictLeftFold);
     let candidates = Candidates::recall(ids.len());
     let mut top_one = 0;
     let mut grounded = 0;
@@ -132,17 +131,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             + 1;
         top_one += usize::from(expected_rank == 1);
         let observed = borrowed.observe(&query, &ObservationConfig::default())?;
-        let dtsc = borrowed.dtsc(&observed, &candidates, &DtscConfig::default())?;
+        let batch = borrowed.candidates(query.vector, &candidates)?;
+        let fields = borrowed.fields(&observed, &config.fields)?;
+        let river_direct =
+            borrowed.river_with(&fields, &batch, &config.readout, &config.calibration, &ctx)?;
+        assert_eq!(river_direct.scores.items, result.scores.items);
+        let dtsc = borrowed.dtsc(&observed, &batch, &DtscConfig::default())?;
         let stages = [Stage {
             name: "Explore",
             limit: 2,
             documents: &ids,
         }];
-        let plan = borrowed.thinking(
-            observed.complete_trace()?,
-            &stages,
-            &ThinkingConfig::default(),
-        )?;
+        let plan = borrowed.thinking(&observed, &batch, &stages, &ThinkingConfig::default())?;
         let thought = plan.scores.stages[0]
             .results
             .iter()
@@ -159,8 +159,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             dtsc.scores.results.len()
         );
 
-        let batch =
-            borrowed.candidates(query.vector, &candidates, SearchConfig::default(), &ctx)?;
         let thinking_candidates: Vec<_> = (0..batch.ids().len())
             .map(|slot| CandidateId::from_index(slot, "example"))
             .collect::<Result<_, _>>()?;
@@ -180,18 +178,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             ComputeFields,
             FieldConfig::default(),
             observation,
-            |input| Ok(borrowed.field_input(input.get()?)),
+            |inputs| Ok(borrowed.field_input(inputs.get())),
         )?;
         let calibration = plan.add(
             PoolCalibrateOperator,
-            config.readout.calibration.clone(),
-            (observation, fields),
-            |input| {
-                let (observation, fields) = input.get()?;
+            config.calibration.clone(),
+            fields,
+            |inputs| {
                 Ok(PoolCalibrateInput {
-                    original_query: &observation.original_query,
-                    enhanced_query: &observation.fused.enhanced_query,
-                    fields,
+                    fields: inputs.get(),
                     candidates: batch.view(),
                 })
             },
@@ -199,12 +194,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         let river = plan.add(
             ReadRiver,
             config.readout.clone(),
-            (observation, fields, calibration),
-            |input| {
-                let (observation, fields, pool) = input.get()?;
+            (fields, calibration),
+            |inputs| {
+                let (fields, pool) = inputs.get();
                 Ok(RiverInput {
                     assets,
-                    observation,
                     fields,
                     pool,
                     candidates: batch.view(),
@@ -215,8 +209,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             ReadDtsc,
             DtscConfig::default(),
             (observation, calibration),
-            |input| {
-                let (observation, pool) = input.get()?;
+            |inputs| {
+                let (observation, pool) = inputs.get();
                 Ok(ObservedDtscInput {
                     assets,
                     observation,
@@ -232,9 +226,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 ThinkingPlanOperator,
                 ThinkingConfig::default(),
                 observation,
-                |input| {
+                |inputs| {
                     Ok(ThinkingInput {
-                        trace: input.get()?.complete_trace()?,
+                        trace: inputs.get().complete_trace()?,
                         candidates: batch.view(),
                         stages: &plan_stages,
                         graph: assets.graph,

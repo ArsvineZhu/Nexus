@@ -96,15 +96,14 @@ mod dependencies {
 pub trait Dependencies: dependencies::Sealed {}
 impl<T: dependencies::Sealed> Dependencies for T {}
 
-/// A node's typed inputs already produced during this execution.
-pub struct Inputs<'result, D> {
-    slots: &'result Slots,
-    dependencies: D,
+/// The requested dependencies, already evaluated and type-checked by the plan.
+pub struct Inputs<'result, D: Dependencies> {
+    values: D::Borrowed<'result>,
 }
 
 impl<'result, D: Dependencies> Inputs<'result, D> {
-    pub fn get(self) -> VcpResult<D::Borrowed<'result>> {
-        self.dependencies.borrow(self.slots)
+    pub fn get(self) -> D::Borrowed<'result> {
+        self.values
     }
 }
 
@@ -133,7 +132,7 @@ impl<'request> Plan<'request> {
         }
     }
 
-    /// 'bind' fills the operator's input from request assets and typed prior results.
+    /// The binder receives the typed results of the requested dependencies.
     pub fn add<O, D, F>(
         &mut self,
         operator: O,
@@ -156,8 +155,7 @@ impl<'request> Plan<'request> {
             run: Box::new(move |ctx, slots| {
                 ctx.check_cancelled(operator.name())?;
                 let input = bind(Inputs {
-                    slots,
-                    dependencies,
+                    values: dependencies.borrow(slots)?,
                 })?;
                 Ok(Box::new(operator.execute(ctx, &config, input)?))
             }),

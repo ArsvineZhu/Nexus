@@ -151,8 +151,7 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             FieldInput {
                 graph,
                 tag_vectors,
-                sense: &observation.sense,
-                fused: &observation.fused,
+                observation: &observation,
             },
         )
         .unwrap();
@@ -178,8 +177,6 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             &ctx,
             &PoolCalibrateConfig::default(),
             PoolCalibrateInput {
-                original_query: &observation.original_query,
-                enhanced_query: &observation.fused.enhanced_query,
                 fields: &fields,
                 candidates,
             },
@@ -190,7 +187,6 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             &ctx,
             &RiverReadoutConfig::default(),
             RiverReadoutInput {
-                observation: &observation,
                 fields: &fields,
                 evidence: EvidencePolicy::Nous,
                 pool: &pool,
@@ -320,8 +316,7 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
             FieldInput {
                 graph,
                 tag_vectors,
-                sense: &observation.sense,
-                fused: &observation.fused,
+                observation: &observation,
             },
         )
         .unwrap();
@@ -349,8 +344,6 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
             &ctx,
             &PoolCalibrateConfig::default(),
             PoolCalibrateInput {
-                original_query: &observation.original_query,
-                enhanced_query: &observation.fused.enhanced_query,
                 fields: &fields,
                 candidates,
             },
@@ -361,7 +354,6 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
             &ctx,
             &RiverReadoutConfig::default(),
             RiverReadoutInput {
-                observation: &observation,
                 fields: &fields,
                 evidence: EvidencePolicy::Nous,
                 pool: &pool,

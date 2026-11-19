@@ -93,7 +93,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         if let Some(value) = self.contacts.get(&tag) {
             return Ok(*value);
         }
-        let state = self.input.observation;
+        let state = self.input.fields.observation();
         let fields = self.fields;
         let domains = [
             &self.input.fields.dual_fields.local_domain,
@@ -203,7 +203,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         if steps.is_empty() {
             return Ok(GraphEvidence::default());
         }
-        let state = self.input.observation;
+        let state = self.input.fields.observation();
         let mut bindings = Vec::new();
         let mut total_node = 0.0;
         let threshold = self.config.tag_align_min_cos;
@@ -344,7 +344,8 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let mut contacts = Vec::new();
         for seed in self
             .input
-            .observation
+            .fields
+            .observation()
             .sense
             .nodes
             .iter()
@@ -392,7 +393,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
     ) -> VcpResult<PathEvidence> {
         let input = self.input;
         let cfg = self.config;
-        let state = input.observation;
+        let state = input.fields.observation();
         let vector = input
             .candidates
             .candidate_vectors

@@ -89,11 +89,11 @@ impl Default for HypernymConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct HypernymPruneInput<'asset, 'query> {
-    pub query: &'query [f32],
+    pub query: &'asset [f32],
     pub pyramid: &'query PyramidResidual,
     pub tag_vectors: VectorMatrixView<'asset, f32>,
     pub lexical_meta: TagLexicalMetaView<'asset>,
-    pub core_tags: &'query [NodeId],
+    pub core_tags: &'asset [NodeId],
     pub seed_contribution_floor: f64,
     pub seed_contribution_ratio: f64,
 }
@@ -275,8 +275,8 @@ pub struct TagGatingInput<'asset, 'query> {
     pub epa: &'query EpaAnalysis,
     pub pyramid: &'query PyramidResidual,
     pub disambiguated: &'query DisambiguatedTags,
-    pub query_text: &'query str,
-    pub core_tags: &'query [NodeId],
+    pub query_text: &'asset str,
+    pub core_tags: &'asset [NodeId],
     pub tag_vectors: VectorMatrixView<'asset, f32>,
     pub lexical_meta: TagLexicalMetaView<'asset>,
     pub graph_node_count: usize,

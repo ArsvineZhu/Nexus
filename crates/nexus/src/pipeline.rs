@@ -8,6 +8,7 @@ use nexus_math::*;
 use nexus_vcp::hyperbolic::{SearchConfig, residual_radius, tag_hits};
 use nexus_vcp::*;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const QUERY: &str = "query";
 
@@ -18,6 +19,7 @@ pub struct Query<'a> {
     pub core_concepts: &'a [u64],
     pub ghost_vectors: Option<VectorMatrixView<'a>>,
     pub ghost_is_core: &'a [bool],
+    pub tag_recall: Option<&'a PyramidCandidates<'a>>,
 }
 
 impl<'a> Query<'a> {
@@ -28,7 +30,14 @@ impl<'a> Query<'a> {
             core_concepts: &[],
             ghost_vectors: None,
             ghost_is_core: &[],
+            tag_recall: None,
         }
+    }
+
+    /// Use the host's Tag recall for each residual layer.
+    pub fn with_tag_recall(mut self, recall: &'a PyramidCandidates<'a>) -> Self {
+        self.tag_recall = Some(recall);
+        self
     }
 }
 
@@ -71,7 +80,6 @@ pub type DtscReadout = Readout<DtscOutput>;
 
 #[derive(Clone, Debug)]
 pub struct RiverConfig {
-    pub calibration: PoolCalibrateConfig,
     pub scoring: RiverReadoutConfig,
     pub wormhole: CrossFileWormholeConfig,
     pub evidence: EvidencePolicy,
@@ -80,7 +88,6 @@ pub struct RiverConfig {
 impl Default for RiverConfig {
     fn default() -> Self {
         Self {
-            calibration: PoolCalibrateConfig::default(),
             scoring: RiverReadoutConfig::default(),
             wormhole: CrossFileWormholeConfig::default(),
             evidence: EvidencePolicy::Vcp,
@@ -92,6 +99,7 @@ impl Default for RiverConfig {
 pub struct RiverPipelineConfig {
     pub observation: ObservationConfig,
     pub fields: FieldConfig,
+    pub calibration: PoolCalibrateConfig,
     pub readout: RiverConfig,
     pub chunk_search: SearchConfig,
 }
@@ -103,6 +111,7 @@ impl Default for RiverPipelineConfig {
         Self {
             observation,
             fields: FieldConfig::default(),
+            calibration: PoolCalibrateConfig::default(),
             readout: RiverConfig::default(),
             chunk_search: SearchConfig::default(),
         }
@@ -127,7 +136,7 @@ pub struct TagMemoItem {
 }
 
 pub struct TagMemoOutput {
-    pub observation: ObservationState,
+    pub observation: Arc<ObservationState>,
     pub ranking: Readout<Vec<TagMemoItem>>,
 }
 
@@ -144,15 +153,9 @@ impl Pipeline<RiverOutput, RiverPipelineConfig> {
             run: |nexus, query, candidates, config, ctx| {
                 let observation = nexus.observe_with(query, &config.observation, ctx)?;
                 let fields = nexus.fields_with(&observation, &config.fields, ctx)?;
-                let pool = nexus.candidates(query.vector, candidates, config.chunk_search, ctx)?;
-                river_in(
-                    nexus.prepared(),
-                    &observation,
-                    &fields,
-                    &pool,
-                    &config.readout,
-                    ctx,
-                )
+                let batch =
+                    nexus.candidates_with(query.vector, candidates, config.chunk_search, ctx)?;
+                nexus.river_with(&fields, &batch, &config.readout, &config.calibration, ctx)
             },
         }
     }
@@ -163,7 +166,13 @@ impl Pipeline<DtscReadout, DtscPipelineConfig> {
         Self {
             run: |nexus, query, candidates, config, ctx| {
                 let observation = nexus.observe_with(query, &config.observation, ctx)?;
-                nexus.dtsc_with(&observation, candidates, &config.readout, ctx)
+                let batch = nexus.candidates_with(
+                    query.vector,
+                    candidates,
+                    SearchConfig::default(),
+                    ctx,
+                )?;
+                nexus.dtsc_with(&observation, &batch, &config.readout, ctx)
             },
         }
     }
@@ -174,8 +183,12 @@ impl Pipeline<TagMemoOutput, TagMemoConfig> {
         Self {
             run: |nexus, query, candidates, config, ctx| {
                 let observation = nexus.observe_with(query, &config.observation, ctx)?;
-                let pool =
-                    nexus.candidates(query.vector, candidates, SearchConfig::default(), ctx)?;
+                let pool = nexus.candidates_with(
+                    query.vector,
+                    candidates,
+                    SearchConfig::default(),
+                    ctx,
+                )?;
                 let scores = TagMemoReadout.execute(
                     ctx,
                     &(),
@@ -228,7 +241,7 @@ impl Nexus<'_> {
         &self,
         query: &Query<'_>,
         config: &ObservationConfig,
-    ) -> VcpResult<ObservationState> {
+    ) -> VcpResult<Arc<ObservationState>> {
         self.observe_with(query, config, &ExecutionContext::default())
     }
 
@@ -237,7 +250,7 @@ impl Nexus<'_> {
         query: &Query<'_>,
         config: &ObservationConfig,
         ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<ObservationState> {
+    ) -> VcpResult<Arc<ObservationState>> {
         ObserveQuery.execute(
             ctx,
             config,
@@ -248,47 +261,9 @@ impl Nexus<'_> {
         )
     }
 
-    pub fn observe_with_recall(
-        &self,
-        query: &Query<'_>,
-        config: &ObservationConfig,
-        recall: &PyramidCandidates<'_>,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<ObservationState> {
-        let assets = self.prepared();
-        let core_tags = query
-            .core_concepts
-            .iter()
-            .map(|key| {
-                let slot = self
-                    .concept_slots
-                    .get(key)
-                    .copied()
-                    .ok_or_else(|| invalid(QUERY, format!("unknown concept {key}")))?;
-                NodeId::from_index(slot, QUERY)
-            })
-            .collect::<VcpResult<Vec<_>>>()?;
-        Observe.execute(
-            ctx,
-            config,
-            ObservationInput {
-                query: query.vector,
-                query_text: query.text,
-                core_tags: &core_tags,
-                candidates: recall,
-                graph: assets.graph,
-                tag_vectors: assets.tags,
-                lexical_meta: assets.lexical,
-                epa_basis: assets.basis,
-                ghost_vectors: query.ghost_vectors,
-                ghost_is_core: query.ghost_is_core,
-            },
-        )
-    }
-
     pub fn fields(
         &self,
-        observed: &ObservationState,
+        observed: &Arc<ObservationState>,
         config: &FieldConfig,
     ) -> VcpResult<FieldState> {
         self.fields_with(observed, config, &ExecutionContext::default())
@@ -296,62 +271,88 @@ impl Nexus<'_> {
 
     pub fn fields_with(
         &self,
-        observed: &ObservationState,
+        observed: &Arc<ObservationState>,
         config: &FieldConfig,
         ctx: &ExecutionContext<'_>,
     ) -> VcpResult<FieldState> {
         ComputeFields.execute(ctx, config, self.field_input(observed))
     }
 
-    pub fn field_input<'a, 'q>(&'a self, observed: &'q ObservationState) -> FieldInput<'a, 'q> {
+    pub fn field_input<'a, 'q>(
+        &'a self,
+        observation: &'q Arc<ObservationState>,
+    ) -> FieldInput<'a, 'q> {
         let assets = self.prepared();
         FieldInput {
             graph: assets.graph,
             tag_vectors: assets.tags,
-            sense: &observed.sense,
-            fused: &observed.fused,
+            observation,
         }
     }
 
     pub fn river(
         &self,
-        observed: &ObservationState,
         fields: &FieldState,
-        candidates: &Candidates<'_>,
+        batch: &CandidateBatch<'_>,
         config: &RiverConfig,
     ) -> VcpResult<RiverOutput> {
-        let ctx = ExecutionContext::default();
-        let pool = self.candidates(
-            &observed.original_query,
-            candidates,
-            SearchConfig::default(),
-            &ctx,
+        self.river_with(
+            fields,
+            batch,
+            config,
+            &Default::default(),
+            &Default::default(),
+        )
+    }
+
+    pub fn river_with(
+        &self,
+        fields: &FieldState,
+        batch: &CandidateBatch<'_>,
+        config: &RiverConfig,
+        calibration: &PoolCalibrateConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<RiverOutput> {
+        batch.check_query(&fields.observation().original_query)?;
+        let candidates = batch.view();
+        let pool = PoolCalibrateOperator.execute(
+            ctx,
+            calibration,
+            PoolCalibrateInput { fields, candidates },
         )?;
-        river_in(self.prepared(), observed, fields, &pool, config, &ctx)
+        let scores = ReadRiver.execute(
+            ctx,
+            config,
+            RiverInput {
+                assets: self.prepared(),
+                fields,
+                candidates,
+                pool: &pool,
+            },
+        )?;
+        Ok(Readout {
+            candidate_ids: batch.ids().to_vec(),
+            scores,
+        })
     }
 
     pub fn dtsc(
         &self,
         observed: &ObservationState,
-        candidates: &Candidates<'_>,
+        batch: &CandidateBatch<'_>,
         config: &DtscConfig,
     ) -> VcpResult<DtscReadout> {
-        self.dtsc_with(observed, candidates, config, &ExecutionContext::default())
+        self.dtsc_with(observed, batch, config, &ExecutionContext::default())
     }
 
     pub fn dtsc_with(
         &self,
         observed: &ObservationState,
-        candidates: &Candidates<'_>,
+        batch: &CandidateBatch<'_>,
         config: &DtscConfig,
         ctx: &ExecutionContext<'_>,
     ) -> VcpResult<DtscReadout> {
-        let pool = self.candidates(
-            &observed.original_query,
-            candidates,
-            SearchConfig::default(),
-            ctx,
-        )?;
+        batch.check_query(&observed.original_query)?;
         let scores = ReadDtsc.execute(
             ctx,
             config,
@@ -359,43 +360,48 @@ impl Nexus<'_> {
                 assets: self.prepared(),
                 pool: None,
                 observation: observed,
-                candidates: pool.view(),
+                candidates: batch.view(),
             },
         )?;
         Ok(Readout {
-            candidate_ids: pool.ids().to_vec(),
+            candidate_ids: batch.ids().to_vec(),
             scores,
         })
     }
 
     pub fn thinking(
         &self,
-        trace: CompleteTrace<'_>,
+        observation: &ObservationState,
+        batch: &CandidateBatch<'_>,
         stages: &[Stage<'_>],
         config: &ThinkingConfig,
     ) -> VcpResult<Readout<ThinkingPlan>> {
+        batch.check_query(&observation.original_query)?;
+        let trace = observation.complete_trace()?;
         let ctx = ExecutionContext::default();
-        let mut seen = HashSet::new();
-        let ids: Vec<_> = stages
-            .iter()
-            .flat_map(|stage| stage.documents.iter().copied())
-            .filter(|&document| seen.insert(document))
-            .collect();
-        let pool = self.candidates(
-            trace.query(),
-            &Candidates::Provided(&ids),
-            SearchConfig::default(),
-            &ctx,
-        )?;
-        let lookup: std::collections::HashMap<_, _> = ids
+        let lookup: std::collections::HashMap<_, _> = batch
+            .ids()
             .iter()
             .enumerate()
             .map(|(i, &id)| Ok((id, CandidateId::from_index(i, "thinking")?)))
             .collect::<VcpResult<_>>()?;
         let stages_candidates: Vec<Vec<_>> = stages
             .iter()
-            .map(|stage| stage.documents.iter().map(|id| lookup[id]).collect())
-            .collect();
+            .map(|stage| {
+                stage
+                    .documents
+                    .iter()
+                    .map(|id| {
+                        lookup.get(id).copied().ok_or_else(|| {
+                            invalid(
+                                "thinking",
+                                format!("document {id} is outside the candidate batch"),
+                            )
+                        })
+                    })
+                    .collect::<VcpResult<Vec<_>>>()
+            })
+            .collect::<VcpResult<_>>()?;
         let stages: Vec<_> = stages
             .iter()
             .zip(&stages_candidates)
@@ -411,7 +417,7 @@ impl Nexus<'_> {
             config,
             ThinkingInput {
                 trace,
-                candidates: pool.view(),
+                candidates: batch.view(),
                 stages: &stages,
                 graph: assets.graph,
                 provenance: assets.provenance,
@@ -421,14 +427,27 @@ impl Nexus<'_> {
             },
         )?;
         Ok(Readout {
-            candidate_ids: ids,
+            candidate_ids: batch.ids().to_vec(),
             scores,
         })
     }
 
     pub fn candidates<'a>(
         &self,
-        query: &[f32],
+        query: &'a [f32],
+        candidates: &Candidates<'a>,
+    ) -> VcpResult<CandidateBatch<'a>> {
+        self.candidates_with(
+            query,
+            candidates,
+            SearchConfig::default(),
+            &Default::default(),
+        )
+    }
+
+    pub fn candidates_with<'a>(
+        &self,
+        query: &'a [f32],
         candidates: &Candidates<'a>,
         config: SearchConfig,
         ctx: &ExecutionContext<'_>,
@@ -445,7 +464,10 @@ impl Nexus<'_> {
             if ids.len() != pool.candidate_count {
                 return Err(invalid(QUERY, "provide one candidate ID per row"));
             }
-            return Ok(CandidateBatch(Batch::Borrowed { ids, pool }));
+            return Ok(CandidateBatch {
+                query,
+                batch: Batch::Borrowed { ids, pool },
+            });
         }
         let catalog = assets
             .documents
@@ -471,7 +493,7 @@ impl Nexus<'_> {
                     .chunks
                     .search(query, limit, scope.as_deref(), config, ctx)?
                     .into_iter()
-                    .map(|hit| (hit.slot, -hit.distance))
+                    .map(|hit| (hit.slot, Some(-hit.distance)))
                     .collect()
             }
             Candidates::Provided(ids) => {
@@ -482,22 +504,16 @@ impl Nexus<'_> {
                         if !seen.insert(slot) {
                             return Err(invalid(QUERY, format!("duplicate document {id}")));
                         }
-                        Ok((
-                            slot,
-                            cosine_f32(
-                                query,
-                                catalog.vectors.row(slot).expect("validated catalog"),
-                                ctx.precision,
-                            ),
-                        ))
+                        Ok((slot, None))
                     })
                     .collect::<VcpResult<Vec<_>>>()?
             }
             Candidates::Borrowed { .. } => unreachable!("borrowed candidates handled above"),
         };
-        Ok(CandidateBatch(Batch::Selected(Box::new(Selected::build(
-            catalog, &selection, query, ctx,
-        )?))))
+        Ok(CandidateBatch {
+            query,
+            batch: Batch::Selected(Box::new(Selected::build(catalog, &selection, query, ctx)?)),
+        })
     }
 }
 
@@ -511,7 +527,7 @@ pub struct ObserveQuery;
 impl Operator for ObserveQuery {
     type Config = ObservationConfig;
     type Input<'asset, 'query> = QueryInput<'asset>;
-    type Output = ObservationState;
+    type Output = Arc<ObservationState>;
 
     fn name(&self) -> &'static str {
         "query.observe"
@@ -523,25 +539,40 @@ impl Operator for ObserveQuery {
         config: &Self::Config,
         input: Self::Input<'_, '_>,
     ) -> VcpResult<Self::Output> {
-        let index = input.nexus.prepared().tag_search.ok_or_else(|| {
-            invalid(
-                QUERY,
-                "prepare a Tag field or supply a residual recall function",
-            )
-        })?;
-        let norm = norm_sq_f32(input.query.vector, ctx.precision);
-        let mut mask = vec![true; input.nexus.prepared().tags.rows];
-        let recall = |level,
-                      residual: &[f32],
-                      limit: usize,
-                      out: &mut Vec<_>,
-                      epa: Option<&EpaAnalysis>,
-                      excluded: &[NodeId]| {
+        let assets = input.nexus.prepared();
+        let query = input.query;
+        let core_tags = query
+            .core_concepts
+            .iter()
+            .map(|key| {
+                let slot = input
+                    .nexus
+                    .concept_slots
+                    .get(key)
+                    .copied()
+                    .ok_or_else(|| invalid(QUERY, format!("unknown concept {key}")))?;
+                NodeId::from_index(slot, QUERY)
+            })
+            .collect::<VcpResult<Vec<_>>>()?;
+        let mask = std::cell::RefCell::new(Vec::new());
+        let query_norm = std::cell::OnceCell::new();
+        let built_in = |level,
+                        residual: &[f32],
+                        limit: usize,
+                        out: &mut Vec<_>,
+                        epa: Option<&EpaAnalysis>,
+                        excluded: &[NodeId]| {
+            let index = assets.tag_search.ok_or_else(|| {
+                invalid(QUERY, "prepare a Tag field or set Query::with_tag_recall")
+            })?;
             let energy = norm_sq_f32(residual, ctx.precision);
             if energy <= 1e-12 {
                 return Ok(());
             }
+            let norm = *query_norm.get_or_init(|| norm_sq_f32(query.vector, ctx.precision));
             let radius = residual_radius(epa, level, energy / norm);
+            let mut mask = mask.borrow_mut();
+            mask.resize(assets.tags.rows, true);
             mask.fill(true);
             for &node in excluded {
                 mask[node.index()] = false;
@@ -561,58 +592,27 @@ impl Operator for ObserveQuery {
                 out,
             )
         };
-        // The pyramid owns the accepted ID list. The callback's mask belongs to this request.
-        let recall = std::cell::RefCell::new(recall);
-        input.nexus.observe_with_recall(
-            &input.query,
-            config,
-            &|level, residual, limit, out, epa, excluded| {
-                (recall.borrow_mut())(level, residual, limit, out, epa, excluded)
-            },
+        Observe.execute(
             ctx,
+            config,
+            ObservationInput {
+                query: query.vector,
+                query_text: query.text,
+                core_tags: &core_tags,
+                candidates: query.tag_recall.unwrap_or(&built_in),
+                graph: assets.graph,
+                tag_vectors: assets.tags,
+                lexical_meta: assets.lexical,
+                epa_basis: assets.basis,
+                ghost_vectors: query.ghost_vectors,
+                ghost_is_core: query.ghost_is_core,
+            },
         )
     }
 }
 
-fn river_in(
-    assets: PreparedDataset<'_>,
-    observation: &ObservationState,
-    fields: &FieldState,
-    batch: &CandidateBatch<'_>,
-    config: &RiverConfig,
-    ctx: &ExecutionContext<'_>,
-) -> VcpResult<RiverOutput> {
-    let candidates = batch.view();
-    let pool = PoolCalibrateOperator.execute(
-        ctx,
-        &config.calibration,
-        PoolCalibrateInput {
-            original_query: &observation.original_query,
-            enhanced_query: &observation.fused.enhanced_query,
-            fields,
-            candidates,
-        },
-    )?;
-    let scores = ReadRiver.execute(
-        ctx,
-        config,
-        RiverInput {
-            assets,
-            observation,
-            fields,
-            candidates,
-            pool: &pool,
-        },
-    )?;
-    Ok(Readout {
-        candidate_ids: batch.ids().to_vec(),
-        scores,
-    })
-}
-
 pub struct RiverInput<'asset, 'query> {
     pub assets: PreparedDataset<'asset>,
-    pub observation: &'query ObservationState,
     pub fields: &'query FieldState,
     pub pool: &'query PreparedCandidatePool,
     pub candidates: CandidatePoolView<'asset>,
@@ -641,7 +641,6 @@ impl Operator for ReadRiver {
             ctx,
             &config.scoring,
             RiverReadoutInput {
-                observation: input.observation,
                 fields: input.fields,
                 evidence: config.evidence,
                 pool: input.pool,
@@ -657,7 +656,7 @@ impl Operator for ReadRiver {
                 ctx,
                 &config.wormhole,
                 CrossFileWormholeInput {
-                    observation: input.observation,
+                    observation: input.fields.observation(),
                     readout: &result,
                     candidates: input.candidates,
                     graph: assets.graph,
@@ -757,9 +756,9 @@ impl Operator for ReadDtsc {
     }
 }
 
-pub struct TagMemoInput<'a> {
-    pub enhanced: &'a [f32],
-    pub candidates: CandidatePoolView<'a>,
+pub struct TagMemoInput<'query, 'asset> {
+    pub enhanced: &'query [f32],
+    pub candidates: CandidatePoolView<'asset>,
 }
 
 /// Ranks candidate vectors by their cosine against the TagMemo-enhanced query.
@@ -767,7 +766,7 @@ pub struct TagMemoReadout;
 
 impl Operator for TagMemoReadout {
     type Config = ();
-    type Input<'asset, 'query> = TagMemoInput<'query>;
+    type Input<'asset, 'query> = TagMemoInput<'query, 'asset>;
     type Output = Vec<TagMemoItem>;
 
     fn name(&self) -> &'static str {
@@ -803,7 +802,11 @@ impl Operator for TagMemoReadout {
     }
 }
 
-pub struct CandidateBatch<'a>(Batch<'a>);
+/// An ordered candidate selection for one query, shared across readouts.
+pub struct CandidateBatch<'a> {
+    query: &'a [f32],
+    batch: Batch<'a>,
+}
 
 enum Batch<'a> {
     Borrowed {
@@ -815,16 +818,27 @@ enum Batch<'a> {
 
 impl CandidateBatch<'_> {
     pub fn ids(&self) -> &[u64] {
-        match &self.0 {
+        match &self.batch {
             Batch::Borrowed { ids, .. } => ids,
             Batch::Selected(rows) => &rows.ids,
         }
     }
 
     pub fn view(&self) -> CandidatePoolView<'_> {
-        match &self.0 {
+        match &self.batch {
             Batch::Borrowed { pool, .. } => **pool,
             Batch::Selected(rows) => rows.view(),
+        }
+    }
+
+    fn check_query(&self, query: &[f32]) -> VcpResult<()> {
+        if self.query == query {
+            Ok(())
+        } else {
+            Err(invalid(
+                QUERY,
+                "candidate batch belongs to a different query vector",
+            ))
         }
     }
 }
@@ -853,18 +867,19 @@ fn offsets(slice: &[u32], slot: usize) -> std::ops::Range<usize> {
 impl Selected {
     fn build(
         catalog: Catalog<'_>,
-        rows: &[(usize, f64)],
+        rows: &[(usize, Option<f64>)],
         query: &[f32],
         ctx: &ExecutionContext<'_>,
     ) -> VcpResult<Self> {
+        let count = rows.len();
         let mut selected = Self {
             dim: catalog.vectors.dim,
             ids: Vec::new(),
             docs: Vec::new(),
-            vectors: Vec::new(),
-            baseline: Vec::new(),
-            union: Vec::new(),
-            ranks: Vec::new(),
+            vectors: Vec::with_capacity(count * catalog.vectors.dim),
+            baseline: Vec::with_capacity(count),
+            union: Vec::with_capacity(count),
+            ranks: Vec::with_capacity(count),
             zeros: vec![0.0; rows.len()],
             root_offsets: vec![0],
             roots: Vec::new(),
@@ -885,10 +900,9 @@ impl Selected {
             selected.ids.push(catalog.ids[slot]);
             selected.docs.push(DocumentId::from_index(slot, QUERY)?);
             selected.vectors.extend_from_slice(vector);
-            selected
-                .baseline
-                .push(cosine_f32(query, vector, ctx.precision));
-            selected.union.push(union);
+            let baseline = cosine_f32(query, vector, ctx.precision);
+            selected.baseline.push(baseline);
+            selected.union.push(union.unwrap_or(baseline));
             selected.ranks.push(offset(i + 1)?);
             selected
                 .roots

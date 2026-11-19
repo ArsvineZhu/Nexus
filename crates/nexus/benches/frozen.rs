@@ -183,10 +183,9 @@ fn run_frozen(criterion: &mut Criterion) {
             Ok(())
         };
         let observation = nexus
-            .observe_with_recall(
-                &Query::new(query, &fixture.query_texts[index]),
+            .observe_with(
+                &Query::new(query, &fixture.query_texts[index]).with_tag_recall(&recall),
                 &config,
-                &recall,
                 &ctx,
             )
             .expect("observe the captured query");
@@ -247,6 +246,16 @@ fn run_frozen(criterion: &mut Criterion) {
         route_queries.len()
     );
 
+    let candidate_ids: Vec<_> = (0..count as u64).collect();
+    let readout = RiverConfig {
+        evidence: EvidencePolicy::Nous,
+        ..Default::default()
+    };
+    let preset = RiverPipelineConfig {
+        observation: config.clone(),
+        readout: readout.clone(),
+        ..Default::default()
+    };
     let execute = |fanout: bool, index: usize| {
         let case = &cases[index];
         let recall = |level: usize,
@@ -266,20 +275,30 @@ fn run_frozen(criterion: &mut Criterion) {
             k: 1,
             candidates: &case.stage,
         }];
+        let query =
+            Query::new(queries[index], &fixture.query_texts[index]).with_tag_recall(&recall);
+        let selection = Candidates::Borrowed {
+            ids: &candidate_ids,
+            pool: &pool,
+        };
+        if !fanout {
+            let result = nexus
+                .run_with(&query, &selection, Pipeline::river(), &preset, &ctx)
+                .expect("read River with host recall and candidates");
+            assert_eq!(result.scores.items.len(), count);
+            black_box(result);
+            return;
+        }
+        let batch = nexus
+            .candidates_with(query.vector, &selection, Default::default(), &ctx)
+            .expect("prepare one batch for the readouts");
+        let pool = batch.view();
         let mut plan = Plan::new();
         let observation = plan
-            .add(Observe, config.clone(), (), |_| {
-                Ok(ObservationInput {
-                    query: queries[index],
-                    query_text: &fixture.query_texts[index],
-                    candidates: &recall,
-                    graph: assets.graph,
-                    tag_vectors: assets.tags,
-                    lexical_meta: assets.lexical,
-                    epa_basis: assets.basis,
-                    core_tags: &[],
-                    ghost_vectors: None,
-                    ghost_is_core: &[],
+            .add(ObserveQuery, config.clone(), (), |_| {
+                Ok(QueryInput {
+                    nexus: &nexus,
+                    query,
                 })
             })
             .unwrap();
@@ -288,23 +307,20 @@ fn run_frozen(criterion: &mut Criterion) {
                 ComputeFields,
                 FieldConfig::default(),
                 observation,
-                |inputs| Ok(nexus.field_input(inputs.get()?)),
+                |inputs| Ok(nexus.field_input(inputs.get())),
             )
             .unwrap();
         let calibration = plan
             .add(
                 PoolCalibrateOperator,
                 PoolCalibrateConfig {
-                    precision: fanout.then_some(PrecisionMode::StrictLeftFold),
+                    precision: Some(PrecisionMode::StrictLeftFold),
                     ..PoolCalibrateConfig::default()
                 },
-                (observation, fields),
-                |input| {
-                    let (observation, fields) = input.get()?;
+                fields,
+                |inputs| {
                     Ok(PoolCalibrateInput {
-                        original_query: &observation.original_query,
-                        enhanced_query: &observation.fused.enhanced_query,
-                        fields,
+                        fields: inputs.get(),
                         candidates: pool,
                     })
                 },
@@ -313,16 +329,12 @@ fn run_frozen(criterion: &mut Criterion) {
         let river = plan
             .add(
                 ReadRiver,
-                RiverConfig {
-                    evidence: EvidencePolicy::Nous,
-                    ..Default::default()
-                },
-                (observation, fields, calibration),
+                readout.clone(),
+                (fields, calibration),
                 |inputs| {
-                    let (observation, fields, calibrated) = inputs.get()?;
+                    let (fields, calibrated) = inputs.get();
                     Ok(RiverInput {
                         assets,
-                        observation,
                         fields,
                         pool: calibrated,
                         candidates: pool,
@@ -330,47 +342,52 @@ fn run_frozen(criterion: &mut Criterion) {
                 },
             )
             .unwrap();
-        if fanout {
-            let dtsc = plan
-                .add(
-                    ReadDtsc,
-                    nexus::math::DtscConfig::default(),
-                    (observation, calibration),
-                    |inputs| {
-                        let (observation, calibrated) = inputs.get()?;
-                        Ok(ObservedDtscInput {
-                            assets,
-                            observation,
-                            pool: Some(calibrated),
-                            candidates: pool,
-                        })
-                    },
-                )
-                .unwrap();
-            let thinking = plan
-                .add(
-                    ThinkingPlanOperator,
-                    ThinkingConfig::default(),
-                    observation,
-                    |inputs| {
-                        Ok(ThinkingInput {
-                            trace: inputs.get()?.complete_trace()?,
-                            candidates: pool,
-                            query_cosines: Some(&case.scores),
-                            stages: &stages,
-                            graph: assets.graph,
-                            provenance,
-                            support_groups: groups,
-                            tag_vectors: tags,
-                        })
-                    },
-                )
-                .unwrap();
-            plan.run((river, dtsc, thinking), &ctx)
-                .expect("run the unified plan")
-        } else {
-            plan.run(river, &ctx).expect("run the River plan")
-        }
+        let dtsc = plan
+            .add(
+                ReadDtsc,
+                nexus::math::DtscConfig::default(),
+                (observation, calibration),
+                |inputs| {
+                    let (observation, calibrated) = inputs.get();
+                    Ok(ObservedDtscInput {
+                        assets,
+                        observation,
+                        pool: Some(calibrated),
+                        candidates: pool,
+                    })
+                },
+            )
+            .unwrap();
+        let thinking = plan
+            .add(
+                ThinkingPlanOperator,
+                ThinkingConfig::default(),
+                observation,
+                |inputs| {
+                    Ok(ThinkingInput {
+                        trace: inputs.get().complete_trace()?,
+                        candidates: pool,
+                        query_cosines: Some(&case.scores),
+                        stages: &stages,
+                        graph: assets.graph,
+                        provenance,
+                        support_groups: groups,
+                        tag_vectors: tags,
+                    })
+                },
+            )
+            .unwrap();
+        let result = plan
+            .run((river, dtsc, thinking), &ctx)
+            .expect("run the unified plan");
+        assert_eq!(result.get(river).unwrap().items.len(), count);
+        assert!(
+            result.get(thinking).unwrap().stages[0]
+                .results
+                .iter()
+                .any(|item| item.route.is_some())
+        );
+        black_box(result);
     };
 
     let report_quantiles = |name: &str, fanout: bool, indices: &[usize]| {
@@ -378,7 +395,7 @@ fn run_frozen(criterion: &mut Criterion) {
             .iter()
             .map(|&index| {
                 let start = Instant::now();
-                black_box(execute(fanout, index));
+                execute(fanout, index);
                 start.elapsed().as_secs_f64() * 1e3
             })
             .collect();
@@ -399,18 +416,16 @@ fn run_frozen(criterion: &mut Criterion) {
     let mut query_index = 0;
     group.bench_function("same_pool", |b| {
         b.iter(|| {
-            let value = execute(false, query_index % queries.len());
+            execute(false, query_index % queries.len());
             query_index = query_index.wrapping_add(1);
-            black_box(value);
         })
     });
     if !route_queries.is_empty() {
         let mut query_index = 0;
         group.bench_function("shared_river_dtsc_thinking", |b| {
             b.iter(|| {
-                let value = execute(true, route_queries[query_index % route_queries.len()]);
+                execute(true, route_queries[query_index % route_queries.len()]);
                 query_index = query_index.wrapping_add(1);
-                black_box(value);
             })
         });
     }

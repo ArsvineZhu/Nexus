@@ -264,7 +264,7 @@ fn sparse_field(value: &Value, count: usize) -> Vec<f64> {
     result
 }
 
-fn observation(input: &Value, count: usize) -> (ObservationState, FieldState) {
+fn observation(input: &Value, count: usize) -> FieldState {
     let state = &input["queryState"];
     let calibration = &input["calibration"];
     let nodes = state["riverNodes"]
@@ -309,8 +309,8 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldState) {
             .map(|id| NodeId(id - 1))
             .collect()
     };
-    (
-        ObservationState {
+    FieldState::from_parts(
+        std::sync::Arc::new(ObservationState {
             original_query: decode(&input["query"]["vector"]),
             epa: EpaAnalysis::default(),
             pyramid: PyramidResidual {
@@ -340,20 +340,18 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldState) {
                     .collect(),
                 ..SenseOutput::default()
             },
+        }),
+        DualFields {
+            local_domain: ids(&state["localDomainIds"]),
+            transfer_domain: ids(&state["transferDomainIds"]),
+            local_field: sparse_field(&state["localField"], count),
+            transfer_field: sparse_field(&state["transferField"], count),
+            ..DualFields::default()
         },
-        FieldState {
-            dual_fields: DualFields {
-                local_domain: ids(&state["localDomainIds"]),
-                transfer_domain: ids(&state["transferDomainIds"]),
-                local_field: sparse_field(&state["localField"], count),
-                transfer_field: sparse_field(&state["transferField"], count),
-                ..DualFields::default()
-            },
-            basins: BasinSupports {
-                local_vector: decode(&input["localVector"]),
-                transfer_vector: decode(&input["transferVector"]),
-                ..BasinSupports::default()
-            },
+        BasinSupports {
+            local_vector: decode(&input["localVector"]),
+            transfer_vector: decode(&input["transferVector"]),
+            ..BasinSupports::default()
         },
     )
 }
@@ -368,7 +366,8 @@ fn upstream_river_and_cross_file_wormhole_scores() {
         .map(|v| (v, false))
         .chain(rows(&source, "wormhole").iter().map(|v| (v, true)))
     {
-        let (state, fields) = observation(&case["input"], 5);
+        let fields = observation(&case["input"], 5);
+        let state = fields.observation();
         let tag_values: Vec<_> = decode::<Vec<Vec<f32>>>(&case["tags"])
             .into_iter()
             .flatten()
@@ -429,8 +428,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 &ctx,
                 &PoolCalibrateConfig::default(),
                 PoolCalibrateInput {
-                    original_query: &state.original_query,
-                    enhanced_query: &state.fused.enhanced_query,
                     fields: &fields,
                     candidates,
                 },
@@ -457,7 +454,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 &ctx,
                 &RiverReadoutConfig::default(),
                 RiverReadoutInput {
-                    observation: &state,
                     fields: &fields,
                     evidence: EvidencePolicy::Nous,
                     pool: &pool,
@@ -478,7 +474,7 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                     &ctx,
                     &CrossFileWormholeConfig::default(),
                     CrossFileWormholeInput {
-                        observation: &state,
+                        observation: state,
                         readout: &base,
                         candidates,
                         graph,
