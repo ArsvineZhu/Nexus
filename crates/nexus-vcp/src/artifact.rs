@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::time::Instant;
 
 use nexus_core::kernel::{dot_f64, normalize_f64};
@@ -58,7 +57,6 @@ pub struct TransportConfig {
     pub association_reserve_mass: f64,
     pub evidence_compression: f64,
     pub hub_smoothing_ratio: f64,
-    pub build_target_sorted_index: bool,
 }
 
 impl Default for TransportConfig {
@@ -73,7 +71,6 @@ impl Default for TransportConfig {
             association_reserve_mass: 0.05,
             evidence_compression: 1.0,
             hub_smoothing_ratio: 0.1,
-            build_target_sorted_index: true,
         }
     }
 }
@@ -149,42 +146,29 @@ pub struct FactMatrixOutput {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TransportCalibrateInput<'asset, 'query> {
+pub struct TransportCalibrateInput<'query> {
     pub fact_matrix: &'query FactMatrix,
     pub anchor_gains: &'query [f64],
     pub edge_gates: Option<&'query [f64]>,
-    pub _marker: PhantomData<&'asset ()>,
 }
 
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TransportGraph {
-    pub node_count: usize,
-    pub row_offsets: Vec<usize>,
-    pub targets: Vec<NodeId>,
-    pub weights: Vec<f64>,
-    pub is_static_wormhole: Vec<bool>,
-    pub inbound: Vec<f64>,
-    pub max_inbound: f64,
-    pub anchor_gains: Vec<f64>,
-    pub target_sorted_indices: Option<Vec<u32>>,
+    pub graph: nexus_core::CsrGraph,
     pub diagnostics: Diagnostics,
 }
 
 impl TransportGraph {
     pub fn as_csr_view(&self) -> CsrGraphView<'_> {
-        CsrGraphView {
-            node_count: self.node_count,
-            row_offsets: &self.row_offsets,
-            targets: &self.targets,
-            weights: &self.weights,
-            is_static_wormhole: &self.is_static_wormhole,
-            inbound: &self.inbound,
-            max_inbound: self.max_inbound,
-            anchor_gains: &self.anchor_gains,
-            target_sorted_indices: self.target_sorted_indices.as_deref(),
-            edge_gates: None,
-        }
+        self.graph.view()
+    }
+}
+
+impl std::ops::Deref for TransportGraph {
+    type Target = nexus_core::CsrGraph;
+
+    fn deref(&self) -> &Self::Target {
+        &self.graph
     }
 }
 
@@ -270,11 +254,59 @@ impl Operator for FactMatrixOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "FactMatrixOperator::execute";
         let start_time = Instant::now();
         ctx.check_cancelled(STAGE)?;
+        for (name, value, min, max) in [
+            ("forward_gain", config.forward_gain, 0.0, f64::INFINITY),
+            (
+                "min_reverse_gain",
+                config.min_reverse_gain,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "max_reverse_gain",
+                config.max_reverse_gain,
+                config.min_reverse_gain,
+                f64::INFINITY,
+            ),
+            (
+                "reverse_gain",
+                config.reverse_gain,
+                config.min_reverse_gain,
+                config.max_reverse_gain,
+            ),
+            ("distance_decay", config.distance_decay, 0.0, f64::INFINITY),
+            (
+                "reverse_inversion_guard",
+                config.reverse_inversion_guard,
+                0.0,
+                1.0,
+            ),
+            (
+                "reverse_anchor_max",
+                config.reverse_anchor_max,
+                1.0,
+                f64::INFINITY,
+            ),
+            (
+                "semantic_gain_sigma",
+                config.semantic_gain_sigma,
+                0.001,
+                f64::INFINITY,
+            ),
+            ("semantic_gain_peak", config.semantic_gain_peak, -1.0, 1.0),
+            (
+                "semantic_gain_low_fallback",
+                config.semantic_gain_low_fallback,
+                0.0,
+                f64::INFINITY,
+            ),
+        ] {
+            crate::parameter(STAGE, name, value, min, max)?;
+        }
 
         input.tag_vectors.validate(STAGE)?;
         let node_count = input.tag_vectors.rows;
@@ -339,7 +371,7 @@ impl Operator for FactMatrixOperator {
             Vec::new()
         };
 
-        let semantic_sigma = config.semantic_gain_sigma.max(0.001);
+        let semantic_sigma = config.semantic_gain_sigma;
         let semantic_peak = config.semantic_gain_peak;
         let low_fallback = config.semantic_gain_low_fallback;
         let compute_semantic_gain = |a: NodeId, b: NodeId| -> f64 {
@@ -361,13 +393,11 @@ impl Operator for FactMatrixOperator {
             }
         };
 
-        let forward_gain = config.forward_gain.max(0.0);
-        let rev_lo = config.min_reverse_gain.min(config.max_reverse_gain);
-        let rev_hi = config.min_reverse_gain.max(config.max_reverse_gain);
-        let base_reverse_gain = config.reverse_gain.clamp(rev_lo, rev_hi);
-        let distance_decay = config.distance_decay.max(0.0);
-        let reverse_guard = config.reverse_inversion_guard.clamp(0.0, 1.0);
-        let reverse_anchor_max = config.reverse_anchor_max.max(1.0);
+        let forward_gain = config.forward_gain;
+        let base_reverse_gain = config.reverse_gain;
+        let distance_decay = config.distance_decay;
+        let reverse_guard = config.reverse_inversion_guard;
+        let reverse_anchor_max = config.reverse_anchor_max;
 
         let mut pair_gains: BTreeMap<(NodeId, NodeId), f64> = BTreeMap::new();
         let mut raw_entries: Vec<(NodeId, NodeId, f64)> = Vec::new();
@@ -433,7 +463,8 @@ impl Operator for FactMatrixOperator {
                                 input.anchor_gains[left_tag.index()].min(reverse_anchor_max);
                             dynamic_reverse *= boost;
                         }
-                        dynamic_reverse = dynamic_reverse.clamp(rev_lo, rev_hi);
+                        dynamic_reverse =
+                            dynamic_reverse.clamp(config.min_reverse_gain, config.max_reverse_gain);
                         let backward =
                             (base * dynamic_reverse * semantic).min(forward * reverse_guard);
                         if forward.is_finite() && forward > 0.0 {
@@ -505,7 +536,7 @@ impl Operator for FactMatrixOperator {
 
 impl Operator for TransportCalibrateOperator {
     type Config = TransportConfig;
-    type Input<'asset, 'query> = TransportCalibrateInput<'asset, 'query>;
+    type Input<'asset, 'query> = TransportCalibrateInput<'query>;
     type Output = TransportGraph;
 
     fn name(&self) -> &'static str {
@@ -517,11 +548,53 @@ impl Operator for TransportCalibrateOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "TransportCalibrateOperator::execute";
         let start_time = Instant::now();
         ctx.check_cancelled(STAGE)?;
+        for (name, value, min, max) in [
+            ("outbound_mass", config.outbound_mass, 0.01, 0.999_999),
+            (
+                "association_reserve_mass",
+                config.association_reserve_mass,
+                0.0,
+                config.outbound_mass,
+            ),
+            (
+                "evidence_compression",
+                config.evidence_compression,
+                0.01,
+                f64::INFINITY,
+            ),
+            ("wormhole_gain", config.wormhole_gain, 1.0, f64::INFINITY),
+            (
+                "wormhole_evidence_threshold",
+                config.wormhole_evidence_threshold,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "hub_penalty_min",
+                config.hub_penalty_min,
+                f64::MIN_POSITIVE,
+                f64::INFINITY,
+            ),
+            (
+                "hub_penalty_max",
+                config.hub_penalty_max,
+                config.hub_penalty_min,
+                f64::INFINITY,
+            ),
+            (
+                "hub_penalty_exponent",
+                config.hub_penalty_exponent,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+            ),
+            ("hub_smoothing_ratio", config.hub_smoothing_ratio, 0.01, 2.0),
+        ] {
+            crate::parameter(STAGE, name, value, min, max)?;
+        }
 
         let fm = input.fact_matrix;
         let node_count = fm.node_count;
@@ -600,11 +673,11 @@ impl Operator for TransportCalibrateOperator {
             }
         }
 
-        let outbound_mass = config.outbound_mass.clamp(0.01, 0.999_999);
-        let reserve_mass = config.association_reserve_mass.clamp(0.0, outbound_mass);
-        let evidence_compression = config.evidence_compression.max(0.01);
-        let wormhole_gain = config.wormhole_gain.max(1.0);
-        let tension_threshold = config.wormhole_evidence_threshold.max(0.0);
+        let outbound_mass = config.outbound_mass;
+        let reserve_mass = config.association_reserve_mass;
+        let evidence_compression = config.evidence_compression;
+        let wormhole_gain = config.wormhole_gain;
+        let tension_threshold = config.wormhole_evidence_threshold;
         let hub_exp = {
             let e = config.hub_penalty_exponent;
             let neg = if e > 0.0 { -e } else { e };
@@ -618,7 +691,7 @@ impl Operator for TransportCalibrateOperator {
             .hub_penalty_min
             .max(config.hub_penalty_max)
             .clamp(1.0, 4.0);
-        let smoothing_ratio = config.hub_smoothing_ratio.clamp(0.01, 2.0);
+        let smoothing_ratio = config.hub_smoothing_ratio;
 
         let mut target_inflow = vec![0.0_f64; node_count];
         let mut raw_rows: Vec<Vec<(NodeId, f64, bool, f64)>> = Vec::with_capacity(node_count);
@@ -735,7 +808,7 @@ impl Operator for TransportCalibrateOperator {
 
         let max_inbound = inbound.iter().copied().fold(0.0_f64, f64::max);
 
-        let target_sorted_indices = if config.build_target_sorted_index {
+        let target_sorted_indices = {
             let out_nnz = targets.len();
             let mut sorted = Vec::with_capacity(out_nnz);
             let mut row_buf = Vec::new();
@@ -754,27 +827,26 @@ impl Operator for TransportCalibrateOperator {
                 sorted.extend_from_slice(&row_buf);
             }
             Some(sorted)
-        } else {
-            None
         };
 
         let out = TransportGraph {
-            node_count,
-            row_offsets,
-            targets,
-            weights,
-            is_static_wormhole,
-            inbound,
-            max_inbound,
-            anchor_gains: input.anchor_gains.to_vec(),
-            target_sorted_indices,
+            graph: nexus_core::CsrGraph::new(nexus_core::CsrStorage {
+                node_count,
+                row_offsets,
+                targets,
+                weights,
+                is_static_wormhole,
+                inbound,
+                max_inbound,
+                anchor_gains: input.anchor_gains.to_vec(),
+                target_sorted_indices,
+            })?,
             diagnostics: Diagnostics {
                 truncated: false,
                 truncation_reason: None,
                 elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
             },
         };
-        out.as_csr_view().validate(STAGE)?;
         Ok(out)
     }
 }
@@ -793,11 +865,27 @@ impl Operator for ProvenanceBuildOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "ProvenanceBuildOperator::execute";
         let start_time = Instant::now();
         ctx.check_cancelled(STAGE)?;
+        for (name, value, min, max) in [
+            ("forward_gain", config.forward_gain, 0.0, f64::INFINITY),
+            (
+                "provenance_reverse_gain",
+                config.provenance_reverse_gain,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "provenance_distance_decay",
+                config.provenance_distance_decay,
+                0.0,
+                f64::INFINITY,
+            ),
+        ] {
+            crate::parameter(STAGE, name, value, min, max)?;
+        }
 
         if input.transport_row_offsets.is_empty() {
             return Err(VcpError::InvalidInput {
@@ -835,27 +923,29 @@ impl Operator for ProvenanceBuildOperator {
             sg.validate(STAGE)?;
         }
 
-        // Map RootId -> GroupId safely without colliding with SupportGroupView indices.
-        let mut singleton_root_groups: BTreeMap<RootId, GroupId> = BTreeMap::new();
+        // A source group's first root identifies the sequence source. Subsequent
+        // roots are required evidence and participate in exclusion.
+        let mut source_groups = BTreeMap::new();
         let sg_count = input.support_groups.map_or(0, |sg| sg.group_count);
         if let Some(sg) = input.support_groups {
             for g in 0..sg.group_count {
                 let gid = GroupId(g as u32);
-                let req = sg.required_roots(gid);
-                if req.len() == 1 && sg.kind(gid) == Some(SupportKind::Source) {
-                    singleton_root_groups.entry(req[0]).or_insert(gid);
+                if sg.kind(gid) == Some(SupportKind::Source)
+                    && let Some(&source) = sg.required_roots(gid).first()
+                {
+                    source_groups.entry(source).or_insert(gid);
                 }
             }
         }
         let resolve_root_group = |root: RootId| -> VcpResult<GroupId> {
-            if let Some(&gid) = singleton_root_groups.get(&root) {
+            if let Some(&gid) = source_groups.get(&root) {
                 return Ok(gid);
             }
             if root.index() < sg_count {
                 return Err(VcpError::InvalidInput {
                     stage: STAGE,
                     detail: format!(
-                        "sequence source_root {} collides with SupportGroupView indices 0..{} without a matching singleton Source group",
+                        "sequence source_root {} collides with SupportGroupView indices 0..{} without a matching Source group",
                         root.0, sg_count
                     ),
                 });
@@ -863,9 +953,9 @@ impl Operator for ProvenanceBuildOperator {
             Ok(GroupId(root.0))
         };
 
-        let forward_gain = config.forward_gain.max(0.0);
-        let reverse_gain = config.provenance_reverse_gain.max(0.0);
-        let distance_decay = config.provenance_distance_decay.max(0.0);
+        let forward_gain = config.forward_gain;
+        let reverse_gain = config.provenance_reverse_gain;
+        let distance_decay = config.provenance_distance_decay;
 
         let mut seq_entries: Vec<((NodeId, NodeId, GroupId), f64)> = Vec::new();
         let mut seq_buf: Vec<(u32, NodeId)> = Vec::new();

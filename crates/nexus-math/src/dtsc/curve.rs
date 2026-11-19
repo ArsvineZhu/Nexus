@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::config::DtscConfig;
+use super::config::{DtscConfig, DtscIdentityConfig};
 use super::field::{DtscField, DtscFieldSampler, DtscSample};
 use super::path_scoring::{contacts, path, shadow};
 use super::{positive, unit};
 use nexus_core::kernel::{batch_cosines_f32, cosine_f32_with_norms, norm_sq_f32};
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator,
-    PathId, PrecisionMode, ScratchPad, VcpError, VectorMatrixView,
+    PathId, PrecisionMode, VcpError, VectorMatrixView,
 };
 use std::cmp::Ordering;
 use std::time::Instant;
@@ -36,6 +36,20 @@ impl Default for DtscGeometryState {
     }
 }
 
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AuxiliaryEvidence {
+    pub shadow_score: f64,
+    pub geometry_floor: f64,
+    pub identity_floor: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtscOrder {
+    Score,
+    Input,
+}
+
 pub struct DtscReadoutInput<'asset, 'query> {
     pub field: &'query DtscField,
     pub candidates: CandidatePoolView<'query>,
@@ -57,6 +71,7 @@ pub struct DtscItem {
     pub geo_bonus: f64,
     pub geo_base_bonus: f64,
     pub geo_aux_bonus: f64,
+    pub auxiliary_evidence: Option<AuxiliaryEvidence>,
     pub geo_effect: &'static str,
     pub geo_evidence_class: &'static str,
     pub geo_reward_eligible: bool,
@@ -79,6 +94,7 @@ impl Default for DtscItem {
             geo_bonus: 0.0,
             geo_base_bonus: 0.0,
             geo_aux_bonus: 0.0,
+            auxiliary_evidence: None,
             geo_effect: "",
             geo_evidence_class: "",
             geo_reward_eligible: false,
@@ -97,6 +113,8 @@ pub struct DtscOutput {
     pub results: Vec<DtscItem>,
     pub field_trusted: bool,
     pub field_entropy: f64,
+    pub order: DtscOrder,
+    pub available: usize,
     pub fallback_used: bool,
     pub fallback_reason: Option<&'static str>,
     pub diagnostics: Diagnostics,
@@ -114,6 +132,7 @@ pub(super) struct DtscEval {
     pub geo_bonus: f64,
     pub geo_base_bonus: f64,
     pub geo_aux_bonus: f64,
+    pub auxiliary_evidence: Option<AuxiliaryEvidence>,
     pub geo_effect: &'static str,
     pub geo_evidence_class: &'static str,
     pub geo_reward_eligible: bool,
@@ -155,6 +174,7 @@ impl Default for DtscEval {
             geo_bonus: 0.0,
             geo_base_bonus: 0.0,
             geo_aux_bonus: 0.0,
+            auxiliary_evidence: None,
             geo_effect: "",
             geo_evidence_class: "",
             geo_reward_eligible: false,
@@ -198,6 +218,7 @@ impl DtscEval {
             geo_bonus: self.geo_bonus,
             geo_base_bonus: self.geo_base_bonus,
             geo_aux_bonus: self.geo_aux_bonus,
+            auxiliary_evidence: self.auxiliary_evidence,
             geo_effect: self.geo_effect,
             geo_evidence_class: self.geo_evidence_class,
             geo_reward_eligible: self.geo_reward_eligible,
@@ -298,13 +319,7 @@ fn collect_samples<'a>(
     }
 }
 
-fn identity_floor(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, eligible: bool) -> f64 {
-    let a = &ctx.config.auxiliary;
-    let cfg = &a.identity_anchor;
-    if !a.enabled || !cfg.enabled || !eligible {
-        return 0.0;
-    }
-
+fn identity_floor(samples: &[Sample<'_>], cfg: &DtscIdentityConfig) -> f64 {
     let mut maximum = 0.0_f64;
     let mut best: Option<(&Sample<'_>, f64)> = None;
 
@@ -340,18 +355,11 @@ fn identity_floor(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, eligible: 
 
 fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEval) {
     let r = &ctx.config.reward;
-    let a = &ctx.config.auxiliary;
 
-    let (class, eligible, cap, channel, floor_cap) = if score.geo_direct_exact_hits > 0
+    let (class, eligible, cap, channel) = if score.geo_direct_exact_hits > 0
         || score.geo_direct_semantic_hits >= r.direct_semantic_min_contacts
     {
-        (
-            "direct",
-            true,
-            r.direct_bonus_cap,
-            score.geo_direct_score,
-            a.direct_floor_cap,
-        )
+        ("direct", true, r.direct_bonus_cap, score.geo_direct_score)
     } else if score.geo_exact_hits > 0
         || (score.geo_strong_hits >= 2
             && score.geo_continuity >= r.structural_continuity_min
@@ -362,7 +370,6 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
             true,
             r.structural_bonus_cap,
             score.geo_structural_score,
-            a.structural_floor_cap,
         )
     } else {
         (
@@ -371,7 +378,6 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
                 && score.geo_isolated_ratio <= r.thematic_max_isolated_ratio,
             r.thematic_bonus_cap,
             score.geo_thematic_score,
-            a.thematic_floor_cap,
         )
     };
 
@@ -397,35 +403,41 @@ fn reward(samples: &[Sample<'_>], ctx: &DtscCurveContext<'_>, score: &mut DtscEv
         0.0
     };
 
-    let geometry_floor = if a.enabled
-        && eligible
-        && channel >= a.min_class_evidence
-        && score.geo_fused_shadow_score >= a.min_fused_score
-        && score.geo_closure_score >= a.min_closure_score
-    {
-        let values = [
-            (score.geo_fused_shadow_score, a.min_fused_score),
-            (channel, a.min_class_evidence),
-            (score.geo_closure_score, a.min_closure_score),
-        ];
-        floor_cap
-            * values
-                .iter()
-                .map(|(v, min)| unit((v - min) / (1.0 - min).max(1e-6)))
-                .product::<f64>()
-                .cbrt()
-                .powf(a.floor_exponent)
-    } else {
-        0.0
-    };
-
-    let id_floor = identity_floor(samples, ctx, eligible);
-    let target = cap.min(geometry_floor.max(id_floor));
-    score.geo_aux_bonus = if a.enabled {
-        a.max_aux_bonus.min(positive(target - score.geo_base_bonus))
-    } else {
-        0.0
-    };
+    if let Some(a) = &ctx.config.auxiliary {
+        let floor_cap = match class {
+            "direct" => a.direct_floor_cap,
+            "structural" => a.structural_floor_cap,
+            _ => a.thematic_floor_cap,
+        };
+        let mut geometry_floor = 0.0;
+        let mut identity = 0.0;
+        if eligible {
+            let values = [
+                (score.geo_fused_shadow_score, a.min_fused_score),
+                (channel, a.min_class_evidence),
+                (score.geo_closure_score, a.min_closure_score),
+            ];
+            if values.iter().all(|(v, min)| v >= min) {
+                geometry_floor = floor_cap
+                    * values
+                        .iter()
+                        .map(|(v, min)| unit((v - min) / (1.0 - min).max(1e-6)))
+                        .product::<f64>()
+                        .cbrt()
+                        .powf(a.floor_exponent);
+            }
+            if let Some(config) = &a.identity_anchor {
+                identity = identity_floor(samples, config);
+            }
+        }
+        let target = cap.min(geometry_floor.max(identity));
+        score.geo_aux_bonus = a.max_aux_bonus.min(positive(target - score.geo_base_bonus));
+        score.auxiliary_evidence = Some(AuxiliaryEvidence {
+            shadow_score: score.geo_fused_shadow_score,
+            geometry_floor,
+            identity_floor: identity,
+        });
+    }
     score.geo_bonus = cap.min(score.geo_base_bonus + score.geo_aux_bonus);
     score.score = score.original_knn_score + score.geo_bonus;
     score.geo_effect = if score.geo_bonus > 0.0 {
@@ -495,7 +507,9 @@ fn eval_path<'a>(
         (score.geo_score - r.geo_reward_floor) / (r.geo_reward_saturation - r.geo_reward_floor),
     );
 
-    shadow(query_closures, target, ctx, &mut score);
+    if ctx.config.auxiliary.is_some() {
+        shadow(query_closures, target, ctx, &mut score);
+    }
     reward(samples_buf, ctx, &mut score);
     score
 }
@@ -557,9 +571,8 @@ impl Operator for DtscReadoutOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        scratch: &mut ScratchPad,
     ) -> Result<Self::Output, VcpError> {
-        self.readout(ctx, config, input, None, scratch)
+        self.readout(ctx, config, input, None)
     }
 }
 
@@ -572,9 +585,8 @@ impl DtscReadoutOperator {
         config: &DtscConfig,
         input: DtscReadoutInput<'_, '_>,
         query_cosines: [&[f64]; 2],
-        scratch: &mut ScratchPad,
     ) -> Result<DtscOutput, VcpError> {
-        self.readout(ctx, config, input, Some(query_cosines), scratch)
+        self.readout(ctx, config, input, Some(query_cosines))
     }
 
     fn readout(
@@ -583,14 +595,12 @@ impl DtscReadoutOperator {
         config: &DtscConfig,
         input: DtscReadoutInput<'_, '_>,
         query_cosines: Option<[&[f64]; 2]>,
-        scratch: &mut ScratchPad,
     ) -> Result<DtscOutput, VcpError> {
         const STAGE: &str = "dtsc_readout";
         let start = Instant::now();
         ctx.check_cancelled(STAGE)?;
 
         input.candidates.validate(STAGE)?;
-        input.graph.validate(STAGE)?;
         input.tag_vectors.validate(STAGE)?;
 
         let dim = input.tag_vectors.dim;
@@ -622,8 +632,8 @@ impl DtscReadoutOperator {
             });
         }
 
-        let norm_cfg = config.normalized();
-        let sampler = DtscFieldSampler::new(input.field, input.graph.inbound, &norm_cfg.field);
+        config.validate()?;
+        let sampler = DtscFieldSampler::new(input.field, input.graph.inbound, &config.field);
         let max_inbound = sampler.max_inbound;
         let mut field_samples = vec![None; input.tag_vectors.rows];
         let mut neighbors = Vec::new();
@@ -640,6 +650,7 @@ impl DtscReadoutOperator {
             }
         }
         let candidates = input.candidates.candidate_count;
+        let (mut original_buffer, mut enhanced_buffer);
         let [original, enhanced] = if let Some(columns) = query_cosines {
             for column in columns {
                 if column.len() != candidates {
@@ -652,8 +663,10 @@ impl DtscReadoutOperator {
             }
             columns
         } else {
-            let original = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, candidates, 0.0);
-            let enhanced = ScratchPad::prepare_f64(&mut scratch.f64_buf_b, candidates, 0.0);
+            original_buffer = vec![0.0; candidates];
+            let original = original_buffer.as_mut_slice();
+            enhanced_buffer = vec![0.0; candidates];
+            let enhanced = enhanced_buffer.as_mut_slice();
             // A host may have calculated the norms under a different precision policy.
             let candidate_matrix = VectorMatrixView {
                 sq_norms_f64: None,
@@ -671,7 +684,7 @@ impl DtscReadoutOperator {
         };
         ctx.check_cancelled(STAGE)?;
         let curve_ctx = DtscCurveContext {
-            config: &norm_cfg,
+            config,
             field_samples: &field_samples,
             graph: &input.graph,
             tag_vectors: &input.tag_vectors,
@@ -733,7 +746,7 @@ impl DtscReadoutOperator {
             }
         }
 
-        let reason = fallback(&evals, input.field, &norm_cfg);
+        let reason = fallback(&evals, input.field, config);
         if reason.is_some() {
             for s in &mut evals {
                 s.geo_bonus = 0.0;
@@ -750,10 +763,11 @@ impl DtscReadoutOperator {
             });
         }
 
-        let limit = if norm_cfg.top_k == 0 {
+        let available = evals.len();
+        let limit = if config.top_k == 0 {
             evals.len()
         } else {
-            norm_cfg.top_k
+            config.top_k
         };
         evals.truncate(limit.max(1));
 
@@ -763,6 +777,12 @@ impl DtscReadoutOperator {
             results,
             field_trusted: input.field.field_trusted,
             field_entropy: input.field.field_entropy,
+            order: if reason.is_some() {
+                DtscOrder::Input
+            } else {
+                DtscOrder::Score
+            },
+            available,
             fallback_used: reason.is_some(),
             fallback_reason: reason,
             diagnostics: Diagnostics {

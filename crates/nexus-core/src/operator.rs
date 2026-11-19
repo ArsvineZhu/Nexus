@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 use crate::error::VcpError;
-use crate::scratch::ScratchPad;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -153,6 +152,5 @@ pub trait Operator: Send + Sync {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        scratch: &mut ScratchPad,
     ) -> Result<Self::Output, VcpError>;
 }

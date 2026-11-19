@@ -155,7 +155,8 @@ pub enum SupportKind {
     Imagination,
 }
 
-/// Multi-root support group view (joint premise: excluding any required root excludes the whole group).
+/// Multi-root support groups. Excluding any required root excludes the whole group.
+/// A source group's first root identifies the source; the remaining roots are its requirements.
 #[derive(Clone, Copy, Debug)]
 pub struct SupportGroupView<'a> {
     pub group_count: usize,
@@ -756,13 +757,35 @@ impl<'a> CounterevidenceAdjView<'a> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum TextRows<'a> {
+    Strings(&'a [String]),
+    Borrowed(&'a [&'a str]),
+}
+
+impl<'a> TextRows<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Strings(rows) => rows.len(),
+            Self::Borrowed(rows) => rows.len(),
+        }
+    }
+
+    fn get(self, index: usize) -> Option<&'a str> {
+        match self {
+            Self::Strings(rows) => rows.get(index).map(String::as_str),
+            Self::Borrowed(rows) => rows.get(index).copied(),
+        }
+    }
+}
+
 /// Tag lexical metadata view (canonical names and aliases for HypernymPrune and TagGating).
 #[derive(Clone, Copy, Debug)]
 pub struct TagLexicalMetaView<'a> {
     pub node_count: usize,
-    pub names: &'a [&'a str],
+    pub names: TextRows<'a>,
     pub alias_offsets: &'a [u32],
-    pub aliases: &'a [&'a str],
+    pub aliases: TextRows<'a>,
 }
 
 impl<'a> TagLexicalMetaView<'a> {
@@ -785,18 +808,19 @@ impl<'a> TagLexicalMetaView<'a> {
 
     #[inline]
     pub fn name(&self, node: NodeId) -> &'a str {
-        self.names.get(node.index()).copied().unwrap_or("")
+        self.names.get(node.index()).unwrap_or("")
     }
 
     #[inline]
-    pub fn aliases(&self, node: NodeId) -> &'a [&'a str] {
-        let idx = node.index();
-        if idx >= self.node_count {
-            return &[];
-        }
-        let start = self.alias_offsets[idx] as usize;
-        let end = self.alias_offsets[idx + 1] as usize;
-        &self.aliases[start..end]
+    pub fn aliases(&self, node: NodeId) -> impl Iterator<Item = &'a str> {
+        let index = node.index();
+        let range = if index < self.node_count {
+            self.alias_offsets[index] as usize..self.alias_offsets[index + 1] as usize
+        } else {
+            0..0
+        };
+        let aliases = self.aliases;
+        range.filter_map(move |index| aliases.get(index))
     }
 }
 

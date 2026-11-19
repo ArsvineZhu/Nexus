@@ -721,6 +721,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexus"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "nexus-core",
+ "nexus-math",
+ "nexus-vcp",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexus-core"
 version = "0.1.0"
 dependencies = [
@@ -734,25 +747,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexus-graph"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "nexus-core",
- "nexus-math",
- "nexus-vcp",
- "rayon",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "nexus-math"
 version = "0.1.0"
 dependencies = [
  "nexus-core",
  "schemars",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

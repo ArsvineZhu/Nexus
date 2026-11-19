@@ -9,10 +9,9 @@ use nexus_core::nnls::{
     CHECK_TOL, solve_nnls_f32, solve_nnls_f64, solve_nnls_flat_f64, solve_nnls_with_ids_f64,
 };
 use nexus_core::{
-    CancellationToken, CandidateId, CandidatePoolView, CsrGraphView, DocumentId, EpochTable,
-    ExecutionContext, GroupId, NodeId, Operator, ParallelPolicy, PathId, PrecisionMode,
-    ProvenanceView, ResourceLimits, RootFactView, RootId, ScratchPad, SupportGroupView,
-    SupportKind, VcpError, VectorMatrixView,
+    CancellationToken, CsrGraphView, CsrParts, GroupId, NnlsWorkspace, NodeId, ParallelPolicy,
+    PrecisionMode, ProvenanceView, ResourceLimits, RootId, SupportGroupView, SupportKind, VcpError,
+    VectorMatrixView,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -66,7 +65,7 @@ fn scalar_ref_dtsc_cosine(a: &[f32], b: &[f32]) -> f64 {
 fn nnls_opposite_and_secondary_directions() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     let a = [1.0, 0.0];
     let b = [0.94, -0.342];
@@ -86,7 +85,7 @@ fn nnls_opposite_and_secondary_directions() {
 fn nnls_joint_fit_negative_initial_correlation() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     let a = [1.0, 1.0];
     let b = [0.0, -1.0];
@@ -101,7 +100,7 @@ fn nnls_joint_fit_negative_initial_correlation() {
 fn nnls_dependent_rays_r2() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     let c1 = [1.0, 1.0];
     let c2 = [0.0, -1.0];
@@ -123,7 +122,7 @@ fn nnls_dependent_rays_r2() {
 fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     for scale in [1e-6_f64, 1.0, 1e6] {
         let a = [scale, 0.0, 0.0];
@@ -175,7 +174,7 @@ fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
 fn nnls_near_collinear_cancellation() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     for eps in [1e-7_f64, 1e-4] {
         let a = [0.6, 0.8, 0.0];
@@ -192,7 +191,7 @@ fn nnls_near_collinear_cancellation() {
 fn nnls_3072d_128_cols_stress() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     let dim = 3072usize;
     let cols_count = 128usize;
@@ -220,7 +219,7 @@ fn nnls_3072d_128_cols_stress() {
 fn nnls_256_cols_rank_deficient_d2048_qr_compression() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     let dim = 2048usize;
     let num_cols = 256usize;
@@ -277,7 +276,7 @@ fn nnls_256_cols_rank_deficient_d2048_qr_compression() {
 fn nnls_rejects_invalid_limits_and_cancellation() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
     let col = [1.0, 0.0];
 
     // Empty query
@@ -538,7 +537,7 @@ fn kernel_csr_spmv_dual_edge_gates_and_parallel() {
     let gains = [1.0, 1.0, 1.0];
     let sorted = [0u32, 1, 2, 3];
 
-    let graph = CsrGraphView {
+    let graph = CsrGraphView::new(CsrParts {
         node_count: 3,
         row_offsets: &row_offsets,
         targets: &targets,
@@ -549,7 +548,8 @@ fn kernel_csr_spmv_dual_edge_gates_and_parallel() {
         anchor_gains: &gains,
         target_sorted_indices: Some(&sorted),
         edge_gates: None,
-    };
+    })
+    .unwrap();
     graph.validate("test").unwrap();
 
     let local = [1.0, 0.5, 0.2];
@@ -625,7 +625,7 @@ fn kernel_csr_spmv_dual_edge_gates_and_parallel() {
     big_wh[0] = true;
     let big_inbound = vec![0.8; big_n];
     let big_gains = vec![1.0; big_n];
-    let big_graph = CsrGraphView {
+    let big_graph = CsrGraphView::new(CsrParts {
         node_count: big_n,
         row_offsets: &big_offsets,
         targets: &big_targets,
@@ -636,7 +636,8 @@ fn kernel_csr_spmv_dual_edge_gates_and_parallel() {
         anchor_gains: &big_gains,
         target_sorted_indices: None,
         edge_gates: None,
-    };
+    })
+    .unwrap();
     let big_l = vec![1.0; big_n];
     let big_t = vec![0.5; big_n];
     let mut seq_l = vec![0.0; big_n];
@@ -683,7 +684,7 @@ fn csr_target_sorted_indices_and_gate_validation() {
     let gains = [1.0; 4];
     let sorted = [1u32, 2, 0];
 
-    let csr_indexed = CsrGraphView {
+    let csr_indexed = CsrGraphView::new(CsrParts {
         node_count: 4,
         row_offsets: &row_offsets,
         targets: &targets,
@@ -694,13 +695,15 @@ fn csr_target_sorted_indices_and_gate_validation() {
         anchor_gains: &gains,
         target_sorted_indices: Some(&sorted),
         edge_gates: None,
-    };
+    })
+    .unwrap();
     csr_indexed.validate("test").unwrap();
 
-    let csr_linear = CsrGraphView {
+    let csr_linear = CsrGraphView::new(CsrParts {
         target_sorted_indices: None,
-        ..csr_indexed
-    };
+        ..*csr_indexed
+    })
+    .unwrap();
 
     for dst in 0..4 {
         let d = NodeId(dst);
@@ -735,9 +738,9 @@ fn csr_target_sorted_indices_and_gate_validation() {
 
     // Reject bad target_sorted_indices (wrong order)
     let bad_sorted = [0u32, 1, 2];
-    let bad_csr = CsrGraphView {
+    let bad_csr = CsrParts {
         target_sorted_indices: Some(&bad_sorted),
-        ..csr_indexed
+        ..*csr_indexed
     };
     assert!(matches!(
         bad_csr.validate("test"),
@@ -808,118 +811,6 @@ fn provenance_multi_root_and_support_group_joint_exclusion() {
     );
     // GroupId(2) has empty required_roots => unconditionally excluded
     assert_eq!(g_prov.independent_support_fraction(1, &[], &sg), Some(0.0));
-}
-
-#[test]
-fn epoch_table_wraparound_and_scratch_borrow_split() {
-    let mut pad = ScratchPad::with_capacities(8, 16, 32);
-    // Normal epoch stamping + disjoint buffer borrows
-    {
-        let (stamps, epoch) = pad.epochs.next_epoch(4);
-        let (aux_stamps, aux_epoch) = pad.epochs_aux.next_epoch(4);
-        let acc = ScratchPad::prepare_f64(&mut pad.node_accum, 4, 0.0);
-        stamps[1] = epoch;
-        aux_stamps[2] = aux_epoch;
-        acc[1] = 42.0;
-    }
-    assert!(pad.epochs.is_stamped(1));
-    assert!(!pad.epochs.is_stamped(0));
-    assert!(pad.epochs_aux.is_stamped(2));
-
-    // Epoch wraparound verification
-    let mut table = EpochTable::with_capacity(4);
-    for _ in 0..3 {
-        let (s, e) = table.next_epoch(4);
-        s[0] = e;
-    }
-    assert!(table.is_stamped(0));
-    table.reset();
-    assert_eq!(table.current_epoch(), 0);
-    assert!(!table.is_stamped(0));
-}
-
-#[test]
-fn views_and_operator_trait_smoke() {
-    struct TestOp;
-    struct TestConfig {
-        scale: f64,
-    }
-    struct TestInput<'asset, 'query> {
-        root_facts: RootFactView<'asset>,
-        pool: CandidatePoolView<'query>,
-    }
-
-    impl Operator for TestOp {
-        type Config = TestConfig;
-        type Input<'asset, 'query>
-            = TestInput<'asset, 'query>
-        where
-            Self: 'asset + 'query;
-        type Output = (bool, f64);
-
-        fn name(&self) -> &'static str {
-            "TestOp"
-        }
-
-        fn execute<'asset, 'query>(
-            &self,
-            ctx: &ExecutionContext<'_>,
-            config: &Self::Config,
-            input: Self::Input<'asset, 'query>,
-            scratch: &mut ScratchPad,
-        ) -> Result<Self::Output, VcpError> {
-            ctx.check_cancelled(self.name())?;
-            input.root_facts.validate(self.name())?;
-            input.pool.validate(self.name())?;
-            let buf = ScratchPad::prepare_f64(&mut scratch.f64_buf_b, 1, 0.0);
-            buf[0] = input.pool.baseline_scores[0] * config.scale;
-            Ok((input.root_facts.has_tag(RootId(0), NodeId(5)), buf[0]))
-        }
-    }
-
-    let rf = RootFactView {
-        root_count: 1,
-        checksum_hashes: &[12345],
-        root_tag_offsets: &[0, 2],
-        root_tags: &[NodeId(2), NodeId(5)],
-        root_req_offsets: &[0, 0],
-        root_required_roots: &[],
-    };
-    let vec_data = [1.0_f32, 0.0];
-    let pool = CandidatePoolView {
-        candidate_count: 1,
-        baseline_scores: &[0.75],
-        union_scores: &[0.75],
-        union_ranks: &[0],
-        bm25_scores: &[0.2],
-        bm25_reference: 1.0,
-        anchor_scores: &[0.5],
-        curve_document_ids: &[DocumentId(0)],
-        candidate_vectors: VectorMatrixView::new(&vec_data, 1, 2).unwrap(),
-        candidate_root_offsets: &[0, 1],
-        candidate_roots: &[RootId(0)],
-        candidate_path_offsets: &[0, 1],
-        path_tag_offsets: &[0, 1],
-        path_tags: &[NodeId(5)],
-        path_positions: &[1],
-    };
-
-    let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
-    let res = TestOp
-        .execute(
-            &ctx,
-            &TestConfig { scale: 2.0 },
-            TestInput {
-                root_facts: rf,
-                pool,
-            },
-            &mut scratch,
-        )
-        .unwrap();
-    assert_eq!(res, (true, 1.5));
-    assert_eq!(pool.path_steps(PathId(0)), (&[NodeId(5)][..], &[1u32][..]));
-    assert_eq!(pool.candidate_roots(CandidateId(0)), &[RootId(0)]);
 }
 
 #[cfg(feature = "schemars")]
@@ -1049,7 +940,7 @@ fn csr_find_edge_duplicate_targets_matches_linear_scan() {
     // Row 2: edge 4 (target 0), edge 5 (target 0)
     let sorted = [1u32, 0, 2, 3, 4, 5];
 
-    let csr_indexed = CsrGraphView {
+    let csr_indexed = CsrGraphView::new(CsrParts {
         node_count: 3,
         row_offsets: &row_offsets,
         targets: &targets,
@@ -1060,13 +951,15 @@ fn csr_find_edge_duplicate_targets_matches_linear_scan() {
         anchor_gains: &gains,
         target_sorted_indices: Some(&sorted),
         edge_gates: None,
-    };
+    })
+    .unwrap();
     csr_indexed.validate("dup_test").unwrap();
 
-    let csr_linear = CsrGraphView {
+    let csr_linear = CsrGraphView::new(CsrParts {
         target_sorted_indices: None,
-        ..csr_indexed
-    };
+        ..*csr_indexed
+    })
+    .unwrap();
 
     let gates = [0.5, 1.0, 0.25, 0.1, 0.75, 0.2];
     let gated_indexed = csr_indexed.with_edge_gates(&gates).unwrap();
@@ -1120,7 +1013,7 @@ fn csr_spmv_dual_zero_bit_parity_across_policies_n2500_nnz25000() {
         row_offsets.push(targets.len());
     }
     let max_inbound = inbound.iter().copied().fold(0.0_f64, f64::max);
-    let graph = CsrGraphView {
+    let graph = CsrGraphView::new(CsrParts {
         node_count: n,
         row_offsets: &row_offsets,
         targets: &targets,
@@ -1131,7 +1024,8 @@ fn csr_spmv_dual_zero_bit_parity_across_policies_n2500_nnz25000() {
         anchor_gains: &gains,
         target_sorted_indices: None,
         edge_gates: None,
-    };
+    })
+    .unwrap();
     graph.validate("spmv_2500").unwrap();
 
     let local: Vec<f64> = (0..n).map(|i| 0.5 + ((i % 23) as f64) * 0.11).collect();
@@ -1185,7 +1079,7 @@ fn csr_spmv_dual_zero_bit_parity_across_policies_n2500_nnz25000() {
 fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
     let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
-    let mut scratch = ScratchPad::new();
+    let mut scratch = NnlsWorkspace::default();
 
     // 1. Deterministic (id, slot) tie-breaking under Householder QR (D = 2048 > count = 18)
     let dim = 2048usize;

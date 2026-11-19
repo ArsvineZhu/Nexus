@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{FusedRanking, RiverReadoutOutput, TOPOLOGY_BUDGET, explicit, select_path, sort_items};
+use super::{FusedRanking, RiverReadoutOutput, explicit, select_path, sort_items};
 use crate::ObservationState;
 use crate::observation::invalid;
 use nexus_core::kernel::{cosine_f32, norm_sq_f32};
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, ExecutionContext, NodeId, Operator, PathId,
-    RootFactView, RootId, ScratchPad, VcpResult, VectorMatrixView,
+    RootFactView, RootId, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -15,21 +15,17 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CrossFileWormholeConfig {
-    pub unified_budget_ct: f64,
     pub min_relative_flow: f64,
     pub semantic_node_threshold: f64,
     pub maximum_river_edges: usize,
-    pub omega_gamma: f64,
 }
 
 impl Default for CrossFileWormholeConfig {
     fn default() -> Self {
         Self {
-            unified_budget_ct: TOPOLOGY_BUDGET,
             min_relative_flow: 0.5,
             semantic_node_threshold: 0.48,
             maximum_river_edges: 96,
-            omega_gamma: 1.0,
         }
     }
 }
@@ -148,7 +144,6 @@ fn build_routes<'asset>(
     const STAGE: &str = "wormhole.routes";
     ctx.check_cancelled(STAGE)?;
     input.candidates.validate(STAGE)?;
-    input.graph.validate(STAGE)?;
     input.root_facts.validate(STAGE)?;
     input.tag_vectors.validate(STAGE)?;
     let n = input.graph.node_count;
@@ -289,17 +284,14 @@ impl Operator for CrossFileWormholeOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
-        if config.unified_budget_ct != input.readout.budget
-            || config.omega_gamma != input.readout.gamma
-            || !(0.0..=1.0).contains(&config.min_relative_flow)
+        if !(0.0..=1.0).contains(&config.min_relative_flow)
             || !(0.0..1.0).contains(&config.semantic_node_threshold)
         {
             return Err(invalid(
                 stage,
-                "cross-file evidence must use the readout's topology budget and omega exponent",
+                "min_relative_flow must be in [0, 1] and semantic_node_threshold in [0, 1)",
             ));
         }
         let routes = build_routes(
@@ -313,7 +305,7 @@ impl Operator for CrossFileWormholeOperator {
         if routes.is_empty() {
             return Ok(output);
         }
-        let gate = input.readout.omega.omega.powf(config.omega_gamma);
+        let gate = input.readout.omega.omega.powf(input.readout.gamma);
         for item in &mut output.items {
             ctx.check_cancelled(stage)?;
             let candidate = item.candidate;
@@ -376,7 +368,6 @@ impl Operator for WormholeRrfFuseOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         if !config.rrf_k.is_finite()

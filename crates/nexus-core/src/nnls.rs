@@ -4,12 +4,17 @@
 use crate::error::VcpError;
 use crate::kernel::{dot_f64, norm_sq_f64};
 use crate::operator::{CancellationToken, PrecisionMode, ResourceLimits};
-use crate::scratch::ScratchPad;
 use faer::Mat;
 
 pub const DUAL_TOL: f64 = 1e-10;
 pub const RANK_TOL: f64 = 1e-12;
 pub const CHECK_TOL: f64 = 2e-8;
+
+#[derive(Default, Debug)]
+pub struct NnlsWorkspace {
+    target: Vec<f64>,
+    projected: Vec<f64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NnlsSolution {
@@ -278,7 +283,7 @@ fn solve_nnls_indexed_impl<'a, I>(
     num_cols: usize,
     limits: &ResourceLimits,
     cancel: &CancellationToken<'_>,
-    scratch: &mut ScratchPad,
+    scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError>
 where
     I: Iterator<Item = (i64, usize, &'a [f64])>,
@@ -382,7 +387,10 @@ where
         });
     }
 
-    let y_unit = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, dim, 0.0);
+    let y_unit = {
+        scratch.target.resize(dim, 0.0);
+        scratch.target.as_mut_slice()
+    };
     for (dst, &src) in y_unit.iter_mut().zip(target) {
         *dst = src / target_norm;
     }
@@ -394,7 +402,11 @@ where
         let q_mat = qr.compute_thin_Q();
         let r_mat = qr.thin_R();
 
-        let z = ScratchPad::prepare_f64(&mut scratch.nnls_qr_work, count, 0.0);
+        let z = {
+            scratch.projected.resize(count, 0.0);
+            scratch.projected.fill(0.0);
+            scratch.projected.as_mut_slice()
+        };
         for k in 0..count {
             let mut sum = 0.0_f64;
             for r in 0..dim {
@@ -509,7 +521,7 @@ pub fn solve_nnls_with_ids_f64(
     columns: &[(i64, &[f64])],
     limits: &ResourceLimits,
     cancel: &CancellationToken<'_>,
-    scratch: &mut ScratchPad,
+    scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
     solve_nnls_indexed_impl(
         "nnls::solve_nnls_with_ids_f64",
@@ -531,7 +543,7 @@ pub fn solve_nnls_f64(
     columns: &[&[f64]],
     limits: &ResourceLimits,
     cancel: &CancellationToken<'_>,
-    scratch: &mut ScratchPad,
+    scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
     solve_nnls_indexed_impl(
         "nnls::solve_nnls_f64",
@@ -555,7 +567,7 @@ pub fn solve_nnls_flat_f64(
     dim: usize,
     limits: &ResourceLimits,
     cancel: &CancellationToken<'_>,
-    scratch: &mut ScratchPad,
+    scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
     const STAGE: &str = "nnls::solve_nnls_flat_f64";
     if target.len() != dim {
@@ -595,7 +607,7 @@ pub fn solve_nnls_f32(
     columns: &[&[f32]],
     limits: &ResourceLimits,
     cancel: &CancellationToken<'_>,
-    scratch: &mut ScratchPad,
+    scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
     const STAGE: &str = "nnls::solve_nnls_f32";
     let dim = target.len();

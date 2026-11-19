@@ -3,7 +3,7 @@
 use super::{EpaAnalysis, PyramidResidual, PyramidTagEntry, finite_vector, invalid};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f64, normalize_f64};
 use nexus_core::{
-    ExecutionContext, NodeId, Operator, PrecisionMode, ScratchPad, TagLexicalMetaView, VcpResult,
+    ExecutionContext, NodeId, Operator, PrecisionMode, TagLexicalMetaView, VcpResult,
     VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,6 @@ impl Operator for HypernymPruneOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -317,7 +316,6 @@ impl Operator for TagGatingOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -415,7 +413,7 @@ impl Operator for TagGatingOperator {
                 }
                 let is_core = input.core_tags.contains(&tag.node);
                 let lexical = std::iter::once(name)
-                    .chain(input.lexical_meta.aliases(tag.node).iter().copied())
+                    .chain(input.lexical_meta.aliases(tag.node))
                     .any(|name| lexical_grounding(&query_tokens, name));
                 let sponsor = tags
                     .iter()

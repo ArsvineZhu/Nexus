@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use nexus_math::nexus_core::{
-    CancellationToken, CandidateId, CandidatePoolView, CsrGraphView, DocumentId, ExecutionContext,
-    NodeId, Operator, RootId, ScratchPad, VcpError, VectorMatrixView,
+    CancellationToken, CandidateId, CandidatePoolView, CsrGraphView, CsrParts, DocumentId,
+    ExecutionContext, NodeId, Operator, RootId, VcpError, VectorMatrixView,
 };
 use nexus_math::{
     DtscAuxConfig, DtscConfig, DtscField, DtscFieldBuildInput, DtscFieldBuildOperator,
@@ -33,14 +33,9 @@ fn build_test_field(
     cfg: &DtscFieldConfig,
 ) -> DtscField {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
+
     DtscFieldBuildOperator
-        .execute(
-            &ctx,
-            cfg,
-            DtscFieldBuildInput { nodes, tag_vectors },
-            &mut scratch,
-        )
+        .execute(&ctx, cfg, DtscFieldBuildInput { nodes, tag_vectors })
         .unwrap()
 }
 
@@ -102,7 +97,7 @@ impl OwnedGraph {
     }
 
     fn view(&self) -> CsrGraphView<'_> {
-        CsrGraphView {
+        CsrGraphView::new(CsrParts {
             node_count: self.node_count,
             row_offsets: &self.row_offsets,
             targets: &self.targets,
@@ -113,7 +108,8 @@ impl OwnedGraph {
             anchor_gains: &self.anchor_gains,
             target_sorted_indices: Some(&self.target_sorted_indices),
             edge_gates: None,
-        }
+        })
+        .unwrap()
     }
 }
 
@@ -272,23 +268,31 @@ fn trusted_field_curve_scoring_and_aux_identity_boost() {
                     (NodeId(3), 4),
                 ]],
             ),
-            (0.54, cand1_vec, vec![vec![(NodeId(4), 1)]]),
+            (0.50, cand1_vec, vec![vec![(NodeId(4), 1)]]),
         ],
     );
 
     let query = mix_vec(dim, 0, 0.7, 1, 0.7);
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
 
     let cfg = DtscConfig {
-        auxiliary: DtscAuxConfig {
-            enabled: true,
-            identity_anchor: DtscIdentityConfig {
-                enabled: true,
-                ..Default::default()
-            },
+        reward: nexus_math::DtscRewardConfig {
+            alpha: 0.0,
             ..Default::default()
         },
+        auxiliary: Some(DtscAuxConfig {
+            min_class_evidence: 0.0,
+            min_fused_score: 0.0,
+            min_closure_score: 0.0,
+            identity_anchor: Some(DtscIdentityConfig {
+                min_potential: 0.0,
+                min_specificity: 0.0,
+                min_tag_chunk_closure: 0.0,
+                min_strength: 0.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     };
 
@@ -305,10 +309,14 @@ fn trusted_field_curve_scoring_and_aux_identity_boost() {
                 enhanced_query: &query,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
 
+    let leading = &out.results[0];
+    assert!(leading.geo_aux_bonus > 0.0);
+    let evidence = leading.auxiliary_evidence.unwrap();
+    assert!(evidence.identity_floor > 0.0);
+    assert!(evidence.shadow_score > 0.0 && evidence.geometry_floor > 0.0);
     assert!(out.field_trusted);
     assert!(!out.fallback_used);
     assert_eq!(out.fallback_reason, None);
@@ -392,7 +400,6 @@ fn sparse_association_relief_and_edge_gates_effect() {
     );
 
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
 
     let cfg_sparse_on = DtscConfig::default();
     let mut cfg_sparse_off = DtscConfig::default();
@@ -411,7 +418,6 @@ fn sparse_association_relief_and_edge_gates_effect() {
                 enhanced_query: &chunk,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -428,7 +434,6 @@ fn sparse_association_relief_and_edge_gates_effect() {
                 enhanced_query: &chunk,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -452,7 +457,6 @@ fn sparse_association_relief_and_edge_gates_effect() {
                 enhanced_query: &chunk,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(
@@ -479,7 +483,6 @@ fn sparse_association_relief_and_edge_gates_effect() {
                 enhanced_query: &chunk,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(
@@ -522,7 +525,7 @@ fn low_trust_fallback_restores_knn_scores_and_preserves_input_order() {
 
     let q = unit_vec(dim, 0);
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
+
     let out = DtscReadoutOperator
         .execute(
             &ctx,
@@ -536,7 +539,6 @@ fn low_trust_fallback_restores_knn_scores_and_preserves_input_order() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -600,7 +602,6 @@ fn low_trust_fallback_restores_knn_scores_and_preserves_input_order() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert!(out_cold.fallback_used);
@@ -670,7 +671,6 @@ fn multipath_csr_isolation_best_path_and_top_k_truncation() {
 
     let q = mix_vec(dim, 0, 0.7, 1, 0.7);
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
 
     let out_all = DtscReadoutOperator
         .execute(
@@ -685,7 +685,6 @@ fn multipath_csr_isolation_best_path_and_top_k_truncation() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -732,7 +731,6 @@ fn multipath_csr_isolation_best_path_and_top_k_truncation() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(out_top2.results.len(), 2);
@@ -741,7 +739,7 @@ fn multipath_csr_isolation_best_path_and_top_k_truncation() {
 }
 
 #[test]
-fn config_serde_defaults_deny_unknown_fields_and_normalized() {
+fn config_rejects_invalid_threshold_without_rewriting() {
     // Empty map deserializes to exact Default values.
     let empty: Vec<(&str, &str)> = Vec::new();
     let de = MapDeserializer::<_, serde::de::value::Error>::new(empty.into_iter());
@@ -751,8 +749,7 @@ fn config_serde_defaults_deny_unknown_fields_and_normalized() {
     assert_eq!(cfg.sparse.pair_saturation, 3);
     assert_eq!(cfg.reward.alpha, 0.35);
     assert_eq!(cfg.trust.min_strong_evidence, 1.0);
-    assert!(!cfg.auxiliary.enabled);
-    assert!(!cfg.auxiliary.identity_anchor.enabled);
+    assert!(cfg.auxiliary.is_none());
     assert_eq!(cfg.top_k, 0);
 
     // Unknown field is rejected (`deny_unknown_fields`).
@@ -764,30 +761,11 @@ fn config_serde_defaults_deny_unknown_fields_and_normalized() {
     );
     assert!(DtscConfig::deserialize(de_unknown).is_err());
 
-    // normalized() clamps cross-field invariants accurately.
     let mut bad = DtscConfig::default();
-    bad.curve.strong_contact_threshold = 0.2;
     bad.curve.weak_contact_threshold = 0.9;
-    bad.curve.position_decay = -2.0;
-    bad.curve.min_geo_samples = 0;
-    bad.sparse.min_contacts = 0;
-    bad.sparse.max_relief = 5.0;
-    bad.reward.direct_bonus_cap = 0.1;
-    bad.reward.structural_bonus_cap = 0.5;
-    bad.reward.thematic_bonus_cap = 0.5;
-    bad.auxiliary.max_aux_bonus = 0.2;
-    bad.auxiliary.identity_anchor.floor_exponent = 10.0;
-
-    let norm = bad.normalized();
-    assert_eq!(norm.curve.weak_contact_threshold, 0.2);
-    assert_eq!(norm.curve.position_decay, 0.0);
-    assert_eq!(norm.curve.min_geo_samples, 1);
-    assert_eq!(norm.sparse.min_contacts, 2);
-    assert_eq!(norm.sparse.max_relief, 0.8);
-    assert_eq!(norm.reward.structural_bonus_cap, 0.1);
-    assert_eq!(norm.reward.thematic_bonus_cap, 0.1);
-    assert_eq!(norm.auxiliary.max_aux_bonus, 0.05);
-    assert_eq!(norm.auxiliary.identity_anchor.floor_exponent, 4.0);
+    let error = bad.validate().unwrap_err();
+    assert!(error.to_string().contains("curve.weak_contact_threshold"));
+    assert_eq!(bad.curve.weak_contact_threshold, 0.9);
 }
 
 #[test]
@@ -799,7 +777,6 @@ fn readout_validates_inputs_and_cancellation() {
     let graph = OwnedGraph::from_edges(1, &[], vec![0.0], vec![1.0]);
     let pool = OwnedPool::from_candidates(dim, &[]);
     let q = vec![1.0_f32; dim];
-    let mut scratch = ScratchPad::default();
 
     // Cancelled context.
     let cancel_flag = AtomicBool::new(true);
@@ -820,7 +797,6 @@ fn readout_validates_inputs_and_cancellation() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap_err();
     assert!(matches!(err, VcpError::Cancelled { .. }));
@@ -842,7 +818,6 @@ fn readout_validates_inputs_and_cancellation() {
                 enhanced_query: &[],
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap_err();
     assert!(matches!(err_zero, VcpError::InvalidInput { .. }));
@@ -861,7 +836,6 @@ fn readout_validates_inputs_and_cancellation() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap_err();
     assert!(matches!(
@@ -909,7 +883,6 @@ fn low_trust_coverage_and_spread_fallback_and_bypass() {
     let graph = OwnedGraph::from_edges(6, &[], vec![0.1; 6], vec![1.0; 6]);
     let q = unit_vec(dim, 0);
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::default();
 
     // 1 of 3 candidates has weak non-strong contact -> coverage (1/3 < 0.5) -> jointly low trust.
     let mut cfg_low = DtscConfig::default();
@@ -945,7 +918,6 @@ fn low_trust_coverage_and_spread_fallback_and_bypass() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert!(out_cov.fallback_used);
@@ -975,7 +947,6 @@ fn low_trust_coverage_and_spread_fallback_and_bypass() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert!(out_spread.fallback_used);
@@ -999,7 +970,6 @@ fn low_trust_coverage_and_spread_fallback_and_bypass() {
                 enhanced_query: &q,
                 geometry: DtscGeometryState::default(),
             },
-            &mut scratch,
         )
         .unwrap();
     assert!(!out_bypass.fallback_used);
@@ -1013,4 +983,227 @@ fn low_trust_coverage_and_spread_fallback_and_bypass() {
 fn schemars_generates_dtsc_config_schema() {
     let schema = schemars::schema_for!(DtscConfig);
     assert!(schema.as_object().is_some());
+}
+
+fn fixture_matrix(input: &serde_json::Value, dim: usize) -> Vec<f32> {
+    let rows: Vec<(usize, Vec<f32>)> =
+        serde_json::from_value(input["tag_vectors"].clone()).unwrap();
+    let count = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
+    let mut values = vec![0.0; count * dim];
+    for (id, vector) in rows {
+        values[(id - 1) * dim..id * dim].copy_from_slice(&vector);
+    }
+    values
+}
+
+fn fixture_nodes(input: &serde_json::Value) -> Vec<DtscNodeInput> {
+    input["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| DtscNodeInput {
+            node: NodeId((node["id"].as_u64().unwrap() - 1) as u32),
+            energy: node["energy"].as_f64().unwrap(),
+            normalized_energy: node["normalizedEnergy"].as_f64().unwrap(),
+            source_type: node["sourceType"].as_str().unwrap().into(),
+        })
+        .collect()
+}
+
+fn fixture_weights(input: &serde_json::Value, field: &str, count: usize, default: f64) -> Vec<f64> {
+    let mut values = vec![default; count];
+    for (id, mass) in serde_json::from_value::<Vec<(usize, f64)>>(input[field].clone()).unwrap() {
+        values[id - 1] = mass;
+    }
+    values
+}
+
+#[track_caller]
+fn close_to_corpus(label: &str, actual: f64, expected: &serde_json::Value) {
+    let expected = expected.as_f64().unwrap();
+    assert!(
+        (actual - expected).abs() < 1e-12,
+        "{label}: {actual} != {expected}"
+    );
+}
+
+#[test]
+fn nous_wave_field_corpus() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/vcp-dtsc-field.json")).unwrap();
+    assert_eq!(
+        fixture["source"]["commit"],
+        "e03b891d42055cdf3cab5dc961cc71dd5facd65a"
+    );
+    for case in fixture["cases"].as_array().unwrap() {
+        let input = &case["input"];
+        let expected = &case["expected"];
+        let dim = input["dimension"].as_u64().unwrap() as usize;
+        let data = fixture_matrix(input, dim);
+        let matrix = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
+        let inbound = fixture_weights(input, "inbound", matrix.rows, 0.0);
+        let custom = &input["config"];
+        let config = DtscFieldConfig {
+            min_field_tags: custom["minFieldTags"].as_u64().unwrap_or(3) as usize,
+            max_field_nodes: custom["maxFieldNodes"].as_u64().unwrap_or(48) as usize,
+            field_energy_mass_ratio: custom["fieldEnergyMassRatio"].as_f64().unwrap_or(0.95),
+            ..DtscFieldConfig::default()
+        };
+        let field = build_test_field(&fixture_nodes(input), matrix, &config);
+        close_to_corpus(
+            "field entropy",
+            field.field_entropy,
+            &expected["fieldEntropy"],
+        );
+        close_to_corpus("total energy", field.total_energy, &expected["totalEnergy"]);
+        assert_eq!(
+            field.field_trusted,
+            expected["fieldTrusted"].as_bool().unwrap()
+        );
+        let retained = expected["fieldNodes"].as_array().unwrap();
+        assert_eq!(field.field_nodes.len(), retained.len());
+        for (node, expected) in field.field_nodes.iter().zip(retained) {
+            assert_eq!(u64::from(node.node.0) + 1, expected["id"].as_u64().unwrap());
+            close_to_corpus("retained potential", node.potential, &expected["potential"]);
+        }
+        let sampler = nexus_math::DtscFieldSampler::new(&field, &inbound, &config);
+        let targets: Vec<(u32, Vec<f32>)> =
+            serde_json::from_value(input["sample_tags"].clone()).unwrap();
+        for ((id, vector), expected) in targets
+            .into_iter()
+            .zip(expected["samples"].as_array().unwrap())
+        {
+            let result = sampler.sample(NodeId(id - 1), &vector);
+            close_to_corpus("sample potential", result.potential, &expected["potential"]);
+            assert_eq!(result.exact, expected["exact"].as_bool().unwrap());
+            assert_eq!(
+                result.source_type.as_str(),
+                expected["sourceType"].as_str().unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn nous_wave_curve_and_fallback_corpus() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/vcp-dtsc.json")).unwrap();
+    let ctx = ExecutionContext::default();
+    for case in fixture["cases"].as_array().unwrap() {
+        let input = &case["input"];
+        let dim = input["dimension"].as_u64().unwrap() as usize;
+        if dim == 0 {
+            let matrix = VectorMatrixView::empty(0);
+            let field = DtscField::default();
+            let graph = OwnedGraph::from_edges(0, &[], vec![], vec![]);
+            let candidates = OwnedPool::from_candidates(0, &[]);
+            let result = DtscReadoutOperator.execute(
+                &ctx,
+                &DtscConfig::default(),
+                DtscReadoutInput {
+                    field: &field,
+                    candidates: candidates.view(),
+                    graph: graph.view(),
+                    tag_vectors: matrix,
+                    original_query: &[],
+                    enhanced_query: &[],
+                    geometry: DtscGeometryState::default(),
+                },
+            );
+            assert!(matches!(result, Err(VcpError::InvalidInput { .. })));
+            continue;
+        }
+        let data = fixture_matrix(input, dim);
+        let matrix = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
+        let edges: Vec<(usize, usize, f64)> =
+            serde_json::from_value(input["edges"].clone()).unwrap();
+        let edges: Vec<_> = edges
+            .into_iter()
+            .map(|(a, b, w)| (a - 1, b - 1, w))
+            .collect();
+        let graph = OwnedGraph::from_edges(
+            matrix.rows,
+            &edges,
+            fixture_weights(input, "inbound", matrix.rows, 0.0),
+            fixture_weights(input, "anchor_gain", matrix.rows, 1.0),
+        );
+        let candidates = input["candidates"].as_array().unwrap();
+        let specs: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                let curve = &candidate["curve"];
+                let tags = curve["tags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tag| {
+                        (
+                            NodeId(tag["id"].as_u64().unwrap() as u32 - 1),
+                            tag["position"].as_u64().unwrap() as u32,
+                        )
+                    })
+                    .collect();
+                (
+                    candidate["score"].as_f64().unwrap(),
+                    serde_json::from_value(curve["chunk_vector"].clone()).unwrap(),
+                    vec![tags],
+                )
+            })
+            .collect();
+        let pool = OwnedPool::from_candidates(dim, &specs);
+        let query: Vec<f32> = serde_json::from_value(input["original_vector"].clone()).unwrap();
+        let enhanced: Vec<f32> = serde_json::from_value(input["enhanced_vector"].clone()).unwrap();
+        let config = DtscConfig {
+            top_k: input["top_k"].as_u64().unwrap() as usize,
+            ..Default::default()
+        };
+        let field = build_test_field(&fixture_nodes(input), matrix, &config.field);
+        let actual = DtscReadoutOperator
+            .execute(
+                &ctx,
+                &config,
+                DtscReadoutInput {
+                    graph: graph.view(),
+                    field: &field,
+                    candidates: pool.view(),
+                    tag_vectors: matrix,
+                    original_query: &query,
+                    enhanced_query: &enhanced,
+                    geometry: DtscGeometryState::default(),
+                },
+            )
+            .unwrap();
+        let expected = &case["expected"];
+        let diagnostics = &expected["diagnostics"];
+        let results = expected["results"].as_array().unwrap();
+        assert_eq!(actual.results.len(), results.len());
+        assert_eq!(
+            actual.fallback_reason,
+            diagnostics["fallbackReason"].as_str()
+        );
+        assert_eq!(
+            actual.field_trusted,
+            diagnostics["fieldTrusted"].as_bool().unwrap()
+        );
+        close_to_corpus(
+            "curve field entropy",
+            actual.field_entropy,
+            &diagnostics["fieldEntropy"],
+        );
+        for (row, expected) in actual.results.iter().zip(results) {
+            assert_eq!(
+                candidates[row.candidate.index()]["curve"]["id"],
+                expected["id"]
+            );
+            for (label, value) in [
+                ("score", row.score),
+                ("geoScore", row.geo_score),
+                ("geoBonus", row.geo_bonus),
+                ("geoConfidence", row.geo_confidence),
+                ("geoIsolatedRatio", row.geo_isolated_ratio),
+            ] {
+                close_to_corpus(label, value, &expected[label]);
+            }
+        }
+    }
 }

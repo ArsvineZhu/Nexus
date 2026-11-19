@@ -1,0 +1,29 @@
+[package]
+name = "nexus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "CC-BY-NC-SA-4.0"
+publish = false
+description = "In-memory composable numerical and retrieval algorithms"
+
+[features]
+schemars = ["nexus-core/schemars", "nexus-math/schemars", "nexus-vcp/schemars"]
+
+[dependencies]
+nexus-core.workspace = true
+nexus-math.workspace = true
+nexus-vcp.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bench]]
+name = "frozen"
+harness = false
+
+[lints]
+workspace = true

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use std::marker::PhantomData;
-
 use nexus_core::*;
 use nexus_vcp::*;
 
@@ -25,7 +23,6 @@ fn make_seq_view<'a>(
 #[test]
 fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // 3 roots contributing to directed edge (0 -> 1):
     // root 101: 3.0, root 202: 1.0, root 303: 2.0 (total = 6.0).
@@ -58,7 +55,6 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
                 positive_relations: Some(pos_rel),
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -70,9 +66,7 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
                 fact_matrix: &fm_out.fact_matrix,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -87,7 +81,6 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
                 positive_relations: Some(pos_rel),
                 support_groups: None,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -128,7 +121,6 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
 #[test]
 fn provenance_contract_2_joint_support_group_and_max_dedup() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // Group 0: joint roots {101, 202} (Interpretation), mass 2.0 (with duplicate 1.0 that must dedup via max).
     // Group 1: root {303} (Source), mass 3.0. Total = 5.0.
@@ -170,7 +162,6 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
                 positive_relations: Some(pos_rel),
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(fm_out.fact_matrix.raw_weights, vec![5.0]);
@@ -183,9 +174,7 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
                 fact_matrix: &fm_out.fact_matrix,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -200,7 +189,6 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
                 positive_relations: Some(pos_rel),
                 support_groups: Some(sg),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -230,7 +218,6 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
 #[test]
 fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     let mut vecs = Vec::with_capacity(5 * 3);
     for id in 1..=5 {
@@ -260,7 +247,6 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
                 sequences: seqs,
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -281,7 +267,6 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
                 sequences: seqs,
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap_err();
     assert!(matches!(err, VcpError::ResourceLimitExceeded { .. }));
@@ -299,7 +284,6 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
                 positive_relations: None,
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(fm_out.fact_matrix.targets.len(), 20);
@@ -308,7 +292,6 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
 #[test]
 fn counterevidence_zero_bit_isolation() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     let vecs = [
         1.0_f32, 0.0, 0.0, 0.0, // 0
@@ -351,7 +334,6 @@ fn counterevidence_zero_bit_isolation() {
                 positive_relations: None,
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(out_clean.counterevidence.sources.len(), 0);
@@ -367,7 +349,6 @@ fn counterevidence_zero_bit_isolation() {
                 positive_relations: None,
                 negative_relations: Some(neg_view),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -410,9 +391,7 @@ fn counterevidence_zero_bit_isolation() {
                 fact_matrix: &out_clean.fact_matrix,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
     let tr_neg = TransportCalibrateOperator
@@ -423,9 +402,7 @@ fn counterevidence_zero_bit_isolation() {
                 fact_matrix: &out_with_neg.fact_matrix,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -445,7 +422,6 @@ fn counterevidence_zero_bit_isolation() {
 #[test]
 fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // 32 nodes in 32-dim space: node 0 is a dense target, nodes 1..=30 are tilted orthonormal vectors.
     let dim = 32;
@@ -479,7 +455,6 @@ fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
                 sequences: SequenceSliceView::empty(),
                 explicit_edges: Some(&explicit_edges),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -504,7 +479,6 @@ fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
                 tag_vectors,
                 geometry: &geom,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -538,7 +512,6 @@ fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
 #[test]
 fn local_cone_ags_mgs2_fallback_and_zero_norm_insufficient_neighbors() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // Node 0: target = normalize([0.1, 0.7, 0.7, 0.0])
     // Node 1: [1.0, 0.0, 0.0, 0.0]
@@ -575,7 +548,6 @@ fn local_cone_ags_mgs2_fallback_and_zero_norm_insufficient_neighbors() {
                 sequences: SequenceSliceView::empty(),
                 explicit_edges: Some(&explicit_edges),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -601,7 +573,6 @@ fn local_cone_ags_mgs2_fallback_and_zero_norm_insufficient_neighbors() {
 #[test]
 fn local_cone_ags_5adb12b_explain_mode_conditional_gain_recovery() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // Node 0 target: [0.005, 0.9999875, 0.0, 0.0]
     // Node 1: [1.0, 0.0, 0.0, 0.0] (initial dot = 0.005 < min_gain=0.015)
@@ -636,7 +607,6 @@ fn local_cone_ags_5adb12b_explain_mode_conditional_gain_recovery() {
                 sequences: SequenceSliceView::empty(),
                 explicit_edges: Some(&explicit_edges),
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -647,7 +617,6 @@ fn local_cone_ags_5adb12b_explain_mode_conditional_gain_recovery() {
 #[test]
 fn global_epa_empty_and_zero_norm_safe_degradation() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // Completely empty corpus.
     let empty_vecs = VectorMatrixView::<f32>::empty(8);
@@ -660,7 +629,6 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
                 sequences: SequenceSliceView::empty(),
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap();
     let epa_empty = GlobalEpaOperator
@@ -671,7 +639,6 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
                 tag_vectors: empty_vecs,
                 geometry: &empty_geom,
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(epa_empty.dim, 8);
@@ -693,7 +660,6 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
                 sequences: SequenceSliceView::empty(),
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap();
     let epa_zero = GlobalEpaOperator
@@ -704,7 +670,6 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
                 tag_vectors: zero_vecs,
                 geometry: &zero_geom,
             },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(epa_zero.basis_count, 0);
@@ -714,7 +679,6 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
 #[test]
 fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     // Build a 4-node FactMatrix directly:
     // Node 0 -> 1 (w=0.5), 2 (w=4.0, wormhole), 3 (w=1.0)
@@ -737,43 +701,23 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     };
     let anchor_gains = [1.0, 1.0, 1.5, 1.0];
 
-    let cfg_sorted = TransportConfig::default();
-    let cfg_linear = TransportConfig {
-        build_target_sorted_index: false,
-        ..Default::default()
-    };
-
-    let tr_sorted = TransportCalibrateOperator
+    let transport = TransportCalibrateOperator
         .execute(
             &ctx,
-            &cfg_sorted,
+            &TransportConfig::default(),
             TransportCalibrateInput {
                 fact_matrix: &fm,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
-    let tr_linear = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &cfg_linear,
-            TransportCalibrateInput {
-                fact_matrix: &fm,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-                _marker: PhantomData,
-            },
-            &mut scratch,
-        )
-        .unwrap();
-
-    let view_sorted = tr_sorted.as_csr_view();
-    let view_linear = tr_linear.as_csr_view();
-    view_sorted.validate("test_sorted").unwrap();
-    view_linear.validate("test_linear").unwrap();
+    let view_sorted = transport.as_csr_view();
+    let view_linear = CsrGraphView::new(CsrParts {
+        target_sorted_indices: None,
+        ..*view_sorted
+    })
+    .unwrap();
 
     // O(log deg) binary-search parity against linear scan.
     for u in 0..4_u32 {
@@ -794,7 +738,7 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     // Row mass conservation (0.95 outbound total on every non-empty row).
     for u in 0..4_u32 {
         let range = view_sorted.row_range(NodeId(u));
-        let row_sum: f64 = tr_sorted.weights[range].iter().sum();
+        let row_sum: f64 = transport.weights[range].iter().sum();
         assert!((row_sum - 0.95).abs() < 1e-13, "row {u} sum = {row_sum}");
     }
 
@@ -810,12 +754,10 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
                 fact_matrix: &fm,
                 anchor_gains: &anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
-    for (a, b) in tr_sorted.weights.iter().zip(&tr_pos_exp.weights) {
+    for (a, b) in transport.weights.iter().zip(&tr_pos_exp.weights) {
         assert_eq!(a.to_bits(), b.to_bits());
     }
 
@@ -825,14 +767,12 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     let tr_gated = TransportCalibrateOperator
         .execute(
             &ctx,
-            &cfg_sorted,
+            &TransportConfig::default(),
             TransportCalibrateInput {
                 fact_matrix: &fm,
                 anchor_gains: &anchor_gains,
                 edge_gates: Some(&gates),
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
     let view_gated = tr_gated.as_csr_view();
@@ -856,7 +796,6 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
 #[test]
 fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
 
     let vecs = [
         1.0_f32, 0.1, 0.2, 0.0, // 0
@@ -890,7 +829,6 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
                 ),
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap();
     let g_unsorted = LocalConeAgsOperator
@@ -908,7 +846,6 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
                 ),
                 explicit_edges: None,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -933,7 +870,6 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
                 positive_relations: None,
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
     let fm_unsorted = FactMatrixOperator
@@ -953,7 +889,6 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
                 positive_relations: None,
                 negative_relations: None,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -1009,8 +944,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
         parallel: ParallelPolicy::GlobalRayon,
         ..Default::default()
     };
-    let mut scratch_seq = ScratchPad::new();
-    let mut scratch_par = ScratchPad::new();
 
     let vecs = [
         1.0_f32, 0.2, 0.1, 0.0, // 0
@@ -1036,7 +969,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 sequences: seqs,
                 explicit_edges: None,
             },
-            &mut scratch_seq,
         )
         .unwrap();
     let g_par = LocalConeAgsOperator
@@ -1048,7 +980,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 sequences: seqs,
                 explicit_edges: None,
             },
-            &mut scratch_par,
         )
         .unwrap();
 
@@ -1070,7 +1001,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 tag_vectors,
                 geometry: &g_seq,
             },
-            &mut scratch_seq,
         )
         .unwrap();
     let epa_par = GlobalEpaOperator
@@ -1081,7 +1011,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 tag_vectors,
                 geometry: &g_par,
             },
-            &mut scratch_par,
         )
         .unwrap();
     assert_eq!(epa_seq.basis_count, epa_par.basis_count);
@@ -1109,7 +1038,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 positive_relations: None,
                 negative_relations: None,
             },
-            &mut scratch_seq,
         )
         .unwrap();
     let tr = TransportCalibrateOperator
@@ -1120,9 +1048,7 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 fact_matrix: &fm_out.fact_matrix,
                 anchor_gains: &g_seq.anchor_gains,
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch_seq,
         )
         .unwrap();
     let prov = ProvenanceBuildOperator
@@ -1136,7 +1062,6 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
                 positive_relations: None,
                 support_groups: None,
             },
-            &mut scratch_seq,
         )
         .unwrap();
     assert_eq!(prov.edge_count, tr.targets.len());
@@ -1158,6 +1083,5 @@ fn schemars_schemas_generate_cleanly() {
     let _ = schemars::schema_for!(GeometryState);
     let _ = schemars::schema_for!(EpaBasis);
     let _ = schemars::schema_for!(FactMatrixOutput);
-    let _ = schemars::schema_for!(TransportGraph);
     let _ = schemars::schema_for!(ProvenanceData);
 }

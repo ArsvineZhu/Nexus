@@ -9,7 +9,7 @@ use crate::id::NodeId;
 /// optional `target_sorted_indices` stores global `0..nnz` edge indices sorted ascending by `targets[edge_idx]`
 /// within each row to enable O(log deg) lookup; optional `edge_gates` enables request-time temporal gating `P^q_ij`.
 #[derive(Clone, Copy, Debug)]
-pub struct CsrGraphView<'a> {
+pub struct CsrParts<'a> {
     pub node_count: usize,
     pub row_offsets: &'a [usize],
     pub targets: &'a [NodeId],
@@ -22,13 +22,22 @@ pub struct CsrGraphView<'a> {
     pub edge_gates: Option<&'a [f64]>,
 }
 
+/// A structurally validated transport view. The backing arrays remain immutable.
+#[derive(Clone, Copy, Debug)]
+pub struct CsrGraphView<'a>(CsrParts<'a>);
+
 impl<'a> CsrGraphView<'a> {
+    pub fn new(parts: CsrParts<'a>) -> Result<Self, VcpError> {
+        parts.validate("csr.prepare")?;
+        Ok(Self(parts))
+    }
+
     /// Binds request-level temporal edge gates `[0.0, 1.0]` aligned 1:1 with global `0..nnz` edges.
     pub fn with_edge_gates(mut self, gates: &'a [f64]) -> Result<Self, VcpError> {
-        if gates.len() != self.weights.len() {
+        if gates.len() != self.0.weights.len() {
             return Err(VcpError::DimensionMismatch {
                 stage: "CsrGraphView::with_edge_gates",
-                expected: self.weights.len(),
+                expected: self.0.weights.len(),
                 actual: gates.len(),
             });
         }
@@ -41,10 +50,73 @@ impl<'a> CsrGraphView<'a> {
                 detail: "edge_gates must be finite and in [0.0, 1.0]".into(),
             });
         }
-        self.edge_gates = Some(gates);
+        self.0.edge_gates = Some(gates);
         Ok(self)
     }
+}
 
+impl<'a> std::ops::Deref for CsrGraphView<'a> {
+    type Target = CsrParts<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Owns the backing arrays for a prepared transport graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CsrGraph(CsrStorage);
+
+impl CsrGraph {
+    pub fn new(storage: CsrStorage) -> Result<Self, VcpError> {
+        storage.parts().validate("csr.prepare")?;
+        Ok(Self(storage))
+    }
+
+    pub fn view(&self) -> CsrGraphView<'_> {
+        CsrGraphView(self.0.parts())
+    }
+}
+
+impl std::ops::Deref for CsrGraph {
+    type Target = CsrStorage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CsrStorage {
+    pub node_count: usize,
+    pub row_offsets: Vec<usize>,
+    pub targets: Vec<NodeId>,
+    pub weights: Vec<f64>,
+    pub is_static_wormhole: Vec<bool>,
+    pub inbound: Vec<f64>,
+    pub max_inbound: f64,
+    pub anchor_gains: Vec<f64>,
+    pub target_sorted_indices: Option<Vec<u32>>,
+}
+
+impl CsrStorage {
+    fn parts(&self) -> CsrParts<'_> {
+        CsrParts {
+            node_count: self.node_count,
+            row_offsets: &self.row_offsets,
+            targets: &self.targets,
+            weights: &self.weights,
+            is_static_wormhole: &self.is_static_wormhole,
+            inbound: &self.inbound,
+            max_inbound: self.max_inbound,
+            anchor_gains: &self.anchor_gains,
+            target_sorted_indices: self.target_sorted_indices.as_deref(),
+            edge_gates: None,
+        }
+    }
+}
+
+impl<'a> CsrParts<'a> {
     #[inline]
     pub fn nnz(&self) -> usize {
         self.targets.len()
@@ -127,10 +199,14 @@ impl<'a> CsrGraphView<'a> {
         let n = self.node_count;
         let nnz = self.targets.len();
 
-        if self.row_offsets.len() != n + 1 {
+        let offsets = n.checked_add(1).ok_or_else(|| VcpError::InvalidInput {
+            stage,
+            detail: "node_count overflows CSR offset length".into(),
+        })?;
+        if self.row_offsets.len() != offsets {
             return Err(VcpError::DimensionMismatch {
                 stage,
-                expected: n + 1,
+                expected: offsets,
                 actual: self.row_offsets.len(),
             });
         }

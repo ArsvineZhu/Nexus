@@ -13,7 +13,7 @@ test *args:
     cargo test --workspace --all-features --locked {{args}}
 
 math-only:
-    cargo test -p nexus-graph --no-default-features --features math-nodes,schemars --locked
+    cargo test -p nexus-math --all-features --locked
 
 check: lint test math-only
     cargo fmt --all -- --check

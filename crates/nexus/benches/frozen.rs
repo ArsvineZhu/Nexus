@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use nexus::*;
 use nexus_core::kernel::{cosine_f32, norm_sq_f32};
 use nexus_core::*;
-use nexus_graph::*;
 use nexus_vcp::*;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -24,7 +24,7 @@ struct Fixture {
     labels: Vec<String>,
     alias_offsets: Vec<u32>,
     aliases: Vec<String>,
-    graph: TransportGraph,
+    graph: CsrStorage,
     provenance_offsets: Vec<u32>,
     provenance_groups: Vec<GroupId>,
     provenance_masses: Vec<f64>,
@@ -78,30 +78,6 @@ impl Fixture {
     }
 }
 
-fn graph(config: &ObservationConfig, fanout: bool) -> ComputeGraph {
-    let mut graph = ComputeGraph::default();
-    let observe = graph.add_node(ObserveNode(config.clone()));
-    let pool = graph.add_node(PoolCalibrateNode(PoolCalibrateConfig {
-        precision: fanout.then_some(PrecisionMode::StrictLeftFold),
-        ..PoolCalibrateConfig::default()
-    }));
-    let river = graph.add_node(RiverReadoutNode(RiverReadoutConfig::default()));
-    graph.connect(observe.port(0), pool.port(0));
-    graph.connect(observe.port(0), river.port(0));
-    graph.connect(pool.port(0), river.port(1));
-    graph.outputs.push(river.port(0));
-    if fanout {
-        let dtsc = graph.add_node(ObservedDtscReadoutNode(nexus_math::DtscConfig::default()));
-        let thinking = graph.add_node(ThinkingNode(ThinkingConfig::default()));
-        graph.connect(observe.port(0), dtsc.port(0));
-        graph.connect(pool.port(0), dtsc.port(1));
-        graph.connect(observe.port(0), thinking.port(0));
-        graph.connect(pool.port(0), thinking.port(1));
-        graph.outputs.extend([dtsc.port(0), thinking.port(0)]);
-    }
-    graph
-}
-
 fn run_frozen(criterion: &mut Criterion) {
     let Some(path) = std::env::var_os("NEXUS_FROZEN_FIXTURE") else {
         eprintln!("Set NEXUS_FROZEN_FIXTURE to an exported dataset. See docs/benchmarks.md.");
@@ -134,7 +110,6 @@ fn run_frozen(criterion: &mut Criterion) {
         pool.as_ref()
             .map_or(ParallelPolicy::Sequential, ParallelPolicy::CustomPool),
     );
-    let mut scratch = ScratchPad::default();
     let zeros = vec![0.0; count];
     let norms: Vec<_> = candidate_values
         .chunks_exact(dim)
@@ -145,8 +120,6 @@ fn run_frozen(criterion: &mut Criterion) {
         .with_sq_norms(&norms)
         .unwrap();
     let tags = VectorMatrixView::new(&tag_values, fixture.labels.len(), dim).unwrap();
-    let labels: Vec<_> = fixture.labels.iter().map(String::as_str).collect();
-    let aliases: Vec<_> = fixture.aliases.iter().map(String::as_str).collect();
     let config = ObservationConfig {
         sense: SenseConfig {
             max_transition_records: 16_000,
@@ -154,16 +127,13 @@ fn run_frozen(criterion: &mut Criterion) {
         },
         ..Default::default()
     };
-    let mut assets = AssetBundle::new(tags);
-    assets.transport = Some(fixture.graph.as_csr_view());
-    assets.epa_basis = fixture.basis.as_ref().map(EpaBasis::as_view);
+    let graph = CsrGraph::new(fixture.graph.clone()).unwrap();
     let lexical = TagLexicalMetaView {
         node_count: tags.rows,
-        names: &labels,
+        names: TextRows::Strings(&fixture.labels),
         alias_offsets: &fixture.alias_offsets,
-        aliases: &aliases,
+        aliases: TextRows::Strings(&fixture.aliases),
     };
-    assets.lexical_meta = Some(lexical);
     let provenance = ProvenanceView {
         edge_count: fixture.graph.targets.len(),
         edge_prov_offsets: &fixture.provenance_offsets,
@@ -176,48 +146,50 @@ fn run_frozen(criterion: &mut Criterion) {
         group_roots: &fixture.group_roots,
         group_kinds: &fixture.group_kinds,
     };
-    assets.provenance = Some(provenance);
-    assets.support_groups = Some(groups);
-
-    // Capture host-side exact retrieval; the benchmark measures Nexus only.
+    let assets = PreparedDataset {
+        concept_ids: &[],
+        tags,
+        graph: graph.view(),
+        lexical,
+        basis: fixture.basis.as_ref().map(EpaBasis::as_view),
+        provenance,
+        groups,
+        documents: None,
+        tag_search: None,
+        sources: RootFactView::empty(),
+        counterevidence: CounterevidenceAdjView::empty(),
+    };
+    let nexus = Nexus::from_prepared(assets).unwrap();
     let mut cases = Vec::with_capacity(queries.len());
     let mut route_queries = Vec::new();
-    let base = graph(&config, false);
-    let fanout = graph(&config, true);
-    let same_pool_plan = GraphValidator::validate(&base).unwrap();
-    let fanout_plan = GraphValidator::validate(&fanout).unwrap();
     for (index, query) in queries.iter().enumerate() {
         let recorded = RefCell::new(Vec::new());
-        let recall = |_, residual: &[f32], limit, out: &mut Vec<_>| {
+        let recall = |_,
+                      residual: &[f32],
+                      limit,
+                      out: &mut Vec<_>,
+                      _: Option<&EpaAnalysis>,
+                      excluded: &[NodeId]| {
             out.extend(tags.data.chunks_exact(dim).enumerate().map(|(index, row)| {
                 (
                     NodeId(index as u32),
                     cosine_f32(row, residual, ctx.precision),
                 )
             }));
+            out.retain(|(node, _)| !excluded.contains(node));
             out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
             out.truncate(limit);
             recorded.borrow_mut().push(out.clone());
             Ok(())
         };
-        let observation = observe(
-            &ctx,
-            &config,
-            ObservationInput {
-                query,
-                query_text: &fixture.query_texts[index],
-                candidates: &recall,
-                graph: assets.transport.unwrap(),
-                tag_vectors: tags,
-                lexical_meta: lexical,
-                epa_basis: assets.epa_basis,
-                core_tags: &[],
-                ghost_vectors: None,
-                ghost_is_core: &[],
-            },
-            &mut scratch,
-        )
-        .expect("observe the captured query");
+        let observation = nexus
+            .observe_with_recall(
+                &Query::new(query, &fixture.query_texts[index]),
+                &config,
+                &recall,
+                &ctx,
+            )
+            .expect("observe the captured query");
 
         let scores: Vec<_> = candidate_values
             .chunks_exact(dim)
@@ -248,19 +220,24 @@ fn run_frozen(criterion: &mut Criterion) {
             candidates: &case.stage,
         }];
         let input = ThinkingInput {
-            observation: &observation,
+            trace: observation.complete_trace().unwrap(),
             candidates: fixture.candidates(candidates, &zeros, &case),
             query_cosines: Some(&case.scores),
             stages: &stage,
-            graph: assets.transport.unwrap(),
+            graph: assets.graph,
             provenance,
             support_groups: groups,
             tag_vectors: tags,
         };
-        match ThinkingPlanOperator.execute(&ctx, &ThinkingConfig::default(), input, &mut scratch) {
-            Ok(_) => route_queries.push(index),
-            Err(VcpError::ThinkingUnavailable { .. }) => {}
-            Err(error) => panic!("could not run frozen Thinking: {error}"),
+        let thinking = ThinkingPlanOperator
+            .execute(&ctx, &ThinkingConfig::default(), input)
+            .expect("read the frozen Thinking stage");
+        if thinking.stages[0]
+            .results
+            .iter()
+            .any(|item| item.route.is_some())
+        {
+            route_queries.push(index);
         }
         cases.push(case);
     }
@@ -270,34 +247,138 @@ fn run_frozen(criterion: &mut Criterion) {
         route_queries.len()
     );
 
-    let mut execute = |plan: &ExecutionPlan<'_>, index: usize| {
+    let execute = |fanout: bool, index: usize| {
         let case = &cases[index];
-        let recall = |level: usize, _: &[f32], limit: usize, out: &mut Vec<_>| {
+        let recall = |level: usize,
+                      _: &[f32],
+                      limit: usize,
+                      out: &mut Vec<_>,
+                      _: Option<&EpaAnalysis>,
+                      _: &[NodeId]| {
             if let Some(layer) = case.recalled.get(level) {
                 out.extend(layer.iter().take(limit).copied());
             }
             Ok(())
         };
-        let mut env = ExecutionEnv::new(assets, queries[index]);
-        env.query_text = &fixture.query_texts[index];
-        env.candidates = Some(fixture.candidates(candidates, &zeros, case));
-        env.pyramid_candidates = Some(&recall);
+        let pool = fixture.candidates(candidates, &zeros, case);
         let stages = [ThinkingStageInputView {
             stage_label: "frozen",
             k: 1,
             candidates: &case.stage,
         }];
-        env.thinking_stages = &stages;
-        GraphExecutor::execute(plan, &ctx, &env, &mut scratch)
-            .expect("execute validated frozen graph")
+        let mut plan = Plan::new();
+        let observation = plan
+            .add(Observe, config.clone(), (), |_| {
+                Ok(ObservationInput {
+                    query: queries[index],
+                    query_text: &fixture.query_texts[index],
+                    candidates: &recall,
+                    graph: assets.graph,
+                    tag_vectors: assets.tags,
+                    lexical_meta: assets.lexical,
+                    epa_basis: assets.basis,
+                    core_tags: &[],
+                    ghost_vectors: None,
+                    ghost_is_core: &[],
+                })
+            })
+            .unwrap();
+        let fields = plan
+            .add(
+                ComputeFields,
+                FieldConfig::default(),
+                observation,
+                |inputs| Ok(nexus.field_input(inputs.get()?)),
+            )
+            .unwrap();
+        let calibration = plan
+            .add(
+                PoolCalibrateOperator,
+                PoolCalibrateConfig {
+                    precision: fanout.then_some(PrecisionMode::StrictLeftFold),
+                    ..PoolCalibrateConfig::default()
+                },
+                (observation, fields),
+                |input| {
+                    let (observation, fields) = input.get()?;
+                    Ok(PoolCalibrateInput {
+                        original_query: &observation.original_query,
+                        enhanced_query: &observation.fused.enhanced_query,
+                        fields,
+                        candidates: pool,
+                    })
+                },
+            )
+            .unwrap();
+        let river = plan
+            .add(
+                ReadRiver,
+                RiverConfig {
+                    evidence: EvidencePolicy::Nous,
+                    ..Default::default()
+                },
+                (observation, fields, calibration),
+                |inputs| {
+                    let (observation, fields, calibrated) = inputs.get()?;
+                    Ok(RiverInput {
+                        assets,
+                        observation,
+                        fields,
+                        pool: calibrated,
+                        candidates: pool,
+                    })
+                },
+            )
+            .unwrap();
+        if fanout {
+            let dtsc = plan
+                .add(
+                    ReadDtsc,
+                    nexus::math::DtscConfig::default(),
+                    (observation, calibration),
+                    |inputs| {
+                        let (observation, calibrated) = inputs.get()?;
+                        Ok(ObservedDtscInput {
+                            assets,
+                            observation,
+                            pool: Some(calibrated),
+                            candidates: pool,
+                        })
+                    },
+                )
+                .unwrap();
+            let thinking = plan
+                .add(
+                    ThinkingPlanOperator,
+                    ThinkingConfig::default(),
+                    observation,
+                    |inputs| {
+                        Ok(ThinkingInput {
+                            trace: inputs.get()?.complete_trace()?,
+                            candidates: pool,
+                            query_cosines: Some(&case.scores),
+                            stages: &stages,
+                            graph: assets.graph,
+                            provenance,
+                            support_groups: groups,
+                            tag_vectors: tags,
+                        })
+                    },
+                )
+                .unwrap();
+            plan.run((river, dtsc, thinking), &ctx)
+                .expect("run the unified plan")
+        } else {
+            plan.run(river, &ctx).expect("run the River plan")
+        }
     };
 
-    let mut report_quantiles = |name: &str, plan: &ExecutionPlan<'_>, indices: &[usize]| {
+    let report_quantiles = |name: &str, fanout: bool, indices: &[usize]| {
         let mut samples: Vec<_> = indices
             .iter()
             .map(|&index| {
                 let start = Instant::now();
-                black_box(execute(plan, index));
+                black_box(execute(fanout, index));
                 start.elapsed().as_secs_f64() * 1e3
             })
             .collect();
@@ -309,20 +390,16 @@ fn run_frozen(criterion: &mut Criterion) {
             samples.len()
         );
     };
-    report_quantiles(
-        "same_pool",
-        &same_pool_plan,
-        &(0..queries.len()).collect::<Vec<_>>(),
-    );
+    report_quantiles("same_pool", false, &(0..queries.len()).collect::<Vec<_>>());
     if !route_queries.is_empty() {
-        report_quantiles("shared_river_dtsc_thinking", &fanout_plan, &route_queries);
+        report_quantiles("shared_river_dtsc_thinking", true, &route_queries);
     }
     let mut group = criterion.benchmark_group(format!("frozen_{threads}t"));
     group.throughput(Throughput::Elements(count as u64));
     let mut query_index = 0;
     group.bench_function("same_pool", |b| {
         b.iter(|| {
-            let value = execute(&same_pool_plan, query_index % queries.len());
+            let value = execute(false, query_index % queries.len());
             query_index = query_index.wrapping_add(1);
             black_box(value);
         })
@@ -331,10 +408,7 @@ fn run_frozen(criterion: &mut Criterion) {
         let mut query_index = 0;
         group.bench_function("shared_river_dtsc_thinking", |b| {
             b.iter(|| {
-                let value = execute(
-                    &fanout_plan,
-                    route_queries[query_index % route_queries.len()],
-                );
+                let value = execute(true, route_queries[query_index % route_queries.len()]);
                 query_index = query_index.wrapping_add(1);
                 black_box(value);
             })

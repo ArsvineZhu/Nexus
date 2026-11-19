@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nexus_math::nexus_core::{ExecutionContext, NodeId, Operator, ScratchPad, VectorMatrixView};
+use nexus_math::nexus_core::{ExecutionContext, NodeId, Operator, VectorMatrixView};
 use nexus_math::{
     DtscField, DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig, DtscFieldNode,
     DtscFieldSampleInput, DtscFieldSampleOperator, DtscFieldSampler, DtscNodeInput, DtscSample,
@@ -279,7 +279,7 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
     ];
 
     let ctx = ExecutionContext::default(); // FastSimd default; DTSC must still enforce StrictLeftFold.
-    let mut scratch = ScratchPad::default();
+
     let cfg = DtscFieldConfig::default();
 
     let field = DtscFieldBuildOperator
@@ -290,7 +290,6 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
                 nodes: &nodes,
                 tag_vectors: tag_matrix,
             },
-            &mut scratch,
         )
         .unwrap();
 
@@ -317,7 +316,6 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
                 query_vectors: tag_matrix,
                 inbound: &inbound,
             },
-            &mut scratch,
         )
         .unwrap();
 

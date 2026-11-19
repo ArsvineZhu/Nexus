@@ -2,7 +2,7 @@
 
 use super::{ReadoutItem, RiverReadoutOutput};
 use crate::observation::invalid;
-use nexus_core::{CandidateId, Diagnostics, ExecutionContext, Operator, ScratchPad, VcpResult};
+use nexus_core::{CandidateId, Diagnostics, ExecutionContext, Operator, VcpResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -48,7 +48,6 @@ impl Operator for OmegaRrfFuseOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;

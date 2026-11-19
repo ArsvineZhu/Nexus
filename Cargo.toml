@@ -3,7 +3,7 @@ members = [
     "crates/nexus-core",
     "crates/nexus-math",
     "crates/nexus-vcp",
-    "crates/nexus-graph",
+    "crates/nexus",
 ]
 resolver = "3"
 
@@ -16,7 +16,6 @@ rust-version = "1.97"
 nexus-core = { path = "crates/nexus-core" }
 nexus-math = { path = "crates/nexus-math" }
 nexus-vcp = { path = "crates/nexus-vcp" }
-nexus-graph = { path = "crates/nexus-graph" }
 faer = { version = "0.24.4", default-features = false, features = ["std", "linalg"] }
 wide = "1.7.1"
 rayon = "1.12.0"

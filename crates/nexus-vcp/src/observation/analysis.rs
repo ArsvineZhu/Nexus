@@ -3,9 +3,7 @@
 use super::{finite_vector, invalid};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f32, norm_sq_f64};
 use nexus_core::nnls::solve_nnls_with_ids_f64;
-use nexus_core::{
-    EpaBasisView, ExecutionContext, NodeId, Operator, ScratchPad, VcpResult, VectorMatrixView,
-};
+use nexus_core::{EpaBasisView, ExecutionContext, NodeId, Operator, VcpResult, VectorMatrixView};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -98,7 +96,6 @@ impl Operator for EpaAnalyzeOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -108,7 +105,8 @@ impl Operator for EpaAnalyzeOperator {
         };
         basis.validate(stage)?;
         finite_vector(stage, input.query, basis.dim)?;
-        let centered = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, basis.dim, 0.0);
+        let mut centered_buffer = vec![0.0; basis.dim];
+        let centered = centered_buffer.as_mut_slice();
         for ((slot, &value), &mean) in centered.iter_mut().zip(input.query).zip(basis.mean) {
             *slot = f64::from(value) - mean;
         }
@@ -218,8 +216,15 @@ impl Operator for EpaAnalyzeOperator {
 
 /// The host fills up to `limit` graph-local candidates for the current residual.
 /// The buffer starts empty and its capacity is reused across layers.
-pub type PyramidCandidates<'a> =
-    dyn Fn(usize, &[f32], usize, &mut Vec<(NodeId, f64)>) -> VcpResult<()> + 'a;
+pub type PyramidCandidates<'a> = dyn Fn(
+        usize,
+        &[f32],
+        usize,
+        &mut Vec<(NodeId, f64)>,
+        Option<&EpaAnalysis>,
+        &[NodeId],
+    ) -> VcpResult<()>
+    + 'a;
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -250,6 +255,7 @@ impl Default for PyramidConfig {
 pub struct PyramidAnalyzeInput<'asset, 'query> {
     pub query: &'query [f32],
     pub candidates: &'query PyramidCandidates<'query>,
+    pub epa: Option<&'query EpaAnalysis>,
     pub tag_vectors: VectorMatrixView<'asset, f32>,
 }
 
@@ -355,7 +361,6 @@ impl Operator for PyramidAnalyzeOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -387,12 +392,21 @@ impl Operator for PyramidAnalyzeOperator {
         let mut residual = input.query.to_vec();
         let mut remaining = original_energy;
         let mut candidates = Vec::new();
+        let mut excluded = Vec::new();
         let mut columns = Vec::<Vec<f64>>::new();
         let mut seen = std::collections::HashSet::new();
+        let mut workspace = nexus_core::NnlsWorkspace::default();
         for level in 0..config.max_levels {
             ctx.check_cancelled(stage)?;
             candidates.clear();
-            (input.candidates)(level, &residual, limit, &mut candidates)?;
+            (input.candidates)(
+                level,
+                &residual,
+                limit,
+                &mut candidates,
+                input.epa,
+                &excluded,
+            )?;
             ctx.check_cancelled(stage)?;
             if candidates.len() > limit {
                 return Err(invalid(
@@ -433,7 +447,7 @@ impl Operator for PyramidAnalyzeOperator {
                 .map(|(tag, column)| (i64::from(tag.node.0), column.as_slice()))
                 .collect();
             let solution =
-                solve_nnls_with_ids_f64(&target, &cone, &ctx.limits, &ctx.cancel, scratch)?;
+                solve_nnls_with_ids_f64(&target, &cone, &ctx.limits, &ctx.cancel, &mut workspace)?;
             let energy = solution.residual_norm.powi(2);
             let explained = (remaining - energy).max(0.0) / original_energy;
             if explained <= 0.0 || explained < config.min_layer_explained_energy {
@@ -442,6 +456,7 @@ impl Operator for PyramidAnalyzeOperator {
             for (tag, weight) in tags.iter_mut().zip(solution.weights) {
                 tag.contribution = weight;
             }
+            excluded.extend(tags.iter().map(|tag| tag.node));
             let handshake = handshakes(&residual, &mut tags, input.tag_vectors, ctx);
             output.total_explained_energy += explained;
             output.levels.push(PyramidLevel {

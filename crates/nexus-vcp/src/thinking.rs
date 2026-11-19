@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::observation::invalid;
-use crate::{ObservationState, ObservationTransition};
+use crate::{ObservationState, ObservationTransition, SenseOutput};
 use nexus_core::kernel::cosine_f32;
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, Operator, PathId,
-    ProvenanceView, ScratchPad, SupportGroupView, ThinkingStageInputView, VcpError, VcpResult,
+    ProvenanceView, SupportGroupView, ThinkingStageInputView, VcpError, VcpResult,
     VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
@@ -34,13 +34,46 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// Records all retained transitions from a completed propagation and its original query.
+#[derive(Clone, Copy, Debug)]
+pub struct CompleteTrace<'a> {
+    query: &'a [f32],
+    transitions: &'a [ObservationTransition],
+}
+
+impl<'a> CompleteTrace<'a> {
+    pub fn query(self) -> &'a [f32] {
+        self.query
+    }
+}
+
+impl SenseOutput {
+    pub fn complete_trace<'a>(&'a self, query: &'a [f32]) -> VcpResult<CompleteTrace<'a>> {
+        if !self.transitions_recorded || self.transitions_truncated || self.state_truncations > 0 {
+            return Err(VcpError::ThinkingUnavailable {
+                reason: "propagation trace unavailable or incomplete",
+            });
+        }
+        Ok(CompleteTrace {
+            query,
+            transitions: &self.transitions,
+        })
+    }
+}
+
+impl ObservationState {
+    pub fn complete_trace(&self) -> VcpResult<CompleteTrace<'_>> {
+        self.sense.complete_trace(&self.original_query)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ThinkingInput<'asset, 'query> {
-    pub observation: &'query ObservationState,
-    pub candidates: CandidatePoolView<'query>,
+    pub trace: CompleteTrace<'query>,
+    pub candidates: CandidatePoolView<'asset>,
     /// Query cosines for this pool and execution precision, when already calibrated.
-    pub query_cosines: Option<&'query [f64]>,
-    pub stages: &'query [ThinkingStageInputView<'query>],
+    pub query_cosines: Option<&'asset [f64]>,
+    pub stages: &'asset [ThinkingStageInputView<'asset>],
     pub graph: CsrGraphView<'asset>,
     pub provenance: ProvenanceView<'asset>,
     pub support_groups: SupportGroupView<'asset>,
@@ -115,6 +148,7 @@ fn build_module(
     config: &ThinkingConfig,
     candidate: CandidateId,
     maximum: f64,
+    edges: &HashMap<nexus_core::NodeId, Vec<(usize, ObservationTransition, usize)>>,
 ) -> VcpResult<Module> {
     const STAGE: &str = "thinking.plan";
     let vector = input
@@ -124,7 +158,7 @@ fn build_module(
         .ok_or_else(|| invalid(STAGE, "stage candidate is outside the candidate pool"))?;
     let precision = ctx.precision;
     let relevance = input.query_cosines.map_or_else(
-        || cosine_f32(vector, &input.observation.original_query, precision),
+        || cosine_f32(vector, input.trace.query, precision),
         |scores| scores[candidate.index()],
     );
     let mut routes = Vec::new();
@@ -144,22 +178,17 @@ fn build_module(
                 stamps.entry(node).or_default().push((position, closure));
             }
         }
-        for &edge in &input.observation.sense.transitions {
-            if edge.immediate_return || edge.flow <= 0.0 || edge.source == edge.target {
-                continue;
-            }
-            let (Some(sources), Some(targets)) =
-                (stamps.get(&edge.source), stamps.get(&edge.target))
-            else {
-                continue;
-            };
-            let Some(index) = input
-                .graph
-                .find_edge(edge.source, edge.target)
-                .filter(|&index| input.graph.effective_weight(index) > 0.0)
-            else {
-                continue;
-            };
+        let mut matching: Vec<_> = stamps
+            .keys()
+            .filter_map(|node| edges.get(node))
+            .flatten()
+            .filter(|(_, edge, _)| stamps.contains_key(&edge.target))
+            .copied()
+            .collect();
+        matching.sort_unstable_by_key(|&(order, _, _)| order);
+        for (_, edge, index) in matching {
+            let sources = &stamps[&edge.source];
+            let targets = &stamps[&edge.target];
             let closure = sources
                 .iter()
                 .flat_map(|&(a, ac)| {
@@ -207,27 +236,17 @@ impl Operator for ThinkingPlanOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
-        let observed = &input.observation.sense;
-        if observed.transitions.is_empty()
-            || observed.transitions_truncated
-            || observed.state_truncations > 0
-        {
-            return Err(VcpError::ThinkingUnavailable {
-                reason: "observation transitions are missing or truncated",
-            });
-        }
-        input.graph.validate(stage)?;
+        let start = std::time::Instant::now();
         input.provenance.validate(input.graph.nnz(), stage)?;
         input.support_groups.validate(stage)?;
         input.candidates.validate(stage)?;
         input.tag_vectors.validate(stage)?;
         if input.graph.node_count != input.tag_vectors.rows
             || input.tag_vectors.dim != input.candidates.candidate_vectors.dim
-            || input.tag_vectors.dim != input.observation.original_query.len()
+            || input.tag_vectors.dim != input.trace.query.len()
             || ![
                 config.min_closure,
                 config.relevance_weight,
@@ -249,11 +268,26 @@ impl Operator for ThinkingPlanOperator {
         {
             return Err(invalid(stage, "invalid Thinking inputs or configuration"));
         }
-        let maximum = observed
+        let maximum = input
+            .trace
             .transitions
             .iter()
             .map(|edge| edge.flow)
             .fold(1e-12, f64::max);
+        let mut edges = HashMap::<_, Vec<_>>::new();
+        for (order, &edge) in input.trace.transitions.iter().enumerate() {
+            if !edge.immediate_return
+                && edge.flow > 0.0
+                && edge.source != edge.target
+                && let Some(index) = input.graph.find_edge(edge.source, edge.target)
+                && input.graph.effective_weight(index) > 0.0
+            {
+                edges
+                    .entry(edge.source)
+                    .or_default()
+                    .push((order, edge, index));
+            }
+        }
         let mut chosen = Vec::<ThinkingSelection>::new();
         let mut used_documents = HashSet::new();
         let mut used_edges = HashSet::new();
@@ -266,7 +300,9 @@ impl Operator for ThinkingPlanOperator {
                     && let std::collections::hash_map::Entry::Vacant(entry) =
                         modules.entry(candidate)
                 {
-                    entry.insert(build_module(ctx, input, config, candidate, maximum)?);
+                    entry.insert(build_module(
+                        ctx, input, config, candidate, maximum, &edges,
+                    )?);
                 }
             }
 
@@ -285,14 +321,16 @@ impl Operator for ThinkingPlanOperator {
                     let mut best_route = None;
                     let mut route_score = 0.0;
                     for route in &module.routes {
-                        let potential_parents: Vec<_> = chosen
-                            .iter()
-                            .filter(|prior| {
-                                prior.route.is_some_and(|edge| follows(edge, route.edge))
-                            })
-                            .map(|prior| prior.candidate)
-                            .collect();
-                        if route.edge.hop != 1 && potential_parents.is_empty() {
+                        let potential_parents = || {
+                            chosen
+                                .iter()
+                                .filter(|prior| {
+                                    prior.route.is_some_and(|edge| follows(edge, route.edge))
+                                })
+                                .map(|prior| prior.candidate)
+                        };
+                        let has_parent = potential_parents().next().is_some();
+                        if route.edge.hop != 1 && !has_parent {
                             continue;
                         }
                         let novelty = if used_edges.contains(&route_key(route.edge)) {
@@ -300,7 +338,7 @@ impl Operator for ThinkingPlanOperator {
                         } else {
                             1.0
                         };
-                        let parent_gain = if potential_parents.is_empty() {
+                        let parent_gain = if !has_parent {
                             config.root_no_parent_penalty
                         } else {
                             1.0
@@ -309,7 +347,8 @@ impl Operator for ThinkingPlanOperator {
                         if score > route_score {
                             best_route = Some(*route);
                             route_score = score;
-                            parents = potential_parents;
+                            parents.clear();
+                            parents.extend(potential_parents());
                         }
                     }
                     let relation = match best_route {
@@ -354,14 +393,12 @@ impl Operator for ThinkingPlanOperator {
                 results,
             });
         }
-        if chosen.iter().all(|selection| selection.route.is_none()) {
-            return Err(VcpError::ThinkingUnavailable {
-                reason: "no grounded route in the requested stages",
-            });
-        }
         Ok(ThinkingPlan {
             stages,
-            diagnostics: observed.diagnostics.clone(),
+            diagnostics: Diagnostics {
+                elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+                ..Diagnostics::default()
+            },
         })
     }
 }

@@ -3,8 +3,8 @@
 use super::{GatedSeeds, finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::cosine_f32;
 use nexus_core::{
-    CsrGraphView, Diagnostics, EpochTable, ExecutionContext, NodeId, Operator, ScratchPad,
-    VcpResult, VectorMatrixView,
+    CsrGraphView, Diagnostics, EpochTable, ExecutionContext, NodeId, Operator, VcpResult,
+    VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -110,6 +110,7 @@ pub struct SenseOutput {
     pub nodes: Vec<ObservationNode>,
     pub edges: Vec<ObservationEdge>,
     pub transitions: Vec<ObservationTransition>,
+    pub transitions_recorded: bool,
     pub transitions_truncated: bool,
     pub state_truncations: usize,
     pub diagnostics: Diagnostics,
@@ -121,6 +122,7 @@ impl SenseOutput {
         self.nodes.clear();
         self.edges.clear();
         self.transitions.clear();
+        self.transitions_recorded = false;
         self.transitions_truncated = false;
         self.state_truncations = 0;
         self.diagnostics.truncated = false;
@@ -415,10 +417,13 @@ impl SpikeSenseOperator {
         output: &mut SenseOutput,
     ) -> VcpResult<()> {
         output.reset();
+        let start = std::time::Instant::now();
         let result = self.propagate(ctx, config, input, work, output);
         if result.is_err() {
             output.reset();
             output.diagnostics.truncation_reason = None;
+        } else {
+            output.diagnostics.elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
         }
         result
     }
@@ -434,7 +439,6 @@ impl SpikeSenseOperator {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         let graph = input.graph;
-        graph.validate(stage)?;
         input.tag_vectors.validate(stage)?;
         if input.tag_vectors.rows != graph.node_count {
             return Err(invalid(stage, "tag matrix must cover the graph"));
@@ -473,7 +477,7 @@ impl SpikeSenseOperator {
             work.routing.begin(graph);
         }
         work.clear(graph.node_count);
-        let gamma = config.fir_gamma.clamp(0.05, 0.95);
+        let gamma = config.fir_gamma;
         work.weights
             .extend((0..=config.max_safe_hops).map(|hop| gamma.powi(hop as i32)));
         let total: f64 = work.weights.iter().sum();
@@ -486,6 +490,7 @@ impl SpikeSenseOperator {
         let transition_limit = config
             .max_transition_records
             .min(ctx.limits.max_transition_records);
+        output.transitions_recorded = transition_limit > 0;
         for seed in &input.seeds.seeds {
             ctx.check_cancelled(stage)?;
             if seed.node.index() >= graph.node_count
@@ -717,7 +722,6 @@ impl Operator for SpikeSenseOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let mut output = SenseOutput::default();
         self.execute_into(

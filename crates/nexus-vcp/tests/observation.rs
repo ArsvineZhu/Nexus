@@ -4,12 +4,11 @@ use nexus_core::kernel::csr_spmv_dual;
 use nexus_core::*;
 use nexus_vcp::*;
 use std::cell::RefCell;
-use std::marker::PhantomData;
 
 #[test]
 fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
-    let mut scratch = ScratchPad::new();
+
     let graph = TransportCalibrateOperator
         .execute(
             &ctx,
@@ -23,16 +22,19 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
                 },
                 anchor_gains: &[1.0; 4],
                 edge_gates: None,
-                _marker: PhantomData,
             },
-            &mut scratch,
         )
         .unwrap();
     let graph = graph.as_csr_view();
     let matrix =
         VectorMatrixView::new(&[1., 0., 0., 0.8, 0.6, 0., 0., 0., 1., 0., 1., 0.], 4, 3).unwrap();
     let seen = RefCell::new(Vec::new());
-    let search = |level, residual: &[f32], top_k, output: &mut Vec<_>| {
+    let search = |level,
+                  residual: &[f32],
+                  top_k,
+                  output: &mut Vec<_>,
+                  _: Option<&EpaAnalysis>,
+                  _: &[NodeId]| {
         assert_eq!(top_k, 10);
         assert!(output.is_empty());
         seen.borrow_mut().push(residual.to_vec());
@@ -51,9 +53,9 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
         tag_vectors: matrix,
         lexical_meta: TagLexicalMetaView {
             node_count: 4,
-            names: &["car", "car engine", "repair", "manual"],
+            names: TextRows::Borrowed(&["car", "car engine", "repair", "manual"]),
             alias_offsets: &[0; 5],
-            aliases: &[],
+            aliases: TextRows::Borrowed(&[]),
         },
         epa_basis: Some(EpaBasisView::empty(3)),
         core_tags: &[],
@@ -67,7 +69,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
         },
         ..Default::default()
     };
-    let observed = observe(&ctx, &cfg, input, &mut scratch).unwrap();
+    let observed = Observe.execute(&ctx, &cfg, input).unwrap();
     assert!(!observed.epa.cache_available);
     assert!(observed.epa.in_domain_gate.is_finite());
     assert_eq!(seen.borrow().len(), 2);
@@ -82,21 +84,34 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             .iter()
             .any(|edge| edge.target == NodeId(3))
     );
-    assert!(observed.dual_fields.transfer_field[3] > 0.0);
-    assert!(observed.basins.transfer_support_nodes.contains(&NodeId(3)));
+    let cfg_fields = FieldConfig::default();
+    let fields = ComputeFields
+        .execute(
+            &ctx,
+            &cfg_fields,
+            FieldInput {
+                graph,
+                tag_vectors: matrix,
+                sense: &observed.sense,
+                fused: &observed.fused,
+            },
+        )
+        .unwrap();
+    assert!(fields.dual_fields.transfer_field[3] > 0.0);
+    assert!(fields.basins.transfer_support_nodes.contains(&NodeId(3)));
 
     seen.borrow_mut().clear();
-    let explicit = observe(
-        &ctx,
-        &cfg,
-        ObservationInput {
-            core_tags: &[NodeId(0)],
-            graph: graph.with_edge_gates(&[0.0]).unwrap(),
-            ..input
-        },
-        &mut scratch,
-    )
-    .unwrap();
+    let explicit = Observe
+        .execute(
+            &ctx,
+            &cfg,
+            ObservationInput {
+                core_tags: &[NodeId(0)],
+                graph: graph.with_edge_gates(&[0.0]).unwrap(),
+                ..input
+            },
+        )
+        .unwrap();
     assert!(explicit.disambiguated.pruned_hypernyms.is_empty());
     assert!(
         explicit
@@ -106,9 +121,21 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             .any(|seed| seed.node == NodeId(0) && seed.is_core)
     );
     assert!(explicit.sense.edges.is_empty());
-    assert_eq!(explicit.dual_fields.transfer_field[3], 0.0);
+    let explicit_fields = ComputeFields
+        .execute(
+            &ctx,
+            &cfg_fields,
+            FieldInput {
+                graph: graph.with_edge_gates(&[0.0]).unwrap(),
+                tag_vectors: matrix,
+                sense: &explicit.sense,
+                fused: &explicit.fused,
+            },
+        )
+        .unwrap();
+    assert_eq!(explicit_fields.dual_fields.transfer_field[3], 0.0);
 
-    let fields = &observed.dual_fields;
+    let fields = &fields.dual_fields;
     let mut local = [0.0; 4];
     let mut transfer = [0.0; 4];
     csr_spmv_dual(
@@ -125,8 +152,12 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
         source[node.index()] += mass;
     }
     for (alpha, field, propagated) in [
-        (cfg.fields.local_alpha, &fields.local_field, local),
-        (cfg.fields.transfer_alpha, &fields.transfer_field, transfer),
+        (cfg_fields.solve.local_alpha, &fields.local_field, local),
+        (
+            cfg_fields.solve.transfer_alpha,
+            &fields.transfer_field,
+            transfer,
+        ),
     ] {
         let residual: f64 = source
             .iter()
@@ -140,7 +171,9 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
 
 #[test]
 fn pyramid_propagates_host_failure() {
-    let host = |_, _: &[f32], _, _: &mut Vec<_>| Err(VcpError::Cancelled { stage: "host" });
+    let host = |_, _: &[f32], _, _: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
+        Err(VcpError::Cancelled { stage: "host" })
+    };
     let result = PyramidAnalyzeOperator.execute(
         &ExecutionContext::default(),
         &PyramidConfig::default(),
@@ -148,8 +181,8 @@ fn pyramid_propagates_host_failure() {
             query: &[1.],
             tag_vectors: VectorMatrixView::new(&[1.], 1, 1).unwrap(),
             candidates: &host,
+            epa: None,
         },
-        &mut ScratchPad::new(),
     );
     assert!(matches!(result, Err(VcpError::Cancelled { stage: "host" })));
 }

@@ -610,11 +610,78 @@ impl Operator for LocalConeAgsOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "LocalConeAgsOperator::execute";
         let start_time = Instant::now();
         ctx.check_cancelled(STAGE)?;
+        if config.max_neighbors == 0
+            || config.min_neighbors == 0
+            || config.min_neighbors > config.max_neighbors
+            || config.max_basis == 0
+            || config.star_neighbors == 0
+        {
+            return Err(crate::observation::invalid(
+                STAGE,
+                "min_neighbors and max_neighbors must be ordered and positive; max_basis and star_neighbors must be positive",
+            ));
+        }
+        for (name, value, min, max) in [
+            ("min_gain", config.min_gain, 0.0, 1.0),
+            ("position_decay", config.position_decay, 0.0, f64::INFINITY),
+            ("star_mix", config.star_mix, 0.0, 1.0),
+            (
+                "semantic_gate_sigma",
+                config.semantic_gate_sigma,
+                0.02,
+                f64::INFINITY,
+            ),
+            ("semantic_gate_peak", config.semantic_gate_peak, -1.0, 1.0),
+            (
+                "semantic_gate_hard_floor",
+                config.semantic_gate_hard_floor,
+                -1.0,
+                1.0,
+            ),
+            ("semantic_gate_floor", config.semantic_gate_floor, 0.0, 1.0),
+            (
+                "anchor_gain_min",
+                config.anchor_gain_min,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "anchor_gain_max",
+                config.anchor_gain_max,
+                config.anchor_gain_min,
+                f64::INFINITY,
+            ),
+            (
+                "anchor_gain_base",
+                config.anchor_gain_base,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "anchor_gain_gamma",
+                config.anchor_gain_gamma,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "anchor_gain_scale",
+                config.anchor_gain_scale,
+                0.0,
+                f64::INFINITY,
+            ),
+            (
+                "reorth_loss_threshold",
+                config.reorth_loss_threshold,
+                0.0,
+                1.0,
+            ),
+        ] {
+            crate::parameter(STAGE, name, value, min, max)?;
+        }
 
         input.tag_vectors.validate(STAGE)?;
         let node_count = input.tag_vectors.rows;
@@ -672,7 +739,7 @@ impl Operator for LocalConeAgsOperator {
             }
         }
 
-        let position_decay = config.position_decay.max(0.0);
+        let position_decay = config.position_decay;
         let pair_limit = ctx.limits.pair_work_limit;
         let mut pair_work = 0usize;
         let mut seq_buf: Vec<(u32, NodeId)> = Vec::new();
@@ -722,7 +789,7 @@ impl Operator for LocalConeAgsOperator {
             }
         }
 
-        let max_keep = config.max_neighbors.max(config.star_neighbors).max(1);
+        let max_keep = config.max_neighbors.max(config.star_neighbors);
         let cmp_edge = |a: &(usize, f64), b: &(usize, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
 
         let mut node_supports = Vec::with_capacity(node_count);
@@ -761,15 +828,15 @@ impl Operator for LocalConeAgsOperator {
             }
         }
 
-        let max_neighbors = config.max_neighbors.max(1);
-        let min_neighbors = config.min_neighbors.max(1);
-        let max_basis = config.max_basis.max(1);
-        let sigma = config.semantic_gate_sigma.max(0.02);
-        let anchor_low = config.anchor_gain_min.min(config.anchor_gain_max);
-        let anchor_high = config.anchor_gain_min.max(config.anchor_gain_max);
+        let max_neighbors = config.max_neighbors;
+        let min_neighbors = config.min_neighbors;
+        let max_basis = config.max_basis;
+        let sigma = config.semantic_gate_sigma;
+        let anchor_low = config.anchor_gain_min;
+        let anchor_high = config.anchor_gain_max;
 
         let compute_node = |i: usize,
-                            local_scratch: &mut ScratchPad|
+                            local_scratch: &mut nexus_core::NnlsWorkspace|
          -> VcpResult<(IntrinsicResidual, f64, bool, Vec<f64>)> {
             ctx.check_cancelled(STAGE)?;
             let node_id = NodeId(i as u32);
@@ -808,7 +875,7 @@ impl Operator for LocalConeAgsOperator {
             let row_end = row_offsets[i + 1];
 
             // Precompute star direction for GlobalEpaOperator parity.
-            let star_end = row_end.min(row_start + config.star_neighbors.max(1));
+            let star_end = row_end.min(row_start + config.star_neighbors);
             let star_slice = &valid_edges[row_start..star_end];
             let star_vecs: Vec<&[f64]> = star_slice
                 .iter()
@@ -947,15 +1014,16 @@ impl Operator for LocalConeAgsOperator {
             ctx.parallel.install(|| {
                 (0..node_count)
                     .into_par_iter()
-                    .map_init(ScratchPad::new, |local_scratch, i| {
+                    .map_init(nexus_core::NnlsWorkspace::default, |local_scratch, i| {
                         compute_node(i, local_scratch)
                     })
                     .collect::<VcpResult<Vec<_>>>()
             })?
         } else {
             let mut out = Vec::with_capacity(node_count);
+            let mut workspace = nexus_core::NnlsWorkspace::default();
             for i in 0..node_count {
-                out.push(compute_node(i, scratch)?);
+                out.push(compute_node(i, &mut workspace)?);
             }
             out
         };
@@ -1006,11 +1074,26 @@ impl Operator for GlobalEpaOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         const STAGE: &str = "GlobalEpaOperator::execute";
         let start_time = Instant::now();
         ctx.check_cancelled(STAGE)?;
+        if config.candidate_pool == 0 || config.k_max == 0 {
+            return Err(crate::observation::invalid(
+                STAGE,
+                "candidate_pool and k_max must be positive",
+            ));
+        }
+        for (name, value, min) in [
+            ("min_gain", config.min_gain, 0.0),
+            ("knee_delta", config.knee_delta, 0.0),
+            ("epsilon", config.epsilon, 0.0),
+            ("min_support", config.min_support, 0.0),
+            ("support_exponent", config.support_exponent, 0.0),
+            ("residual_exponent", config.residual_exponent, 0.0),
+        ] {
+            crate::parameter(STAGE, name, value, min, f64::INFINITY)?;
+        }
 
         input.tag_vectors.validate(STAGE)?;
         let node_count = input.tag_vectors.rows;
@@ -1133,7 +1216,7 @@ impl Operator for GlobalEpaOperator {
         }
 
         pool.sort_by(|a, b| b.prior.total_cmp(&a.prior).then(a.id.cmp(&b.id)));
-        pool.truncate(config.candidate_pool.max(1));
+        pool.truncate(config.candidate_pool);
 
         let centered: Vec<Vec<f64>> = pool
             .iter()
@@ -1162,7 +1245,7 @@ impl Operator for GlobalEpaOperator {
             &refs,
             None,
             None,
-            config.k_max.max(1),
+            config.k_max,
             config.min_gain,
             1e-3,
             true,

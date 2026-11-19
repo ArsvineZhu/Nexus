@@ -29,3 +29,11 @@ From Nexus, run the capture script against a disposable VCPToolBox checkout pinn
 python scripts/capture-vcp-golden.py temp/reference/VCPToolBox crates/nexus-vcp/tests/fixtures/vcp_5adb12b.json
 cargo test -p nexus-vcp --test upstream_golden --all-features --locked
 ```
+
+## DTSC field and curve references
+
+The [field](../crates/nexus-math/tests/fixtures/vcp-dtsc-field.json) and [curve](../crates/nexus-math/tests/fixtures/vcp-dtsc.json) fixtures are the original numerical corpus in Nous-Wave at `412b062`. Their embedded capture revision is `e03b891d42055cdf3cab5dc961cc71dd5facd65a`. The standalone DTSC tests exercise field sampling, trusted scoring and the low-trust input-order result through the public operators.
+
+## Warped Chunk reference
+
+[The exact Chunk test](../crates/nexus-vcp/tests/hyperbolic.rs) captures a query radius and four distances from the pinned VCPToolBox quantile, direction transform and Clairaut routines. It also exercises scoped navigation followed by exact reranking.

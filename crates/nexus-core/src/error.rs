@@ -39,8 +39,6 @@ pub enum VcpError {
     },
     #[error("THINKING_UNAVAILABLE: {reason}")]
     ThinkingUnavailable { reason: &'static str },
-    #[error("GRAPH_VALIDATION_ERROR: {detail}")]
-    GraphValidation { detail: String },
     #[error("NUMERIC_DIVERGENCE at `{stage}`: {detail}")]
     NumericDivergence { stage: &'static str, detail: String },
 }

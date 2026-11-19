@@ -41,7 +41,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
         "5adb12bb55e616e22bd0e0dbfdc13032c069941a"
     );
     let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
-    let mut scratch = ScratchPad::default();
+
     for case in rows(&source, "nnls") {
         let query: Vec<f64> = decode(&case["query"]);
         let ids: Vec<i64> = decode(&case["ids"]);
@@ -55,7 +55,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
             &columns,
             &ctx.limits,
             &ctx.cancel,
-            &mut scratch,
+            &mut NnlsWorkspace::default(),
         )
         .unwrap();
         matching_values(
@@ -111,7 +111,6 @@ fn upstream_nnls_projection_and_cone_geometry() {
                     sequences: SequenceSliceView::empty(),
                     explicit_edges: Some(&edges),
                 },
-                &mut scratch,
             )
             .unwrap();
         let target = &geometry.intrinsics[0];
@@ -135,7 +134,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
 fn upstream_hypernym_and_dedup_contracts() {
     let source = fixture();
     let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
-    let mut scratch = ScratchPad::default();
+
     for case in rows(&source, "hypernym") {
         let query: Vec<f32> = decode(&case["query"]);
         let names: Vec<String> = decode(&case["names"]);
@@ -184,15 +183,14 @@ fn upstream_hypernym_and_dedup_contracts() {
                     tag_vectors: VectorMatrixView::new(&flat, vectors.len(), dim).unwrap(),
                     lexical_meta: TagLexicalMetaView {
                         node_count: vectors.len(),
-                        names: &names,
+                        names: TextRows::Borrowed(&names),
                         alias_offsets: &[0, 0, 0],
-                        aliases: &[],
+                        aliases: TextRows::Borrowed(&[]),
                     },
                     core_tags: cores,
                     seed_contribution_floor: 0.05,
                     seed_contribution_ratio: 0.1,
                 },
-                &mut scratch,
             )
             .unwrap();
         let parents: Vec<_> = decode::<Vec<u32>>(&case["parents"])
@@ -242,7 +240,6 @@ fn upstream_hypernym_and_dedup_contracts() {
                     )
                     .unwrap(),
                 },
-                &mut scratch,
             )
             .unwrap();
         let upstream: Vec<_> = decode::<Vec<u32>>(&case["survivors"])
@@ -267,7 +264,7 @@ fn sparse_field(value: &Value, count: usize) -> Vec<f64> {
     result
 }
 
-fn observation(input: &Value, count: usize) -> ObservationState {
+fn observation(input: &Value, count: usize) -> (ObservationState, FieldState) {
     let state = &input["queryState"];
     let calibration = &input["calibration"];
     let nodes = state["riverNodes"]
@@ -312,62 +309,66 @@ fn observation(input: &Value, count: usize) -> ObservationState {
             .map(|id| NodeId(id - 1))
             .collect()
     };
-    ObservationState {
-        original_query: decode(&input["query"]["vector"]),
-        epa: EpaAnalysis::default(),
-        pyramid: PyramidResidual {
-            coverage: decode(&calibration["explainedRatio"]),
-            ..PyramidResidual::default()
+    (
+        ObservationState {
+            original_query: decode(&input["query"]["vector"]),
+            epa: EpaAnalysis::default(),
+            pyramid: PyramidResidual {
+                coverage: decode(&calibration["explainedRatio"]),
+                ..PyramidResidual::default()
+            },
+            disambiguated: DisambiguatedTags {
+                differentia_confidence: decode(&calibration["differentiaConfidence"]),
+                differentia_q_perp: Some(decode(&calibration["differentiaVector"])),
+                pruned_hypernyms: ids(&calibration["supersededIds"]),
+                ..DisambiguatedTags::default()
+            },
+            gated_seeds: GatedSeeds {
+                exact_focus: Some(NodeId(decode::<u32>(&calibration["exactFocusId"]) - 1)),
+                ..GatedSeeds::default()
+            },
+            fused: FusedObservation {
+                enhanced_query: decode(&input["denoisedVector"]),
+                ..FusedObservation::default()
+            },
+            sense: SenseOutput {
+                nodes,
+                edges,
+                source_field: decode::<Vec<(u32, f64)>>(&state["sourceField"])
+                    .into_iter()
+                    .map(|(id, mass)| (NodeId(id - 1), mass))
+                    .collect(),
+                ..SenseOutput::default()
+            },
         },
-        disambiguated: DisambiguatedTags {
-            differentia_confidence: decode(&calibration["differentiaConfidence"]),
-            differentia_q_perp: Some(decode(&calibration["differentiaVector"])),
-            pruned_hypernyms: ids(&calibration["supersededIds"]),
-            ..DisambiguatedTags::default()
+        FieldState {
+            dual_fields: DualFields {
+                local_domain: ids(&state["localDomainIds"]),
+                transfer_domain: ids(&state["transferDomainIds"]),
+                local_field: sparse_field(&state["localField"], count),
+                transfer_field: sparse_field(&state["transferField"], count),
+                ..DualFields::default()
+            },
+            basins: BasinSupports {
+                local_vector: decode(&input["localVector"]),
+                transfer_vector: decode(&input["transferVector"]),
+                ..BasinSupports::default()
+            },
         },
-        gated_seeds: GatedSeeds {
-            exact_focus: Some(NodeId(decode::<u32>(&calibration["exactFocusId"]) - 1)),
-            ..GatedSeeds::default()
-        },
-        fused: FusedObservation {
-            enhanced_query: decode(&input["denoisedVector"]),
-            ..FusedObservation::default()
-        },
-        dual_fields: DualFields {
-            local_domain: ids(&state["localDomainIds"]),
-            transfer_domain: ids(&state["transferDomainIds"]),
-            local_field: sparse_field(&state["localField"], count),
-            transfer_field: sparse_field(&state["transferField"], count),
-            ..DualFields::default()
-        },
-        basins: BasinSupports {
-            local_vector: decode(&input["localVector"]),
-            transfer_vector: decode(&input["transferVector"]),
-            ..BasinSupports::default()
-        },
-        sense: SenseOutput {
-            nodes,
-            edges,
-            source_field: decode::<Vec<(u32, f64)>>(&state["sourceField"])
-                .into_iter()
-                .map(|(id, mass)| (NodeId(id - 1), mass))
-                .collect(),
-            ..SenseOutput::default()
-        },
-    }
+    )
 }
 
 #[test]
 fn upstream_river_and_cross_file_wormhole_scores() {
     let source = fixture();
     let ctx = ExecutionContext::default().with_precision(PrecisionMode::StrictLeftFold);
-    let mut scratch = ScratchPad::default();
+
     for (case, wormhole) in rows(&source, "river")
         .iter()
         .map(|v| (v, false))
         .chain(rows(&source, "wormhole").iter().map(|v| (v, true)))
     {
-        let state = observation(&case["input"], 5);
+        let (state, fields) = observation(&case["input"], 5);
         let tag_values: Vec<_> = decode::<Vec<Vec<f32>>>(&case["tags"])
             .into_iter()
             .flatten()
@@ -392,18 +393,20 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 Some(*offset)
             }))
             .collect();
-        let graph = CsrGraphView {
+        let wormhole_flags = [wormhole];
+        let graph = CsrGraphView::new(CsrParts {
             node_count: 5,
             row_offsets: &[0, 1, 1, 1, 1, 1],
             targets: &[NodeId(2)],
             weights: &[0.8],
-            is_static_wormhole: &[wormhole],
+            is_static_wormhole: &wormhole_flags,
             inbound: &[0.0, 0.0, 0.8, 0.0, 0.0],
             max_inbound: 0.8,
             anchor_gains: &[1.0; 5],
             target_sorted_indices: None,
             edge_gates: None,
-        };
+        })
+        .unwrap();
         let candidates = CandidatePoolView {
             candidate_count: 3,
             baseline_scores: &[0.91, 0.83, 0.67],
@@ -426,10 +429,11 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 &ctx,
                 &PoolCalibrateConfig::default(),
                 PoolCalibrateInput {
-                    observation: &state,
+                    original_query: &state.original_query,
+                    enhanced_query: &state.fused.enhanced_query,
+                    fields: &fields,
                     candidates,
                 },
-                &mut scratch,
             )
             .unwrap();
         let has_provenance: bool = decode(&case["has_provenance"]);
@@ -454,6 +458,8 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 &RiverReadoutConfig::default(),
                 RiverReadoutInput {
                     observation: &state,
+                    fields: &fields,
+                    evidence: EvidencePolicy::Nous,
                     pool: &pool,
                     candidates,
                     graph,
@@ -461,7 +467,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                     support_groups: SupportGroupView::empty(),
                     tag_vectors,
                 },
-                &mut scratch,
             )
             .unwrap();
         let result = if wormhole {
@@ -487,7 +492,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                         },
                         tag_vectors,
                     },
-                    &mut scratch,
                 )
                 .unwrap()
         } else {
@@ -526,7 +530,7 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             close(
                 case,
                 &name("semantic base"),
-                item.baseline_score,
+                item.base_score,
                 decode(&expected["base_score"]),
                 2e-7,
             );
@@ -540,19 +544,19 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             if !has_provenance && item.candidate == CandidateId(1) {
                 // The upstream assumes complete independence when attribution
                 // is absent. The Nous contract retains only its 0.15 floor.
-                assert!(item.wormhole_bonus < decode::<f64>(&expected["graph_bonus"]));
+                assert!(item.graph_bonus < decode::<f64>(&expected["graph_bonus"]));
                 close(
                     case,
                     &name("quality sum"),
                     item.quality_score,
-                    item.baseline_score + item.path_bonus + item.wormhole_bonus,
+                    item.base_score + item.path_bonus + item.graph_bonus,
                     1e-12,
                 );
             } else {
                 close(
                     case,
                     &name("graph and transport bonus"),
-                    item.wormhole_bonus,
+                    item.graph_bonus,
                     decode(&expected["graph_bonus"]),
                     2e-7,
                 );
@@ -564,7 +568,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                     2e-7,
                 );
             }
-            assert_eq!(item.anchor_bonus.to_bits(), 0);
         }
     }
 }

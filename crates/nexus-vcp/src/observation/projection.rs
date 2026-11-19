@@ -3,7 +3,7 @@
 use super::{DualFields, SenseOutput, finite_vector, invalid};
 use nexus_core::kernel::normalize_f64;
 use nexus_core::{
-    CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator, ScratchPad, VcpError, VcpResult,
+    CsrGraphView, Diagnostics, ExecutionContext, NodeId, Operator, VcpError, VcpResult,
     VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
@@ -212,12 +212,10 @@ impl Operator for BasinProjectionOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         let graph = input.graph;
-        graph.validate(stage)?;
         input.tag_vectors.validate(stage)?;
         let fields = [
             input.dual_fields.local_field.as_slice(),
@@ -383,9 +381,10 @@ impl Operator for BasinProjectionOperator {
                 lane.gain = 0.5 * lane.gain + 0.5 * gain / outer as f64;
             }
         }
-        let mut project = |field: usize| -> VcpResult<Vec<f32>> {
+        let project = |field: usize| -> VcpResult<Vec<f32>> {
             let dim = input.tag_vectors.dim;
-            let vector = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, dim, 0.0);
+            let mut vector_buffer = vec![0.0; dim];
+            let vector = vector_buffer.as_mut_slice();
             for &node in &ids[field] {
                 let values = input.tag_vectors.row(node.index()).unwrap();
                 finite_vector(stage, values, dim)?;

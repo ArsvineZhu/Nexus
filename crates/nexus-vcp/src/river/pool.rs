@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use crate::ObservationState;
+use crate::FieldState;
 use crate::observation::{finite_vector, invalid};
 use nexus_core::kernel::{all_finite_f32, batch_cosines_f32};
 use nexus_core::{
-    CandidateId, CandidatePoolView, ExecutionContext, Operator, PathId, PrecisionMode, ScratchPad,
-    VcpResult, VectorMatrixView,
+    CandidateId, CandidatePoolView, ExecutionContext, Operator, PathId, PrecisionMode, VcpResult,
+    VectorMatrixView,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -30,8 +30,10 @@ impl Default for PoolCalibrateConfig {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PoolCalibrateInput<'asset, 'query> {
-    pub observation: &'asset ObservationState,
-    pub candidates: CandidatePoolView<'query>,
+    pub original_query: &'query [f32],
+    pub enhanced_query: &'query [f32],
+    pub fields: &'query FieldState,
+    pub candidates: CandidatePoolView<'asset>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -55,7 +57,6 @@ impl PoolCalibrateOperator {
         ctx: &ExecutionContext<'_>,
         config: &PoolCalibrateConfig,
         input: PoolCalibrateInput<'_, '_>,
-        scratch: &mut ScratchPad,
         output: &mut PreparedCandidatePool,
     ) -> VcpResult<()> {
         let stage = self.name();
@@ -63,12 +64,12 @@ impl PoolCalibrateOperator {
         ctx.check_cancelled(stage)?;
         let pool = input.candidates;
         pool.validate(stage)?;
-        let observation = input.observation;
+        let fields = input.fields;
         let queries = [
-            observation.original_query.as_slice(),
-            observation.fused.enhanced_query.as_slice(),
-            observation.basins.local_vector.as_slice(),
-            observation.basins.transfer_vector.as_slice(),
+            input.original_query,
+            input.enhanced_query,
+            fields.basins.local_vector.as_slice(),
+            fields.basins.transfer_vector.as_slice(),
         ];
         for query in queries {
             finite_vector(stage, query, pool.candidate_vectors.dim)?;
@@ -128,13 +129,15 @@ impl PoolCalibrateOperator {
         output.domain_anchor_counts.resize(count, 0);
         output.domain_anchor_counts.fill(0);
         if config.compute_anchor_contacts {
-            let dim = observation.dual_fields.local_field.len();
-            let (anchors, anchor_epoch) = scratch.epochs.next_epoch(dim);
-            for &node in observation
+            let dim = fields.dual_fields.local_field.len();
+            let mut anchor_table = nexus_core::EpochTable::default();
+            let mut counted_table = nexus_core::EpochTable::default();
+            let (anchors, anchor_epoch) = anchor_table.next_epoch(dim);
+            for &node in fields
                 .dual_fields
                 .local_domain
                 .iter()
-                .chain(&observation.dual_fields.transfer_domain)
+                .chain(&fields.dual_fields.transfer_domain)
             {
                 *anchors
                     .get_mut(node.index())
@@ -146,7 +149,7 @@ impl PoolCalibrateOperator {
                 let candidate = CandidateId::from_index(index, stage)?;
                 let mut best = 0;
                 for path in pool.candidate_paths(candidate) {
-                    let (counted, epoch) = scratch.epochs_aux.next_epoch(dim);
+                    let (counted, epoch) = counted_table.next_epoch(dim);
                     let mut count = 0;
                     for &node in pool.path_steps(PathId::from_index(path, stage)?).0 {
                         let slot = node.index();
@@ -180,10 +183,9 @@ impl Operator for PoolCalibrateOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let mut output = PreparedCandidatePool::default();
-        self.execute_into(ctx, config, input, scratch, &mut output)?;
+        self.execute_into(ctx, config, input, &mut output)?;
         Ok(output)
     }
 }

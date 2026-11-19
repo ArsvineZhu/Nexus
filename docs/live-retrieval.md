@@ -1,12 +1,12 @@
 # Live vector retrieval
 
-The live verification embeds ten passages, their concept tags and seven queries through a host-supplied OpenAI-compatible endpoint. The Rust example constructs geometry, facts, transport and provenance from those vectors. Each query runs dense cosine retrieval, residual tag recall, observation and River scoring. It reports the dense winner, River winner, topology contribution and expected rank.
+The example embeds ten passages, concept tags and seven queries through an OpenAI-compatible endpoint. Nexus prepares the geometry and graph, recalls through the warped Chunk and Tag fields, and ranks with RiverMemo. The example borrows the same assets for independent DTSC and Thinking calls and for one typed combination sharing the observation.
 
-Provide an authorized model API key through `NEXUS_EMBEDDING_KEY`. Pass the gateway's `/v1` endpoint and embedding model name explicitly. The script writes the returned vectors into ignored local storage when the destination is under `temp/`.
+Supply the gateway's `/v1` endpoint and embedding model explicitly. Pass an authorized key in `NEXUS_EMBEDDING_KEY`. The generated vectors can be kept in the local `temp/` directory and replayed without calling the model again.
 
 ```sh
 python scripts/live-retrieval.py temp/live-retrieval/embeddings.json --endpoint "$EMBEDDING_ENDPOINT" --model "$EMBEDDING_MODEL"
-cargo run -p nexus-graph --example live_retrieval --locked -- temp/live-retrieval/embeddings.json
+cargo run -p nexus --example live_retrieval --locked -- temp/live-retrieval/embeddings.json
 ```
 
-The queries have fixed expected passages. This example tests that the model output can drive the full retrieval path and checks expected top results on the sample. Use the [frozen corpus benchmark](benchmarks.md) to study larger inputs.
+The output shows the expected rank, score, topology contribution, observation size and number of grounded routes. Use the [frozen corpus benchmark](benchmarks.md) for larger host-style inputs.

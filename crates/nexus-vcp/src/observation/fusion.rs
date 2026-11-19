@@ -2,9 +2,7 @@
 
 use super::{GatedSeeds, SenseOutput, finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::{cosine_f32, norm_sq_f32, normalize_f64};
-use nexus_core::{
-    Diagnostics, ExecutionContext, NodeId, Operator, ScratchPad, VcpResult, VectorMatrixView,
-};
+use nexus_core::{Diagnostics, ExecutionContext, NodeId, Operator, VcpResult, VectorMatrixView};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -73,11 +71,13 @@ impl Operator for ObservationFuseOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         input.tag_vectors.validate(stage)?;
+        if config.max_fusion_tags == 0 {
+            return Err(invalid(stage, "max_fusion_tags must be positive"));
+        }
         let dim = input.tag_vectors.dim;
         finite_vector(stage, input.query, dim)?;
         if !(-1.0..=1.0).contains(&config.deduplication_threshold)
@@ -204,7 +204,7 @@ impl Operator for ObservationFuseOperator {
                 .then(a.node.cmp(&b.node))
                 .then(ai.cmp(bi))
         });
-        vectors.truncate(config.max_fusion_tags.clamp(1, 1024));
+        vectors.truncate(config.max_fusion_tags);
         let mut selected = Vec::<(FusionTag, &[f32])>::new();
         for (candidate, _, vector) in vectors {
             ctx.check_cancelled(stage)?;
@@ -224,7 +224,8 @@ impl Operator for ObservationFuseOperator {
         }
         let mut enhanced_query = input.query.to_vec();
         if mass > 0.0 {
-            let context = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, dim, 0.0);
+            let mut context_buffer = vec![0.0; dim];
+            let context = context_buffer.as_mut_slice();
             for (tag, vector) in &selected {
                 for (out, value) in context.iter_mut().zip(*vector) {
                     *out += f64::from(*value) * (tag.weight / mass);

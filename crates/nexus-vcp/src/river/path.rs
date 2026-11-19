@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{PathEvidence, QueryMorphology, RiverReadoutConfig, RiverReadoutInput};
+use super::{PathEvidence, QueryMode, QueryMorphology, RiverReadoutConfig, RiverReadoutInput};
 use nexus_core::kernel::{cosine_f32, cosine_f32_with_norms, norm_sq_f32};
 use nexus_core::{CandidateId, ExecutionContext, NodeId, PathId, VcpError, VcpResult};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,6 +43,9 @@ pub(super) struct ReadoutWorkspace<'r, 'asset, 'query, 'ctx> {
     pub(super) input: RiverReadoutInput<'asset, 'query>,
     pub(super) config: &'r RiverReadoutConfig,
     pub(super) active: &'r HashMap<(NodeId, NodeId), f64>,
+    pub(super) topology_edges: &'r [(crate::ObservationEdge, usize, f64)],
+    pub(super) ordinary: &'r HashMap<NodeId, f64>,
+    pub(super) max_hop: f64,
     pub(super) explicit_seeds: &'r HashSet<NodeId>,
     pub(super) hops: &'r HashMap<NodeId, usize>,
     pub(super) focus_targets: &'r HashSet<NodeId>,
@@ -93,8 +96,8 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let state = self.input.observation;
         let fields = self.fields;
         let domains = [
-            &state.dual_fields.local_domain,
-            &state.dual_fields.transfer_domain,
+            &self.input.fields.dual_fields.local_domain,
+            &self.input.fields.dual_fields.transfer_domain,
         ];
         let mut result = FieldContact {
             potential: fields.map(|field| field[tag.index()]),
@@ -128,12 +131,11 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
     }
 
     fn path_quality(&mut self, steps: &[Step]) -> VcpResult<f64> {
-        let state = self.input.observation;
         let graph = self.input.graph;
         let fields = self.fields;
         let domains = [
-            &state.dual_fields.local_domain,
-            &state.dual_fields.transfer_domain,
+            &self.input.fields.dual_fields.local_domain,
+            &self.input.fields.dual_fields.transfer_domain,
         ];
         let mut used = HashSet::new();
         let mut quality = 0.0;
@@ -269,7 +271,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         graph.closure =
             chosen.values().map(|a| a.step.closure).sum::<f64>() / chosen.len().max(1) as f64;
 
-        let max_hop = self.hops.values().copied().max().unwrap_or(0).max(1) as f64;
+        let max_hop = self.max_hop;
         let span = steps
             .first()
             .zip(steps.last())
@@ -282,14 +284,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
             mut direction_mass,
             mut topology_mass,
         ] = [0.0; 5];
-        for edge in state
-            .sense
-            .edges
-            .iter()
-            .filter(|edge| self.active.contains_key(&(edge.source, edge.target)))
-            .take(96)
-        {
-            let weight = self.active[&(edge.source, edge.target)];
+        for &(edge, index, weight) in self.topology_edges {
             total_edge += weight;
             let (Some(a), Some(b)) = (chosen.get(&edge.source), chosen.get(&edge.target)) else {
                 continue;
@@ -304,16 +299,18 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
             } else {
                 0.25
             };
-            let index = self
-                .input
-                .graph
-                .find_edge(edge.source, edge.target)
-                .unwrap();
-            let independent = self.input.provenance.independent_fraction_excluding(
-                index,
-                roots,
-                &self.input.support_groups,
-            );
+            let independent = if self.input.evidence == super::EvidencePolicy::Vcp
+                && self.input.provenance.edge_prov_offsets[index]
+                    == self.input.provenance.edge_prov_offsets[index + 1]
+            {
+                1.0
+            } else {
+                self.input.provenance.independent_fraction_excluding(
+                    index,
+                    roots,
+                    &self.input.support_groups,
+                )
+            };
             let endpoint = (a.quality * b.quality).sqrt();
             matched_edge += weight * endpoint;
             distance_mass += weight * endpoint * distance;
@@ -412,6 +409,10 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
                 base: raw,
                 path_bonus: 0.0,
                 graph_bonus: 0.0,
+                path_quality: 0.0,
+                field_support: 0.0,
+                node_alignment: 0.0,
+                edge_coverage: 0.0,
                 ordinary_transport: 0.0,
                 genus_gate: 1.0,
                 anchor_contacts: 0,
@@ -522,8 +523,7 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
         let evidence = self.topology(candidate, &steps)?;
         let node_branch = (evidence.node_coverage / 0.35).min(1.0);
         let edge_branch = (evidence.edge_coverage / 0.20).min(1.0);
-        let mode = self.morphology.dominant_mode.as_str();
-        let branch = if mode == "atomic" {
+        let branch = if self.morphology.dominant_mode == QueryMode::Atomic {
             node_branch
         } else if evidence.has_edges {
             0.70 * edge_branch + 0.30 * node_branch
@@ -548,44 +548,27 @@ impl ReadoutWorkspace<'_, '_, '_, '_> {
             * direction
             * grounding
             * self.path_gate;
-        let mut ordinary_transport = 0.0_f64;
-        for edge in &state.sense.edges {
-            if edge.wormhole
-                || edge.immediate_return
-                || !self.explicit_seeds.contains(&edge.source)
-                || self.hops.get(&edge.target) != Some(&1)
-                || edge.flow <= 0.0
-                || state.sense.state_truncations > 0
-            {
-                continue;
-            }
-            let Some(closure) = steps
+        let ordinary_transport = if self.ordinary.is_empty() {
+            0.0
+        } else {
+            steps
                 .iter()
-                .filter(|step| step.node == edge.target)
-                .map(|step| step.closure)
-                .max_by(f64::total_cmp)
-            else {
-                continue;
-            };
-            let row = input.graph.row_range(edge.source);
-            let mut sum = 0.0;
-            let mut max = 0.0_f64;
-            for edge in row {
-                let weight = input.graph.effective_weight(edge);
-                sum += weight;
-                max = max.max(weight);
-            }
-            let conductance = input.graph.edge_weight(edge.source, edge.target);
-            if sum > 0.0 && conductance > 0.0 && conductance >= 0.5 * max {
-                ordinary_transport =
-                    ordinary_transport.max(conductance / sum * closure * self.path_gate);
-            }
-        }
+                .filter_map(|step| {
+                    self.ordinary
+                        .get(&step.node)
+                        .map(|conductance| conductance * step.closure * self.path_gate)
+                })
+                .fold(0.0_f64, f64::max)
+        };
         Ok(PathEvidence {
             path,
             base,
             path_bonus,
             graph_bonus,
+            path_quality: geometry,
+            field_support: support,
+            node_alignment: evidence.node_alignment,
+            edge_coverage: evidence.edge_coverage,
             ordinary_transport,
             genus_gate: genus,
             anchor_contacts: anchors,

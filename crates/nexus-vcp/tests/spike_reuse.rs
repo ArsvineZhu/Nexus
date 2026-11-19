@@ -17,7 +17,7 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         dynamic_wormhole_slots: 1,
         ..Default::default()
     };
-    let graph = CsrGraphView {
+    let graph = CsrGraphView::new(CsrParts {
         node_count: 3,
         row_offsets: &[0, 2, 2, 3],
         targets: &[NodeId(1), NodeId(2), NodeId(0)],
@@ -28,7 +28,8 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         anchor_gains: &[0.0; 3],
         target_sorted_indices: None,
         edge_gates: None,
-    };
+    })
+    .unwrap();
     let tag_vectors = VectorMatrixView::new(&[1., 0., 1., 0., 0., 1.], 3, 2).unwrap();
     let seeds = GatedSeeds {
         seeds: vec![GatedSeed {
@@ -48,9 +49,9 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         residuals: Some(&residuals),
     };
     let ctx = ExecutionContext::default();
-    let expected = SpikeSenseOperator
-        .execute(&ctx, &config, input, &mut ScratchPad::new())
-        .unwrap();
+    let mut expected = SpikeSenseOperator.execute(&ctx, &config, input).unwrap();
+    assert!(expected.diagnostics.elapsed_ms > 0.0);
+    expected.diagnostics.elapsed_ms = 0.0;
     assert!(expected.transitions_truncated);
     assert!(
         expected
@@ -75,6 +76,8 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
     let after = dhat::HeapStats::get();
     drop(profile);
     assert_eq!(before.total_blocks, after.total_blocks);
+    assert!(output.diagnostics.elapsed_ms > 0.0);
+    output.diagnostics.elapsed_ms = 0.0;
     assert_eq!(output, expected);
 
     let count = AtomicUsize::new(0);
@@ -89,6 +92,8 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
     SpikeSenseOperator
         .execute_into(&ctx, &config, input, &mut work, &mut output)
         .unwrap();
+    assert!(output.diagnostics.elapsed_ms > 0.0);
+    output.diagnostics.elapsed_ms = 0.0;
     assert_eq!(output, expected);
 
     let gates = [1.0, 0.0, 1.0];

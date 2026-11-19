@@ -2,9 +2,7 @@
 
 use super::{DtscFieldConfig, unit};
 use nexus_core::kernel::{cosine_f32_with_norms, norm_sq_f32};
-use nexus_core::{
-    ExecutionContext, NodeId, Operator, PrecisionMode, ScratchPad, VcpError, VectorMatrixView,
-};
+use nexus_core::{ExecutionContext, NodeId, Operator, PrecisionMode, VcpError, VectorMatrixView};
 
 #[derive(Clone, Debug)]
 pub struct DtscNodeInput {
@@ -188,13 +186,13 @@ impl Operator for DtscFieldBuildOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> Result<Self::Output, VcpError> {
         const STAGE: &str = "dtsc_field_build";
         ctx.check_cancelled(STAGE)?;
+        config.validate()?;
         input.tag_vectors.validate(STAGE)?;
 
-        let minimum = config.min_field_tags.max(1);
+        let minimum = config.min_field_tags;
         let input_order_nodes: Vec<&DtscNodeInput> = input
             .nodes
             .iter()
@@ -248,8 +246,8 @@ impl Operator for DtscFieldBuildOperator {
 
         let mut retained = 0;
         let mut mass = 0.0;
-        let max_nodes = config.max_field_nodes.max(minimum);
-        let mass_ratio = config.field_energy_mass_ratio.clamp(0.5, 1.0);
+        let max_nodes = config.max_field_nodes;
+        let mass_ratio = config.field_energy_mass_ratio;
         for n in &sorted_nodes {
             if retained >= max_nodes
                 || (retained >= minimum && mass / total_energy.max(1e-12) >= mass_ratio)
@@ -316,10 +314,10 @@ impl Operator for DtscFieldSampleOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'asset, 'query>,
-        _scratch: &mut ScratchPad,
     ) -> Result<Self::Output, VcpError> {
         const STAGE: &str = "dtsc_field_sample";
         ctx.check_cancelled(STAGE)?;
+        config.validate()?;
         input.query_vectors.validate(STAGE)?;
         if input.query_ids.len() != input.query_vectors.rows {
             return Err(VcpError::DimensionMismatch {

@@ -10,11 +10,11 @@ pub use ranking::*;
 pub use wormhole::*;
 
 use crate::observation::{finite_vector, invalid};
-use crate::{ObservationState, SeedSourceKind};
+use crate::{FieldState, ObservationState, SeedSourceKind, SenseOutput};
 use nexus_core::kernel::norm_sq_f32;
 use nexus_core::{
     CandidateId, CandidatePoolView, CsrGraphView, Diagnostics, ExecutionContext, Operator, PathId,
-    ProvenanceView, ScratchPad, SupportGroupView, VcpResult, VectorMatrixView,
+    ProvenanceView, SupportGroupView, VcpResult, VectorMatrixView,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,8 @@ impl Default for RiverReadoutConfig {
 #[derive(Clone, Copy, Debug)]
 pub struct RiverReadoutInput<'asset, 'query> {
     pub observation: &'query ObservationState,
+    pub fields: &'query FieldState,
+    pub evidence: EvidencePolicy,
     pub pool: &'query PreparedCandidatePool,
     pub candidates: CandidatePoolView<'query>,
     pub graph: CsrGraphView<'asset>,
@@ -60,13 +62,29 @@ pub struct RiverReadoutInput<'asset, 'query> {
     pub tag_vectors: VectorMatrixView<'asset, f32>,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub enum EvidencePolicy {
+    #[default]
+    Vcp,
+    Nous,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryMode {
+    #[default]
+    Atomic,
+    Propositional,
+    Narrative,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueryMorphology {
     pub atomic_weight: f64,
     pub propositional_weight: f64,
     pub narrative_weight: f64,
     pub confidence: f64,
-    pub dominant_mode: String,
+    pub dominant_mode: QueryMode,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -83,26 +101,31 @@ pub struct OmegaOutput {
 pub struct ReadoutItem {
     pub candidate: CandidateId,
     pub chosen_path: Option<PathId>,
-    pub baseline_score: f64,
+    /// Semantic base and field resonance (B).
+    pub base_score: f64,
     pub path_bonus: f64,
-    pub wormhole_bonus: f64,
-    pub anchor_bonus: f64,
+    /// Graph and transmission evidence after applying the shared budget (G).
+    pub graph_bonus: f64,
     pub quality_score: f64,
     pub ranking_score: f64,
-    pub omega_contribution: f64,
+    pub topology_bonus: f64,
     pub genus_gate: f64,
     pub direct_anchor_contacts: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PathEvidence {
-    path: Option<PathId>,
-    base: f64,
-    path_bonus: f64,
-    graph_bonus: f64,
-    ordinary_transport: f64,
-    genus_gate: f64,
-    anchor_contacts: u8,
+pub struct PathEvidence {
+    pub path: Option<PathId>,
+    pub base: f64,
+    pub path_bonus: f64,
+    pub graph_bonus: f64,
+    pub path_quality: f64,
+    pub field_support: f64,
+    pub node_alignment: f64,
+    pub edge_coverage: f64,
+    pub ordinary_transport: f64,
+    pub genus_gate: f64,
+    pub anchor_contacts: u8,
 }
 
 impl PathEvidence {
@@ -121,13 +144,12 @@ impl PathEvidence {
         ReadoutItem {
             candidate,
             chosen_path: self.path,
-            baseline_score: self.base,
+            base_score: self.base,
             path_bonus: self.path_bonus,
-            wormhole_bonus: bonus,
-            anchor_bonus: 0.0,
+            graph_bonus: bonus,
             quality_score: score,
             ranking_score: score,
-            omega_contribution: self.path_bonus + bonus,
+            topology_bonus: self.path_bonus + bonus,
             genus_gate: self.genus_gate,
             direct_anchor_contacts: self.anchor_contacts,
         }
@@ -142,7 +164,7 @@ pub struct RiverReadoutOutput {
     pub diagnostics: Diagnostics,
     // Per-path raw evidence allows cross-file transport to reselect the winning
     // complete path, and recompute the bounded composition without compounding it.
-    path_evidence: Vec<Vec<PathEvidence>>,
+    pub path_evidence: Vec<Vec<PathEvidence>>,
     budget: f64,
     gamma: f64,
 }
@@ -151,9 +173,9 @@ fn explicit(kind: SeedSourceKind) -> bool {
     matches!(kind, SeedSourceKind::Core | SeedSourceKind::LexicalSeed)
 }
 
-fn omega(observation: &ObservationState, complete: bool) -> OmegaOutput {
-    let nodes = &observation.sense.nodes;
-    let edges = &observation.sense.edges;
+fn omega(sense: &SenseOutput, coverage: f64, complete: bool) -> OmegaOutput {
+    let nodes = &sense.nodes;
+    let edges = &sense.edges;
     let seeds = nodes.iter().filter(|node| node.hop == 0).count();
     let seed_count = seeds.max(1) as f64;
     let omega_edge = (edges.len() as f64 / (0.5 * seed_count)).min(1.0);
@@ -181,7 +203,7 @@ fn omega(observation: &ObservationState, complete: bool) -> OmegaOutput {
     let factor = if complete { 1.0 } else { 0.5 };
     let value = (omega_edge.max(0.02) * omega_emerge.max(0.02) * omega_flow.max(0.02)).cbrt()
         * factor
-        * observation.pyramid.coverage.clamp(0.0, 1.0);
+        * coverage.clamp(0.0, 1.0);
     let regime = if value < 0.12 {
         "collapsed"
     } else if value < 0.45 {
@@ -199,9 +221,9 @@ fn omega(observation: &ObservationState, complete: bool) -> OmegaOutput {
     }
 }
 
-fn morphology(observation: &ObservationState, complete: bool, slots: usize) -> QueryMorphology {
-    let nodes = &observation.sense.nodes;
-    let edges = &observation.sense.edges;
+fn morphology(sense: &SenseOutput, complete: bool, slots: usize) -> QueryMorphology {
+    let nodes = &sense.nodes;
+    let edges = &sense.edges;
     let mut hops = vec![0; slots];
     let mut degrees = vec![[0_usize; 2]; slots];
     let energies = || nodes.iter().map(|node| (node, node.normalized_energy));
@@ -290,30 +312,64 @@ fn morphology(observation: &ObservationState, complete: bool, slots: usize) -> Q
     let [atomic, propositional, narrative] =
         weights.map(|value| confidence * value / sum + (1.0 - confidence) / 3.0);
     let mode = if atomic >= propositional && atomic >= narrative {
-        "atomic"
+        QueryMode::Atomic
     } else if narrative >= propositional {
-        "narrative"
+        QueryMode::Narrative
     } else {
-        "propositional"
+        QueryMode::Propositional
     };
     QueryMorphology {
         atomic_weight: atomic,
         propositional_weight: propositional,
         narrative_weight: narrative,
         confidence,
-        dominant_mode: mode.into(),
+        dominant_mode: mode,
     }
 }
 
+/// Query-level evidence, computed independently of candidate paths.
+pub fn analyze_river_network(
+    sense: &SenseOutput,
+    coverage: f64,
+    slots: usize,
+) -> VcpResult<(OmegaOutput, QueryMorphology)> {
+    if !coverage.is_finite()
+        || sense.nodes.iter().any(|node| node.node.index() >= slots)
+        || sense
+            .edges
+            .iter()
+            .any(|edge| edge.source.index() >= slots || edge.target.index() >= slots)
+    {
+        return Err(invalid(
+            "river.network",
+            "coverage and river network must match the graph",
+        ));
+    }
+    let complete = !sense.source_field.is_empty() && sense.state_truncations == 0;
+    Ok((
+        omega(sense, coverage, complete),
+        morphology(sense, complete, slots),
+    ))
+}
+
+pub struct RiverPathAnalysis {
+    pub paths: Vec<Vec<PathEvidence>>,
+    pub omega: OmegaOutput,
+    pub morphology: QueryMorphology,
+}
+
+/// Measures candidate paths without performing cross-file fusion or ranking.
+pub struct AnalyzeRiverPaths;
+
 pub struct RiverReadoutOperator;
 
-impl Operator for RiverReadoutOperator {
+impl Operator for AnalyzeRiverPaths {
     type Config = RiverReadoutConfig;
     type Input<'asset, 'query> = RiverReadoutInput<'asset, 'query>;
-    type Output = RiverReadoutOutput;
+    type Output = RiverPathAnalysis;
 
     fn name(&self) -> &'static str {
-        "river.readout"
+        "river.paths"
     }
 
     fn execute(
@@ -321,16 +377,14 @@ impl Operator for RiverReadoutOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        _: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
         input.candidates.validate(stage)?;
-        input.graph.validate(stage)?;
         input.tag_vectors.validate(stage)?;
         input.provenance.validate(input.graph.nnz(), stage)?;
         input.support_groups.validate(stage)?;
-        if !(0.0..=TOPOLOGY_BUDGET).contains(&config.unified_budget_ct)
+        if !(0.0..=1.0).contains(&config.unified_budget_ct)
             || ![
                 config.semantic_field_inherit_cos,
                 config.tag_align_min_cos,
@@ -375,14 +429,14 @@ impl Operator for RiverReadoutOperator {
                 .iter()
                 .any(|edge| edge.source.index() >= n || edge.target.index() >= n)
             || [
-                &state.dual_fields.local_field,
-                &state.dual_fields.transfer_field,
+                &input.fields.dual_fields.local_field,
+                &input.fields.dual_fields.transfer_field,
             ]
             .into_iter()
             .any(|field| field.len() != n || field.iter().any(|v| !v.is_finite() || *v < 0.0))
             || [
-                &state.dual_fields.local_domain,
-                &state.dual_fields.transfer_domain,
+                &input.fields.dual_fields.local_domain,
+                &input.fields.dual_fields.transfer_domain,
                 &state.disambiguated.pruned_hypernyms,
             ]
             .into_iter()
@@ -394,16 +448,20 @@ impl Operator for RiverReadoutOperator {
             ));
         }
         finite_vector(stage, &state.original_query, vectors.dim)?;
-        let active: HashMap<_, _> = state
-            .sense
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                let flow = observed_flow(edge);
-                (flow >= 0.015 && input.graph.edge_weight(edge.source, edge.target) > 0.0)
-                    .then_some(((edge.source, edge.target), flow))
-            })
-            .collect();
+        let mut topology_edges = Vec::new();
+        let mut active = HashMap::new();
+        for edge in &state.sense.edges {
+            let flow = observed_flow(edge);
+            if flow >= 0.015
+                && let Some(index) = input.graph.find_edge(edge.source, edge.target)
+                && input.graph.effective_weight(index) > 0.0
+            {
+                active.insert((edge.source, edge.target), flow);
+                if topology_edges.len() < 96 {
+                    topology_edges.push((*edge, index, flow));
+                }
+            }
+        }
         let explicit_seeds: HashSet<_> = state
             .sense
             .nodes
@@ -417,6 +475,32 @@ impl Operator for RiverReadoutOperator {
             .iter()
             .map(|node| (node.node, node.hop))
             .collect();
+        let mut ordinary = HashMap::<_, f64>::new();
+        let mut row_statistics = HashMap::new();
+        if state.sense.state_truncations == 0 {
+            for edge in &state.sense.edges {
+                if edge.wormhole
+                    || edge.immediate_return
+                    || edge.flow <= 0.0
+                    || !explicit_seeds.contains(&edge.source)
+                    || hops.get(&edge.target) != Some(&1)
+                {
+                    continue;
+                }
+                let (sum, max) = *row_statistics.entry(edge.source).or_insert_with(|| {
+                    input
+                        .graph
+                        .row_range(edge.source)
+                        .map(|e| input.graph.effective_weight(e))
+                        .fold((0.0, 0.0_f64), |(sum, max), w| (sum + w, max.max(w)))
+                });
+                let conductance = input.graph.edge_weight(edge.source, edge.target);
+                if sum > 0.0 && conductance > 0.0 && conductance >= 0.5 * max {
+                    let retained = ordinary.entry(edge.target).or_default();
+                    *retained = retained.max(conductance / sum);
+                }
+            }
+        }
         let focus = state
             .gated_seeds
             .exact_focus
@@ -440,16 +524,17 @@ impl Operator for RiverReadoutOperator {
         } else {
             HashSet::new()
         };
-        let complete = !state.sense.source_field.is_empty() && state.sense.state_truncations == 0;
-        let omega = omega(state, complete);
-        let morphology = morphology(state, complete, n);
+        let (omega, morphology) = analyze_river_network(&state.sense, state.pyramid.coverage, n)?;
         let path_gate = if omega.omega > 0.0 {
             omega.omega.powf(config.omega_gamma)
         } else {
             0.0
         };
-        let field_mix = [&state.basins.local_vector, &state.basins.transfer_vector]
-            .map(|vector| norm_sq_f32(vector, ctx.precision) > 1e-12);
+        let field_mix = [
+            &input.fields.basins.local_vector,
+            &input.fields.basins.transfer_vector,
+        ]
+        .map(|vector| norm_sq_f32(vector, ctx.precision) > 1e-12);
         let tag_norms: Vec<_> = (0..vectors.rows)
             .map(|index| {
                 vectors
@@ -458,8 +543,8 @@ impl Operator for RiverReadoutOperator {
             })
             .collect();
         let fields = [
-            &state.dual_fields.local_field,
-            &state.dual_fields.transfer_field,
+            &input.fields.dual_fields.local_field,
+            &input.fields.dual_fields.transfer_field,
         ]
         .map(|field| {
             let peak = field.iter().copied().fold(0.0, f64::max);
@@ -473,6 +558,9 @@ impl Operator for RiverReadoutOperator {
             input,
             config,
             active: &active,
+            topology_edges: &topology_edges,
+            ordinary: &ordinary,
+            max_hop: hops.values().copied().max().unwrap_or(0).max(1) as f64,
             explicit_seeds: &explicit_seeds,
             hops: &hops,
             focus_targets: &focus_targets,
@@ -498,8 +586,7 @@ impl Operator for RiverReadoutOperator {
             if variants.is_empty() {
                 variants.push(workspace.score(candidate, None)?);
             }
-            let item = select_path(candidate, &variants, config.unified_budget_ct, |_| 0.0);
-            Ok((item, variants))
+            Ok(variants)
         };
         let results = if ctx.parallel.is_parallel() && count >= 128 {
             ctx.parallel.install(|| {
@@ -514,14 +601,54 @@ impl Operator for RiverReadoutOperator {
                 .map(|index| score(&mut workspace, index))
                 .collect::<VcpResult<Vec<_>>>()?
         };
-        let (mut items, cache): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        Ok(RiverPathAnalysis {
+            paths: results,
+            omega,
+            morphology,
+        })
+    }
+}
+
+impl Operator for RiverReadoutOperator {
+    type Config = RiverReadoutConfig;
+    type Input<'asset, 'query> = RiverReadoutInput<'asset, 'query>;
+    type Output = RiverReadoutOutput;
+
+    fn name(&self) -> &'static str {
+        "river.readout"
+    }
+
+    fn execute(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        config: &Self::Config,
+        input: Self::Input<'_, '_>,
+    ) -> VcpResult<Self::Output> {
+        let start = std::time::Instant::now();
+        let analysis = AnalyzeRiverPaths.execute(ctx, config, input)?;
+        let mut items = analysis
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, paths)| {
+                Ok(select_path(
+                    CandidateId::from_index(index, self.name())?,
+                    paths,
+                    config.unified_budget_ct,
+                    |_| 0.0,
+                ))
+            })
+            .collect::<VcpResult<Vec<_>>>()?;
         sort_items(&mut items, input.candidates);
         Ok(RiverReadoutOutput {
             items,
-            omega,
-            morphology,
-            diagnostics: state.sense.diagnostics.clone(),
-            path_evidence: cache,
+            omega: analysis.omega,
+            morphology: analysis.morphology,
+            diagnostics: Diagnostics {
+                elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+                ..Diagnostics::default()
+            },
+            path_evidence: analysis.paths,
             budget: config.unified_budget_ct,
             gamma: config.omega_gamma,
         })
@@ -546,8 +673,8 @@ fn select_path(
         .iter()
         .map(|&path| path.item(candidate, cap, evidence(path.path)))
         .max_by(|a, b| {
-            a.omega_contribution
-                .total_cmp(&b.omega_contribution)
+            a.topology_bonus
+                .total_cmp(&b.topology_bonus)
                 .then_with(|| b.chosen_path.cmp(&a.chosen_path))
         })
         .expect("a candidate has at least its pathless fallback")

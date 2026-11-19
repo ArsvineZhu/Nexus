@@ -3,7 +3,7 @@
 use crate::observation::{finite_vector, invalid};
 use nexus_core::kernel::{dot_f32, norm_sq_f32};
 use nexus_core::{
-    CandidateId, Diagnostics, ExecutionContext, Operator, PrecisionMode, ScratchPad, VcpResult,
+    CandidateId, Diagnostics, ExecutionContext, Operator, PrecisionMode, VcpResult,
     VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
@@ -111,9 +111,9 @@ impl Operator for CosineDedupOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
+        let mut suffix = Vec::new();
         ctx.check_cancelled(stage)?;
         input.candidate_vectors.validate(stage)?;
         if !(-1.0..=1.0).contains(&config.threshold) || config.bound_block == 0 {
@@ -137,7 +137,7 @@ impl Operator for CosineDedupOperator {
             finite_vector(stage, vector, input.candidate_vectors.dim)?;
             let norm = norm_sq_f32(vector, mode).sqrt();
             if bounded {
-                fill_suffix(vector, block, &mut scratch.f64_buf_a);
+                fill_suffix(vector, block, &mut suffix);
             }
             let mut matched = None;
             for (index, prior) in representatives.iter().enumerate() {
@@ -146,14 +146,7 @@ impl Operator for CosineDedupOperator {
                     continue;
                 }
                 let cosine = if bounded && index < config.bound_slow_budget {
-                    bounded_cosine(
-                        prior,
-                        vector,
-                        norm,
-                        &scratch.f64_buf_a,
-                        block,
-                        config.threshold,
-                    )
+                    bounded_cosine(prior, vector, norm, &suffix, block, config.threshold)
                 } else {
                     Some(dot_f32(vector, prior.vector, mode) / (norm * prior.norm))
                 };
@@ -175,7 +168,7 @@ impl Operator for CosineDedupOperator {
                     vector,
                     norm,
                     suffix: if bounded && representatives.len() < config.bound_slow_budget {
-                        scratch.f64_buf_a.clone()
+                        suffix.clone()
                     } else {
                         Vec::new()
                     },

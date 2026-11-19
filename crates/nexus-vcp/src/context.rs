@@ -3,8 +3,7 @@
 use crate::observation::{finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::{dot_f32, norm_sq_f32, normalize_f64};
 use nexus_core::{
-    ContextFragmentsView, Diagnostics, ExecutionContext, Operator, ScratchPad, VcpResult,
-    VectorMatrixView,
+    ContextFragmentsView, Diagnostics, ExecutionContext, Operator, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -151,7 +150,6 @@ impl Operator for ContextAggregateOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -177,7 +175,8 @@ impl Operator for ContextAggregateOperator {
         type Grouped<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<usize>>>;
         let mut groups = Grouped::new();
         let mut seen = BTreeSet::new();
-        let norm = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, fragments.count, 0.0);
+        let mut norm_buffer = vec![0.0; fragments.count];
+        let norm = norm_buffer.as_mut_slice();
         for (row, scale) in norm.iter_mut().enumerate() {
             ctx.check_cancelled(stage)?;
             let [key, role, phase] = [
@@ -208,7 +207,8 @@ impl Operator for ContextAggregateOperator {
         }
         let mut allocations = Vec::new();
         let mut role_diagnostics = Vec::new();
-        let combined = ScratchPad::prepare_f64(&mut scratch.f64_buf_b, dim, 0.0);
+        let mut combined_buffer = vec![0.0; dim];
+        let combined = combined_buffer.as_mut_slice();
         for ((phase, role), parents) in groups {
             ctx.check_cancelled(stage)?;
             let mut parents: Vec<_> = parents.into_values().collect();
@@ -341,7 +341,6 @@ impl Operator for ContextSegmentOperator {
         ctx: &ExecutionContext<'_>,
         config: &Self::Config,
         input: Self::Input<'_, '_>,
-        scratch: &mut ScratchPad,
     ) -> VcpResult<Self::Output> {
         let stage = self.name();
         ctx.check_cancelled(stage)?;
@@ -356,7 +355,8 @@ impl Operator for ContextSegmentOperator {
         let mut result = ContextSegments::default();
         let mut start = 0;
         let mut previous = None;
-        let mean = ScratchPad::prepare_f64(&mut scratch.f64_buf_a, vectors.dim, 0.0);
+        let mut mean_buffer = vec![0.0; vectors.dim];
+        let mean = mean_buffer.as_mut_slice();
         let append = |range: SegmentRange,
                       mean: &mut [f64],
                       result: &mut ContextSegments|

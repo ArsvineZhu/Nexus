@@ -6,7 +6,7 @@ use nexus_vcp::*;
 #[test]
 fn context_mass_is_invariant_under_twenty_disjoint_fragments() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
+
     for count in [1, 20] {
         let keys: Vec<_> = (0..count).map(|row| row.to_string()).collect();
         let names: Vec<_> = keys.iter().map(String::as_str).collect();
@@ -38,7 +38,6 @@ fn context_mass_is_invariant_under_twenty_disjoint_fragments() {
                     fragments,
                     fragment_vectors: VectorMatrixView::new(&values, count, 1).unwrap(),
                 },
-                &mut scratch,
             )
             .unwrap();
         let contribution = result
@@ -56,7 +55,6 @@ fn context_mass_is_invariant_under_twenty_disjoint_fragments() {
             &ctx,
             &ContextSegmentConfig::default(),
             ContextSegmentInput { vectors: matrix },
-            &mut scratch,
         )
         .unwrap();
     assert_eq!(
@@ -80,15 +78,13 @@ fn suffix_pruning_matches_unbounded_greedy_dedup() {
         candidate_vectors: VectorMatrixView::new(&values, 25, dim).unwrap(),
     };
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
+
     for threshold in [0.1, 0.5, 0.92, 1.0] {
         let config = CosineDedupConfig {
             threshold,
             ..Default::default()
         };
-        let bounded = CosineDedupOperator
-            .execute(&ctx, &config, input, &mut scratch)
-            .unwrap();
+        let bounded = CosineDedupOperator.execute(&ctx, &config, input).unwrap();
         let exact = CosineDedupOperator
             .execute(
                 &ctx,
@@ -97,7 +93,6 @@ fn suffix_pruning_matches_unbounded_greedy_dedup() {
                     ..config
                 },
                 input,
-                &mut scratch,
             )
             .unwrap();
         assert_eq!(bounded, exact);
@@ -107,9 +102,9 @@ fn suffix_pruning_matches_unbounded_greedy_dedup() {
 #[test]
 fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
+
     let tag_vectors = VectorMatrixView::new(&[1., 0., 1., 0., 0., 1., 0., 1.], 4, 2).unwrap();
-    let graph = CsrGraphView {
+    let graph = CsrGraphView::new(CsrParts {
         node_count: 4,
         row_offsets: &[0, 1, 1, 1, 1],
         targets: &[NodeId(2)],
@@ -120,34 +115,47 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
         anchor_gains: &[0.0; 4],
         target_sorted_indices: None,
         edge_gates: None,
-    };
-    let recall = |_, _: &[f32], _, out: &mut Vec<_>| {
+    })
+    .unwrap();
+    let recall = |_, _: &[f32], _, out: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
         out.push((NodeId(0), 1.0));
         Ok(())
     };
-    let observation = observe(
-        &ctx,
-        &ObservationConfig::default(),
-        ObservationInput {
-            graph,
-            tag_vectors,
-            query: &[1., 0.],
-            candidates: &recall,
-            query_text: "source",
-            lexical_meta: TagLexicalMetaView {
-                names: &["source", "focus", "target", "bridge"],
-                node_count: 4,
-                alias_offsets: &[0; 5],
-                aliases: &[],
+    let observation = Observe
+        .execute(
+            &ctx,
+            &ObservationConfig::default(),
+            ObservationInput {
+                graph,
+                tag_vectors,
+                query: &[1., 0.],
+                candidates: &recall,
+                query_text: "source",
+                lexical_meta: TagLexicalMetaView {
+                    names: TextRows::Borrowed(&["source", "focus", "target", "bridge"]),
+                    node_count: 4,
+                    alias_offsets: &[0; 5],
+                    aliases: TextRows::Borrowed(&[]),
+                },
+                epa_basis: None,
+                core_tags: &[NodeId(0), NodeId(1)],
+                ghost_vectors: None,
+                ghost_is_core: &[],
             },
-            epa_basis: None,
-            core_tags: &[NodeId(0), NodeId(1)],
-            ghost_vectors: None,
-            ghost_is_core: &[],
-        },
-        &mut scratch,
-    )
-    .unwrap();
+        )
+        .unwrap();
+    let fields = ComputeFields
+        .execute(
+            &ctx,
+            &FieldConfig::default(),
+            FieldInput {
+                graph,
+                tag_vectors,
+                sense: &observation.sense,
+                fused: &observation.fused,
+            },
+        )
+        .unwrap();
     let candidates = CandidatePoolView {
         candidate_count: 2,
         baseline_scores: &[0.0; 2],
@@ -170,10 +178,11 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             &ctx,
             &PoolCalibrateConfig::default(),
             PoolCalibrateInput {
-                observation: &observation,
+                original_query: &observation.original_query,
+                enhanced_query: &observation.fused.enhanced_query,
+                fields: &fields,
                 candidates,
             },
-            &mut scratch,
         )
         .unwrap();
     let river = RiverReadoutOperator
@@ -182,6 +191,8 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             &RiverReadoutConfig::default(),
             RiverReadoutInput {
                 observation: &observation,
+                fields: &fields,
+                evidence: EvidencePolicy::Nous,
                 pool: &pool,
                 candidates,
                 graph,
@@ -194,7 +205,6 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
                 },
                 support_groups: SupportGroupView::empty(),
             },
-            &mut scratch,
         )
         .unwrap();
     let input = CrossFileWormholeInput {
@@ -221,12 +231,7 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
         },
     };
     let augmented = CrossFileWormholeOperator
-        .execute(
-            &ctx,
-            &CrossFileWormholeConfig::default(),
-            input,
-            &mut scratch,
-        )
+        .execute(&ctx, &CrossFileWormholeConfig::default(), input)
         .unwrap();
     for item in &augmented.items {
         let baseline = river
@@ -235,17 +240,14 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
             .find(|row| row.candidate == item.candidate)
             .unwrap();
         if item.candidate == CandidateId(0) {
-            assert_eq!(
-                baseline.wormhole_bonus.to_bits(),
-                item.wormhole_bonus.to_bits()
-            );
+            assert_eq!(baseline.graph_bonus.to_bits(), item.graph_bonus.to_bits());
         } else {
-            assert!(item.wormhole_bonus > baseline.wormhole_bonus);
+            assert!(item.graph_bonus > baseline.graph_bonus);
         }
-        assert!(item.path_bonus + item.wormhole_bonus <= 0.08);
+        assert!(item.path_bonus + item.graph_bonus <= 0.08);
     }
     let reranked = WormholeRrfFuseOperator
-        .execute(&ctx, &WormholeRrfFuseConfig::default(), input, &mut scratch)
+        .execute(&ctx, &WormholeRrfFuseConfig::default(), input)
         .unwrap();
     assert!(reranked.rrf_active);
     for item in &reranked.items {
@@ -269,9 +271,9 @@ fn cross_file_evidence_requires_independent_witnesses_and_rrf_keeps_quality() {
 #[test]
 fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
     let ctx = ExecutionContext::default();
-    let mut scratch = ScratchPad::new();
+
     let tag_vectors = VectorMatrixView::new(&[1., 0., 0.8, 0.6, 0., 1., 0., 1.], 4, 2).unwrap();
-    let graph = CsrGraphView {
+    let graph = CsrGraphView::new(CsrParts {
         node_count: 4,
         row_offsets: &[0, 0, 1, 1, 1],
         targets: &[NodeId(2)],
@@ -282,34 +284,47 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
         anchor_gains: &[0.0; 4],
         target_sorted_indices: None,
         edge_gates: None,
-    };
-    let recall = |_, _: &[f32], _, out: &mut Vec<_>| {
+    })
+    .unwrap();
+    let recall = |_, _: &[f32], _, out: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
         out.extend([(NodeId(1), 1.0), (NodeId(0), 0.8)]);
         Ok(())
     };
-    let observation = observe(
-        &ctx,
-        &ObservationConfig::default(),
-        ObservationInput {
-            graph,
-            tag_vectors,
-            query: &[0.8, 0.6],
-            candidates: &recall,
-            query_text: "car engine",
-            lexical_meta: TagLexicalMetaView {
-                names: &["car", "car engine", "repair", "manual"],
-                node_count: 4,
-                alias_offsets: &[0; 5],
-                aliases: &[],
+    let observation = Observe
+        .execute(
+            &ctx,
+            &ObservationConfig::default(),
+            ObservationInput {
+                graph,
+                tag_vectors,
+                query: &[0.8, 0.6],
+                candidates: &recall,
+                query_text: "car engine",
+                lexical_meta: TagLexicalMetaView {
+                    names: TextRows::Borrowed(&["car", "car engine", "repair", "manual"]),
+                    node_count: 4,
+                    alias_offsets: &[0; 5],
+                    aliases: TextRows::Borrowed(&[]),
+                },
+                epa_basis: None,
+                core_tags: &[],
+                ghost_vectors: None,
+                ghost_is_core: &[],
             },
-            epa_basis: None,
-            core_tags: &[],
-            ghost_vectors: None,
-            ghost_is_core: &[],
-        },
-        &mut scratch,
-    )
-    .unwrap();
+        )
+        .unwrap();
+    let fields = ComputeFields
+        .execute(
+            &ctx,
+            &FieldConfig::default(),
+            FieldInput {
+                graph,
+                tag_vectors,
+                sense: &observation.sense,
+                fused: &observation.fused,
+            },
+        )
+        .unwrap();
     assert_eq!(observation.disambiguated.pruned_hypernyms, [NodeId(0)]);
     assert_eq!(observation.gated_seeds.exact_focus, Some(NodeId(1)));
     let candidates = CandidatePoolView {
@@ -334,10 +349,11 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
             &ctx,
             &PoolCalibrateConfig::default(),
             PoolCalibrateInput {
-                observation: &observation,
+                original_query: &observation.original_query,
+                enhanced_query: &observation.fused.enhanced_query,
+                fields: &fields,
                 candidates,
             },
-            &mut scratch,
         )
         .unwrap();
     let result = RiverReadoutOperator
@@ -346,6 +362,8 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
             &RiverReadoutConfig::default(),
             RiverReadoutInput {
                 observation: &observation,
+                fields: &fields,
+                evidence: EvidencePolicy::Nous,
                 pool: &pool,
                 candidates,
                 graph,
@@ -358,7 +376,6 @@ fn single_parent_genus_rescue_requires_observed_exact_focus_contact() {
                 },
                 support_groups: SupportGroupView::empty(),
             },
-            &mut scratch,
         )
         .unwrap();
     for item in result.items {

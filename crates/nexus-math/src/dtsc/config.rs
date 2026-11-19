@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use nexus_core::{VcpError, VcpResult};
+
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -147,7 +149,6 @@ impl Default for DtscTrustConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DtscIdentityConfig {
-    pub enabled: bool,
     pub min_potential: f64,
     pub min_specificity: f64,
     pub min_tag_chunk_closure: f64,
@@ -159,7 +160,6 @@ pub struct DtscIdentityConfig {
 impl Default for DtscIdentityConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             min_potential: 0.8,
             min_specificity: 0.55,
             min_tag_chunk_closure: 0.35,
@@ -174,7 +174,6 @@ impl Default for DtscIdentityConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DtscAuxConfig {
-    pub enabled: bool,
     pub max_aux_bonus: f64,
     pub direct_floor_cap: f64,
     pub structural_floor_cap: f64,
@@ -183,13 +182,12 @@ pub struct DtscAuxConfig {
     pub min_closure_score: f64,
     pub min_class_evidence: f64,
     pub floor_exponent: f64,
-    pub identity_anchor: DtscIdentityConfig,
+    pub identity_anchor: Option<DtscIdentityConfig>,
 }
 
 impl Default for DtscAuxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             max_aux_bonus: 0.018,
             direct_floor_cap: 0.018,
             structural_floor_cap: 0.012,
@@ -198,7 +196,7 @@ impl Default for DtscAuxConfig {
             min_closure_score: 0.55,
             min_class_evidence: 0.1,
             floor_exponent: 1.5,
-            identity_anchor: DtscIdentityConfig::default(),
+            identity_anchor: None,
         }
     }
 }
@@ -212,101 +210,191 @@ pub struct DtscConfig {
     pub sparse: DtscSparseConfig,
     pub reward: DtscRewardConfig,
     pub trust: DtscTrustConfig,
-    pub auxiliary: DtscAuxConfig,
+    pub auxiliary: Option<DtscAuxConfig>,
     pub top_k: usize,
 }
 
-#[inline]
-fn clamp_finite(value: f64, lo: f64, hi: f64) -> f64 {
-    if value.is_finite() {
-        value.clamp(lo, hi)
+fn require(condition: bool, name: &str, constraint: &str) -> VcpResult<()> {
+    if condition {
+        Ok(())
     } else {
-        lo
+        Err(VcpError::InvalidInput {
+            stage: "dtsc.config",
+            detail: format!("{name} must {constraint}"),
+        })
+    }
+}
+
+fn range(name: &str, value: f64, lower: f64, upper: f64) -> VcpResult<()> {
+    require(
+        (lower..=upper).contains(&value),
+        name,
+        &format!("be in [{lower}, {upper}]"),
+    )
+}
+
+impl DtscFieldConfig {
+    pub(crate) fn validate(&self) -> VcpResult<()> {
+        require(
+            self.min_field_tags > 0 && self.min_field_tags <= self.max_field_nodes,
+            "min_field_tags",
+            "be positive and at most max_field_nodes",
+        )?;
+        require(
+            self.max_field_neighbors > 0,
+            "max_field_neighbors",
+            "be positive",
+        )?;
+        range("min_field_entropy", self.min_field_entropy, 0.0, 1.0)?;
+        range(
+            "field_energy_mass_ratio",
+            self.field_energy_mass_ratio,
+            0.5,
+            1.0,
+        )?;
+        range(
+            "field_similarity_threshold",
+            self.field_similarity_threshold,
+            -1.0,
+            1.0,
+        )?;
+        range("public_hub_floor", self.public_hub_floor, 0.05, 1.0)?;
+        require(
+            self.field_kernel_exponent.is_finite() && self.field_kernel_exponent > 0.0,
+            "field_kernel_exponent",
+            "be finite and positive",
+        )
     }
 }
 
 impl DtscConfig {
-    pub fn normalized(&self) -> Self {
-        let mut c = self.clone();
-
-        c.curve.strong_contact_threshold = clamp_finite(c.curve.strong_contact_threshold, 0.0, 1.0);
-        c.curve.weak_contact_threshold = clamp_finite(
-            c.curve.weak_contact_threshold,
+    pub fn validate(&self) -> VcpResult<()> {
+        self.field.validate()?;
+        let c = &self.curve;
+        range(
+            "curve.strong_contact_threshold",
+            c.strong_contact_threshold,
             0.0,
-            c.curve.strong_contact_threshold,
-        );
-        c.curve.min_closure_similarity = clamp_finite(c.curve.min_closure_similarity, -1.0, 1.0);
-        c.curve.position_decay = if c.curve.position_decay.is_finite() {
-            c.curve.position_decay.max(0.0)
-        } else {
-            0.0
-        };
-        c.curve.min_geo_samples = c.curve.min_geo_samples.max(1);
-
-        let s = &mut c.sparse;
-        s.min_contacts = s.min_contacts.max(2);
-        s.min_conductance = clamp_finite(s.min_conductance, 0.0, 1.0);
-        s.min_similarity = clamp_finite(s.min_similarity, -1.0, 1.0);
-        s.min_potential = if s.min_potential.is_finite() {
-            s.min_potential.min(1.0).max(c.curve.weak_contact_threshold)
-        } else {
-            c.curve.weak_contact_threshold
-        };
-        s.min_closure = clamp_finite(s.min_closure, 0.0, 1.0);
-        s.pair_saturation = s.pair_saturation.max(1);
-        s.max_relief = clamp_finite(s.max_relief, 0.0, 0.8);
-
-        let r = &mut c.reward;
-        r.alpha = clamp_finite(r.alpha, 0.0, 1.0);
-        r.geo_reward_floor = clamp_finite(r.geo_reward_floor, 0.0, 1.0);
-        r.geo_reward_saturation = if r.geo_reward_saturation.is_finite() {
-            r.geo_reward_saturation
-                .min(1.0)
-                .max(r.geo_reward_floor + 1e-6)
-        } else {
-            r.geo_reward_floor + 1e-6
-        };
-        r.direct_bonus_cap = clamp_finite(r.direct_bonus_cap, 0.0, 1.0);
-        r.structural_bonus_cap = clamp_finite(r.structural_bonus_cap, 0.0, r.direct_bonus_cap);
-        r.thematic_bonus_cap = clamp_finite(r.thematic_bonus_cap, 0.0, r.structural_bonus_cap);
-        r.structural_continuity_min = clamp_finite(r.structural_continuity_min, 0.0, 1.0);
-        r.thematic_min_potential = clamp_finite(r.thematic_min_potential, 0.0, 1.0);
-        r.thematic_max_isolated_ratio = clamp_finite(r.thematic_max_isolated_ratio, 0.0, 1.0);
-        r.direct_semantic_min_potential = if r.direct_semantic_min_potential.is_finite() {
-            r.direct_semantic_min_potential
-                .min(1.0)
-                .max(c.curve.strong_contact_threshold)
-        } else {
-            c.curve.strong_contact_threshold
-        };
-        r.direct_semantic_saturation = if r.direct_semantic_saturation.is_finite() {
-            r.direct_semantic_saturation
-                .min(1.0)
-                .max(r.direct_semantic_min_potential + 1e-6)
-        } else {
-            r.direct_semantic_min_potential + 1e-6
-        };
-        r.direct_semantic_min_contacts = r.direct_semantic_min_contacts.max(1);
-        r.direct_confidence_floor = clamp_finite(r.direct_confidence_floor, 0.0, 1.0);
-
-        let a = &mut c.auxiliary;
-        a.max_aux_bonus = clamp_finite(a.max_aux_bonus, 0.0, 0.05);
-        a.direct_floor_cap = clamp_finite(a.direct_floor_cap, 0.0, a.max_aux_bonus);
-        a.structural_floor_cap = clamp_finite(a.structural_floor_cap, 0.0, a.direct_floor_cap);
-        a.thematic_floor_cap = clamp_finite(a.thematic_floor_cap, 0.0, a.structural_floor_cap);
-        a.min_fused_score = clamp_finite(a.min_fused_score, 0.0, 1.0);
-        a.min_closure_score = clamp_finite(a.min_closure_score, 0.0, 1.0);
-        a.min_class_evidence = clamp_finite(a.min_class_evidence, 0.0, 1.0);
-        a.floor_exponent = clamp_finite(a.floor_exponent, 0.5, 4.0);
-
-        let id = &mut a.identity_anchor;
-        id.min_potential = clamp_finite(id.min_potential, 0.0, 1.0);
-        id.min_specificity = clamp_finite(id.min_specificity, 0.0, 1.0);
-        id.min_tag_chunk_closure = clamp_finite(id.min_tag_chunk_closure, 0.0, 1.0);
-        id.min_strength = clamp_finite(id.min_strength, 0.0, 1.0);
-        id.floor_cap = clamp_finite(id.floor_cap, 0.0, r.direct_bonus_cap.min(a.max_aux_bonus));
-        id.floor_exponent = clamp_finite(id.floor_exponent, 0.5, 4.0);
-
-        c
+            1.0,
+        )?;
+        range(
+            "curve.weak_contact_threshold",
+            c.weak_contact_threshold,
+            0.0,
+            c.strong_contact_threshold,
+        )?;
+        range(
+            "curve.min_closure_similarity",
+            c.min_closure_similarity,
+            -1.0,
+            1.0,
+        )?;
+        require(
+            c.position_decay.is_finite() && c.position_decay >= 0.0,
+            "curve.position_decay",
+            "be finite and nonnegative",
+        )?;
+        require(
+            c.min_geo_samples > 0,
+            "curve.min_geo_samples",
+            "be positive",
+        )?;
+        let s = &self.sparse;
+        if s.enabled {
+            require(
+                s.min_contacts >= 2,
+                "sparse.min_contacts",
+                "be at least two",
+            )?;
+            require(
+                s.pair_saturation > 0,
+                "sparse.pair_saturation",
+                "be positive",
+            )?;
+            range("sparse.min_conductance", s.min_conductance, 0.0, 1.0)?;
+            range("sparse.min_similarity", s.min_similarity, -1.0, 1.0)?;
+            range("sparse.min_potential", s.min_potential, 0.0, 1.0)?;
+            range("sparse.min_closure", s.min_closure, 0.0, 1.0)?;
+            range("sparse.max_relief", s.max_relief, 0.0, 0.8)?;
+        }
+        let r = &self.reward;
+        for (name, value) in [
+            ("reward.alpha", r.alpha),
+            ("reward.direct_bonus_cap", r.direct_bonus_cap),
+            ("reward.structural_bonus_cap", r.structural_bonus_cap),
+            ("reward.thematic_bonus_cap", r.thematic_bonus_cap),
+            ("reward.geo_reward_floor", r.geo_reward_floor),
+            (
+                "reward.structural_continuity_min",
+                r.structural_continuity_min,
+            ),
+            ("reward.thematic_min_potential", r.thematic_min_potential),
+            (
+                "reward.thematic_max_isolated_ratio",
+                r.thematic_max_isolated_ratio,
+            ),
+            (
+                "reward.direct_semantic_min_potential",
+                r.direct_semantic_min_potential,
+            ),
+            ("reward.direct_confidence_floor", r.direct_confidence_floor),
+            (
+                "trust.min_candidate_coverage",
+                self.trust.min_candidate_coverage,
+            ),
+            ("trust.min_geo_score", self.trust.min_geo_score),
+            ("trust.min_geo_spread", self.trust.min_geo_spread),
+        ] {
+            range(name, value, 0.0, 1.0)?;
+        }
+        range(
+            "reward.geo_reward_saturation",
+            r.geo_reward_saturation,
+            r.geo_reward_floor + 1e-6,
+            1.0,
+        )?;
+        range(
+            "reward.direct_semantic_saturation",
+            r.direct_semantic_saturation,
+            r.direct_semantic_min_potential + 1e-6,
+            1.0,
+        )?;
+        require(
+            r.direct_semantic_min_contacts > 0,
+            "reward.direct_semantic_min_contacts",
+            "be positive",
+        )?;
+        require(
+            self.trust.min_strong_evidence.is_finite() && self.trust.min_strong_evidence >= 0.0,
+            "trust.min_strong_evidence",
+            "be finite and nonnegative",
+        )?;
+        if let Some(a) = &self.auxiliary {
+            range("auxiliary.max_aux_bonus", a.max_aux_bonus, 0.0, 0.05)?;
+            for (name, value) in [
+                ("auxiliary.min_fused_score", a.min_fused_score),
+                ("auxiliary.min_closure_score", a.min_closure_score),
+                ("auxiliary.min_class_evidence", a.min_class_evidence),
+                ("auxiliary.direct_floor_cap", a.direct_floor_cap),
+                ("auxiliary.structural_floor_cap", a.structural_floor_cap),
+                ("auxiliary.thematic_floor_cap", a.thematic_floor_cap),
+            ] {
+                range(name, value, 0.0, 1.0)?;
+            }
+            range("auxiliary.floor_exponent", a.floor_exponent, 0.5, 4.0)?;
+            if let Some(id) = &a.identity_anchor {
+                for (name, value) in [
+                    ("identity.min_potential", id.min_potential),
+                    ("identity.min_specificity", id.min_specificity),
+                    ("identity.min_tag_chunk_closure", id.min_tag_chunk_closure),
+                    ("identity.min_strength", id.min_strength),
+                    ("identity.floor_cap", id.floor_cap),
+                ] {
+                    range(name, value, 0.0, 1.0)?;
+                }
+                range("identity.floor_exponent", id.floor_exponent, 0.5, 4.0)?;
+            }
+        }
+        Ok(())
     }
 }
