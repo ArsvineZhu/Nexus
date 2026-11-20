@@ -2,14 +2,18 @@
 
 use super::{DtscFieldConfig, unit};
 use nexus_core::kernel::{cosine_f32_with_norms, norm_sq_f32};
-use nexus_core::{ExecutionContext, NodeId, Operator, PrecisionMode, VcpError, VectorMatrixView};
+use nexus_core::{ExecutionContext, NodeId, PrecisionMode, VcpError, VectorMatrixView};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DtscSourceType {
     Core,
+    /// A direct concept asserted by the caller or grounded in the query text.
     Seed,
+    /// A zero-hop concept obtained from semantic inference.
+    Inferred,
+    /// A concept first reached by propagation.
     Emergent,
     Unknown,
 }
@@ -17,8 +21,7 @@ pub enum DtscSourceType {
 #[derive(Clone, Debug)]
 pub struct DtscNodeInput {
     pub node: NodeId,
-    pub energy: f64,
-    pub normalized_energy: f64,
+    pub mass: f64,
     pub source_type: DtscSourceType,
 }
 
@@ -105,15 +108,6 @@ pub fn dtsc_cosine(a: &[f32], b: &[f32]) -> f64 {
     let aa = norm_sq_f32(a, PrecisionMode::StrictLeftFold);
     let bb = norm_sq_f32(b, PrecisionMode::StrictLeftFold);
     cosine_f32_with_norms(a, b, aa, bb, PrecisionMode::StrictLeftFold, 1e-12)
-}
-
-#[inline]
-fn node_energy(n: &DtscNodeInput) -> f64 {
-    if n.energy > 0.0 {
-        n.energy
-    } else {
-        n.normalized_energy
-    }
 }
 
 pub struct DtscFieldSampler<'a> {
@@ -208,162 +202,151 @@ impl<'a> DtscFieldSampler<'a> {
     }
 }
 
-pub struct DtscFieldBuildOperator;
+pub fn build_dtsc_field<'call>(
+    input: DtscFieldBuildInput<'call>,
+    config: &DtscFieldConfig,
+    ctx: &ExecutionContext<'_>,
+) -> Result<DtscFieldValues, VcpError> {
+    const STAGE: &str = "dtsc_field_build";
+    ctx.check_cancelled(STAGE)?;
+    config.validate()?;
+    input.tag_vectors.validate(STAGE)?;
 
-impl Operator for DtscFieldBuildOperator {
-    type Config = DtscFieldConfig;
-    type Input<'call> = DtscFieldBuildInput<'call>;
-    type Output = DtscFieldValues;
-
-    fn name(&self) -> &'static str {
-        "dtsc_field_build"
-    }
-
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> Result<Self::Output, VcpError> {
-        const STAGE: &str = "dtsc_field_build";
+    let mut seen = std::collections::HashSet::with_capacity(input.nodes.len());
+    for node in input.nodes {
         ctx.check_cancelled(STAGE)?;
-        config.validate()?;
-        input.tag_vectors.validate(STAGE)?;
-
-        let minimum = config.min_field_tags;
-        let input_order_nodes: Vec<&DtscNodeInput> = input
-            .nodes
-            .iter()
-            .filter(|n| n.node.index() < input.tag_vectors.rows && node_energy(n) > 0.0)
-            .collect();
-
-        let mut sorted_nodes = input_order_nodes.clone();
-        sorted_nodes.sort_by(|a, b| {
-            node_energy(b)
-                .total_cmp(&node_energy(a))
-                .then_with(|| a.node.cmp(&b.node))
-        });
-
-        let total_energy: f64 = sorted_nodes.iter().map(|n| node_energy(n)).sum();
-        let max_energy = sorted_nodes
-            .iter()
-            .map(|n| node_energy(n))
-            .fold(0.0_f64, f64::max);
-
-        let field_entropy = if sorted_nodes.len() > 1 && total_energy > 0.0 {
-            sorted_nodes
-                .iter()
-                .map(|n| {
-                    let p = node_energy(n) / total_energy;
-                    if p > 0.0 { -p * p.ln() } else { 0.0 }
-                })
-                .sum::<f64>()
-                / (sorted_nodes.len() as f64).ln()
-        } else {
-            0.0
-        };
-
-        let exact_field: Vec<DtscSample> = input_order_nodes
-            .iter()
-            .map(|n| DtscSample {
-                node: n.node,
-                potential: if max_energy > 0.0 {
-                    unit(node_energy(n) / max_energy)
-                } else {
-                    0.0
-                },
-                exact: true,
-                source_type: n.source_type,
-            })
-            .collect();
-
-        let mut retained = 0;
-        let mut mass = 0.0;
-        let max_nodes = config.max_field_nodes;
-        let mass_ratio = config.field_energy_mass_ratio;
-        for n in &sorted_nodes {
-            if retained >= max_nodes
-                || (retained >= minimum && mass / total_energy.max(1e-12) >= mass_ratio)
-            {
-                break;
-            }
-            retained += 1;
-            mass += node_energy(n);
-        }
-
-        let field_nodes: Vec<DtscFieldNode> = if input.tag_vectors.dim > 0 {
-            sorted_nodes
-                .iter()
-                .take(retained)
-                .filter_map(|n| {
-                    input
-                        .tag_vectors
-                        .row(n.node.index())
-                        .map(|v| DtscFieldNode {
-                            node: n.node,
-                            potential: if max_energy > 0.0 {
-                                unit(node_energy(n) / max_energy)
-                            } else {
-                                0.0
-                            },
-                            vector: v.to_vec(),
-                            source_type: n.source_type,
-                        })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        Ok(DtscFieldValues {
-            exact_field,
-            field_nodes,
-            field_entropy,
-            total_energy,
-            max_energy,
-            config: config.clone(),
-        })
-    }
-}
-
-pub struct DtscFieldSampleOperator;
-
-impl Operator for DtscFieldSampleOperator {
-    type Config = ();
-    type Input<'call> = DtscFieldSampleInput<'call>;
-    type Output = Vec<DtscSample>;
-
-    fn name(&self) -> &'static str {
-        "dtsc_field_sample"
-    }
-
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        _config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> Result<Self::Output, VcpError> {
-        const STAGE: &str = "dtsc_field_sample";
-        ctx.check_cancelled(STAGE)?;
-        input.query_vectors.validate(STAGE)?;
-        if input.query_ids.len() != input.query_vectors.rows {
-            return Err(VcpError::DimensionMismatch {
+        if node.node.index() >= input.tag_vectors.rows || !seen.insert(node.node) {
+            return Err(VcpError::InvalidInput {
                 stage: STAGE,
-                expected: input.query_ids.len(),
-                actual: input.query_vectors.rows,
+                detail: format!(
+                    "node {} is repeated or outside the tag matrix",
+                    node.node.index()
+                ),
             });
         }
-
-        let sampler = DtscFieldSampler::new(input.field, input.inbound);
-        let mut neighbors = Vec::new();
-        let mut out = Vec::with_capacity(input.query_ids.len());
-        for (idx, &node) in input.query_ids.iter().enumerate() {
-            if idx % 64 == 0 {
-                ctx.check_cancelled(STAGE)?;
-            }
-            let vec = input.query_vectors.row(idx).unwrap_or(&[]);
-            out.push(sampler.sample_with_buf(node, vec, &mut neighbors));
+        if !node.mass.is_finite() || node.mass < 0.0 {
+            return Err(VcpError::InvalidInput {
+                stage: STAGE,
+                detail: format!(
+                    "node {} mass must be finite and nonnegative",
+                    node.node.index()
+                ),
+            });
         }
-        Ok(out)
     }
+    let minimum = config.min_field_tags;
+    let input_order_nodes: Vec<&DtscNodeInput> =
+        input.nodes.iter().filter(|n| n.mass > 0.0).collect();
+
+    let mut sorted_nodes = input_order_nodes.clone();
+    sorted_nodes.sort_by(|a, b| b.mass.total_cmp(&a.mass).then_with(|| a.node.cmp(&b.node)));
+
+    let total_energy: f64 = sorted_nodes.iter().map(|n| n.mass).sum();
+    if !total_energy.is_finite() {
+        return Err(VcpError::NumericDivergence {
+            stage: STAGE,
+            detail: "total field mass overflowed".into(),
+        });
+    }
+    let max_energy = sorted_nodes.iter().map(|n| n.mass).fold(0.0_f64, f64::max);
+
+    let field_entropy = if sorted_nodes.len() > 1 && total_energy > 0.0 {
+        sorted_nodes
+            .iter()
+            .map(|n| {
+                let p = n.mass / total_energy;
+                if p > 0.0 { -p * p.ln() } else { 0.0 }
+            })
+            .sum::<f64>()
+            / (sorted_nodes.len() as f64).ln()
+    } else {
+        0.0
+    };
+
+    let exact_field: Vec<DtscSample> = input_order_nodes
+        .iter()
+        .map(|n| DtscSample {
+            node: n.node,
+            potential: if max_energy > 0.0 {
+                unit(n.mass / max_energy)
+            } else {
+                0.0
+            },
+            exact: true,
+            source_type: n.source_type,
+        })
+        .collect();
+
+    let mut retained = 0;
+    let mut mass = 0.0;
+    let max_nodes = config.max_field_nodes;
+    let mass_ratio = config.field_energy_mass_ratio;
+    for n in &sorted_nodes {
+        if retained >= max_nodes || (retained >= minimum && mass / total_energy >= mass_ratio) {
+            break;
+        }
+        retained += 1;
+        mass += n.mass;
+    }
+
+    let field_nodes: Vec<DtscFieldNode> = if input.tag_vectors.dim > 0 {
+        sorted_nodes
+            .iter()
+            .take(retained)
+            .filter_map(|n| {
+                input
+                    .tag_vectors
+                    .row(n.node.index())
+                    .map(|v| DtscFieldNode {
+                        node: n.node,
+                        potential: if max_energy > 0.0 {
+                            unit(n.mass / max_energy)
+                        } else {
+                            0.0
+                        },
+                        vector: v.to_vec(),
+                        source_type: n.source_type,
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(DtscFieldValues {
+        exact_field,
+        field_nodes,
+        field_entropy,
+        total_energy,
+        max_energy,
+        config: config.clone(),
+    })
+}
+
+pub fn sample_dtsc_field<'call>(
+    input: DtscFieldSampleInput<'call>,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<DtscSample>, VcpError> {
+    const STAGE: &str = "dtsc_field_sample";
+    ctx.check_cancelled(STAGE)?;
+    input.query_vectors.validate(STAGE)?;
+    if input.query_ids.len() != input.query_vectors.rows {
+        return Err(VcpError::DimensionMismatch {
+            stage: STAGE,
+            expected: input.query_ids.len(),
+            actual: input.query_vectors.rows,
+        });
+    }
+
+    let sampler = DtscFieldSampler::new(input.field, input.inbound);
+    let mut neighbors = Vec::new();
+    let mut out = Vec::with_capacity(input.query_ids.len());
+    for (idx, &node) in input.query_ids.iter().enumerate() {
+        if idx % 64 == 0 {
+            ctx.check_cancelled(STAGE)?;
+        }
+        let vec = input.query_vectors.row(idx).unwrap_or(&[]);
+        out.push(sampler.sample_with_buf(node, vec, &mut neighbors));
+    }
+    Ok(out)
 }

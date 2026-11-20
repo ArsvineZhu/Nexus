@@ -1,115 +1,115 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{DtscEvidenceValues, DtscItem, DtscReadoutConfig};
-use nexus_core::{Diagnostics, ExecutionContext, Operator, VcpResult};
+use super::{DtscEvidenceValues, DtscFallbackOrder, DtscFieldStats, DtscItem, DtscReadoutConfig};
+use nexus_core::{ExecutionContext, VcpResult};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DtscOrder {
-    Score,
-    Input,
+pub enum DtscFallbackReason {
+    InsufficientFieldSupport,
+    LowFieldEntropy,
+    NoCurveContact,
+    InsufficientCandidateCoverage,
+    InsufficientScoreSpread,
 }
 
-pub struct DtscReadoutInput<'call> {
-    pub evidence: &'call DtscEvidenceValues,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtscDecision {
+    Scored,
+    Fallback {
+        reason: DtscFallbackReason,
+        order: DtscFallbackOrder,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct DtscOutput {
     pub results: Vec<DtscItem>,
-    pub field_trusted: bool,
-    pub field_entropy: f64,
-    pub order: DtscOrder,
+    pub field: DtscFieldStats,
+    pub decision: DtscDecision,
     pub available: usize,
-    pub fallback_used: bool,
-    pub fallback_reason: Option<&'static str>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
-pub struct DtscReadoutOperator;
+pub fn readout_dtsc(
+    evidence: &DtscEvidenceValues,
+    config: &DtscReadoutConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<DtscOutput> {
+    let start = Instant::now();
+    ctx.check_cancelled("dtsc_readout")?;
+    config.validate()?;
+    let reason = fallback(evidence, config);
+    let available = evidence.items().len();
+    let limit = if config.top_k == 0 {
+        available
+    } else {
+        config.top_k
+    };
 
-impl Operator for DtscReadoutOperator {
-    type Config = DtscReadoutConfig;
-    type Input<'call> = DtscReadoutInput<'call>;
-    type Output = DtscOutput;
-
-    fn name(&self) -> &'static str {
-        "dtsc_readout"
-    }
-
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> VcpResult<Self::Output> {
-        let start = Instant::now();
-        ctx.check_cancelled(self.name())?;
-        config.validate()?;
-        let evidence = input.evidence;
-        let field_trusted = evidence.field_trusted(config.fallback_on_low_trust);
-        let reason = fallback(evidence, field_trusted, config);
-        let available = evidence.items().len();
-        let limit = if config.top_k == 0 {
-            available
+    let keep_input_order =
+        reason.is_some() && config.fallback_order == DtscFallbackOrder::InputOrder;
+    let mut results = if keep_input_order {
+        evidence.items().iter().take(limit).cloned().collect()
+    } else {
+        evidence.items().to_vec()
+    };
+    let geometry_weight = if reason.is_some() {
+        0.0
+    } else {
+        config.geometry_weight
+    };
+    for item in &mut results {
+        let scores = &mut item.scores;
+        scores.geo_bonus *= geometry_weight;
+        scores.geo_base_bonus *= geometry_weight;
+        scores.geo_aux_bonus *= geometry_weight;
+        scores.score = scores.original_cosine + scores.geo_bonus;
+        scores.geo_effect = if scores.geo_bonus > 0.0 {
+            "boost"
         } else {
-            config.top_k
+            "neutral"
         };
-
-        let (results, order) = if reason.is_some() {
-            let results = evidence
-                .items()
-                .iter()
-                .take(limit)
-                .cloned()
-                .map(|mut item| {
-                    item.geo_bonus = 0.0;
-                    item.geo_base_bonus = 0.0;
-                    item.geo_aux_bonus = 0.0;
-                    item.score = item.original_cosine;
-                    item.geo_effect = "neutral";
-                    item
-                })
-                .collect();
-            (results, DtscOrder::Input)
-        } else {
-            let mut results = evidence.items().to_vec();
-            results.sort_by(|a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| b.original_cosine.total_cmp(&a.original_cosine))
-            });
-            results.truncate(limit);
-            (results, DtscOrder::Score)
-        };
-
-        Ok(DtscOutput {
-            results,
-            field_trusted,
-            field_entropy: evidence.field_entropy(),
-            order,
-            available,
-            fallback_used: reason.is_some(),
-            fallback_reason: reason,
-            diagnostics: Diagnostics {
-                elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
-                ..Diagnostics::default()
-            },
-        })
     }
+    if !keep_input_order {
+        results.sort_by(|a, b| {
+            b.scores.score.total_cmp(&a.scores.score).then_with(|| {
+                b.scores
+                    .original_cosine
+                    .total_cmp(&a.scores.original_cosine)
+            })
+        });
+        results.truncate(limit);
+    }
+    let decision = reason.map_or(DtscDecision::Scored, |reason| DtscDecision::Fallback {
+        reason,
+        order: config.fallback_order,
+    });
+
+    ctx.check_cancelled("dtsc_readout")?;
+    Ok(DtscOutput {
+        results,
+        field: evidence.field_stats(),
+        decision,
+        available,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+    })
 }
 
 fn fallback(
     evidence: &DtscEvidenceValues,
-    field_trusted: bool,
     config: &DtscReadoutConfig,
-) -> Option<&'static str> {
-    if !field_trusted {
-        return Some("query-energy-field-low-trust");
+) -> Option<DtscFallbackReason> {
+    use DtscFallbackReason::*;
+    if !evidence.field_has_support() {
+        return Some(InsufficientFieldSupport);
+    }
+    if config.fallback_on_low_trust && evidence.field.entropy < config.trust.min_field_entropy {
+        return Some(LowFieldEntropy);
     }
     let stats = &evidence.stats;
     if stats.contributors == 0 {
-        return Some("no-candidate-curve-contacted-query-field");
+        return Some(NoCurveContact);
     }
     if !config.fallback_on_low_trust {
         return None;
@@ -120,10 +120,10 @@ fn fallback(
         stats.maximum < trust.min_geo_score && stats.strong_evidence < trust.min_strong_evidence;
     let coverage = stats.contributors as f64 / evidence.items().len() as f64;
     if low && coverage < trust.min_candidate_coverage {
-        Some("candidate-curve-readout-jointly-low-trust")
+        Some(InsufficientCandidateCoverage)
     } else if low && stats.contributors > 1 && stats.maximum - stats.minimum < trust.min_geo_spread
     {
-        Some("candidate-curve-scores-lack-discrimination")
+        Some(InsufficientScoreSpread)
     } else {
         None
     }

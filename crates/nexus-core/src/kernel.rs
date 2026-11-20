@@ -3,10 +3,10 @@
 
 use crate::csr::CsrGraphView;
 use crate::error::VcpError;
-use crate::operator::{ParallelPolicy, PrecisionMode};
+use crate::execution::{ParallelPolicy, PrecisionMode};
 use crate::view::VectorMatrixView;
 use rayon::prelude::*;
-use wide::{f32x8, f64x4};
+use wide::{f32x8, f64x2, f64x4};
 
 /// Checks finite inputs in contiguous blocks, independent of arithmetic precision.
 pub fn all_finite_f32(values: &[f32]) -> bool {
@@ -24,6 +24,35 @@ fn dot_f32_strict(a: &[f32], b: &[f32]) -> f64 {
         .fold(0.0_f64, |acc, (&x, &y)| acc + f64::from(x) * f64::from(y))
 }
 
+/// Packs two directions once so candidate rows accumulate them in parallel.
+/// Each lane keeps the original addition order and uses separate multiply and add.
+pub(crate) struct StrictDotPair(Vec<f64x2>);
+
+impl StrictDotPair {
+    pub(crate) fn new(a: &[f32], b: &[f32]) -> Self {
+        Self(
+            a.iter()
+                .zip(b)
+                .map(|(&a, &b)| f64x2::new([f64::from(a), f64::from(b)]))
+                .collect(),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn accumulate<const WITH_NORM: bool>(&self, row: &[f32]) -> ([f64; 2], f64) {
+        let mut dots = f64x2::ZERO;
+        let mut norm = 0.0;
+        for (&value, &directions) in row.iter().zip(&self.0) {
+            let value = f64::from(value);
+            dots += f64x2::splat(value) * directions;
+            if WITH_NORM {
+                norm += value * value;
+            }
+        }
+        (dots.to_array(), norm)
+    }
+}
+
 #[inline]
 fn dot_f32_simd(a: &[f32], b: &[f32]) -> f64 {
     let len = a.len().min(b.len());
@@ -32,10 +61,10 @@ fn dot_f32_simd(a: &[f32], b: &[f32]) -> f64 {
 
     let mut acc0 = f64x4::ZERO;
     let mut acc1 = f64x4::ZERO;
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
+    let (a_blocks, a_tail) = a.as_chunks::<8>();
+    let (b_blocks, b_tail) = b.as_chunks::<8>();
 
-    for (xa, xb) in (&mut ca).zip(&mut cb) {
+    for (xa, xb) in a_blocks.iter().zip(b_blocks) {
         let va0 = f64x4::new([
             f64::from(xa[0]),
             f64::from(xa[1]),
@@ -66,7 +95,7 @@ fn dot_f32_simd(a: &[f32], b: &[f32]) -> f64 {
     }
 
     let mut sum = (acc0 + acc1).reduce_add();
-    for (&x, &y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
         sum += f64::from(x) * f64::from(y);
     }
     sum
@@ -92,9 +121,9 @@ fn norm_sq_f32_strict(v: &[f32]) -> f64 {
 fn norm_sq_f32_simd(v: &[f32]) -> f64 {
     let mut acc0 = f64x4::ZERO;
     let mut acc1 = f64x4::ZERO;
-    let mut chunks = v.chunks_exact(8);
+    let (blocks, tail) = v.as_chunks::<8>();
 
-    for c in &mut chunks {
+    for c in blocks {
         let v0 = f64x4::new([
             f64::from(c[0]),
             f64::from(c[1]),
@@ -113,7 +142,7 @@ fn norm_sq_f32_simd(v: &[f32]) -> f64 {
     }
 
     let mut sum = (acc0 + acc1).reduce_add();
-    for &x in chunks.remainder() {
+    for &x in tail {
         let xf = f64::from(x);
         sum += xf * xf;
     }
@@ -139,10 +168,10 @@ pub fn dot_f64(a: &[f64], b: &[f64], mode: PrecisionMode) -> f64 {
 
             let mut acc0 = f64x4::ZERO;
             let mut acc1 = f64x4::ZERO;
-            let mut ca = a.chunks_exact(8);
-            let mut cb = b.chunks_exact(8);
+            let (a_blocks, a_tail) = a.as_chunks::<8>();
+            let (b_blocks, b_tail) = b.as_chunks::<8>();
 
-            for (xa, xb) in (&mut ca).zip(&mut cb) {
+            for (xa, xb) in a_blocks.iter().zip(b_blocks) {
                 let va0 = f64x4::new([xa[0], xa[1], xa[2], xa[3]]);
                 let vb0 = f64x4::new([xb[0], xb[1], xb[2], xb[3]]);
                 acc0 = va0.mul_add(vb0, acc0);
@@ -153,7 +182,7 @@ pub fn dot_f64(a: &[f64], b: &[f64], mode: PrecisionMode) -> f64 {
             }
 
             let mut sum = (acc0 + acc1).reduce_add();
-            for (&x, &y) in ca.remainder().iter().zip(cb.remainder()) {
+            for (&x, &y) in a_tail.iter().zip(b_tail) {
                 sum += x * y;
             }
             sum
@@ -168,9 +197,9 @@ pub fn norm_sq_f64(v: &[f64], mode: PrecisionMode) -> f64 {
         PrecisionMode::FastSimd => {
             let mut acc0 = f64x4::ZERO;
             let mut acc1 = f64x4::ZERO;
-            let mut chunks = v.chunks_exact(8);
+            let (blocks, tail) = v.as_chunks::<8>();
 
-            for c in &mut chunks {
+            for c in blocks {
                 let v0 = f64x4::new([c[0], c[1], c[2], c[3]]);
                 acc0 = v0.mul_add(v0, acc0);
 
@@ -179,7 +208,7 @@ pub fn norm_sq_f64(v: &[f64], mode: PrecisionMode) -> f64 {
             }
 
             let mut sum = (acc0 + acc1).reduce_add();
-            for &x in chunks.remainder() {
+            for &x in tail {
                 sum += x * x;
             }
             sum
@@ -414,15 +443,26 @@ pub fn batch_cosines_f32(
     if let [q0, q1] = queries
         && let [out0, out1] = &mut *out_cols
     {
-        let [bb0, bb1] = [q0, q1].map(|query| norm_sq_f32(query, mode));
+        let query_norms = [q0, q1].map(|query| norm_sq_f32(query, mode));
+        let pair = (mode == PrecisionMode::StrictLeftFold).then(|| StrictDotPair::new(q0, q1));
         let row_cosines = |index: usize| {
             let row = matrix.row(index).unwrap();
+            if let Some(pair) = &pair {
+                let (dots, aa) = match matrix.sq_norm_f64(index) {
+                    Some(aa) if aa > norm_sq_floor => (pair.accumulate::<false>(row).0, aa),
+                    Some(_) => return [0.0; 2],
+                    None => pair.accumulate::<true>(row),
+                };
+                return std::array::from_fn(|i| {
+                    cosine_from_dot(dots[i], aa, query_norms[i], norm_sq_floor)
+                });
+            }
             let aa = matrix
                 .sq_norm_f64(index)
                 .unwrap_or_else(|| norm_sq_f32(row, mode));
             [
-                cosine_f32_with_norms(row, q0, aa, bb0, mode, norm_sq_floor),
-                cosine_f32_with_norms(row, q1, aa, bb1, mode, norm_sq_floor),
+                cosine_f32_with_norms(row, q0, aa, query_norms[0], mode, norm_sq_floor),
+                cosine_f32_with_norms(row, q1, aa, query_norms[1], mode, norm_sq_floor),
             ]
         };
         if use_par {
@@ -452,6 +492,15 @@ pub fn batch_cosines_f32(
         }
     }
     Ok(())
+}
+
+#[inline]
+pub(crate) fn cosine_from_dot(dot: f64, row_norm: f64, query_norm: f64, floor: f64) -> f64 {
+    if row_norm > floor && query_norm > floor {
+        dot / (row_norm.sqrt() * query_norm.sqrt())
+    } else {
+        0.0
+    }
 }
 
 /// Computes 4 inner products `<target, vecs[k]>` in a single pass over `target`.

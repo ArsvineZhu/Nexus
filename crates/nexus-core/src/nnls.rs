@@ -2,8 +2,8 @@
 #![forbid(unsafe_code)]
 
 use crate::error::VcpError;
+use crate::execution::{CancellationToken, PrecisionMode};
 use crate::kernel::{dot_f64, norm_sq_f64};
-use crate::operator::{CancellationToken, PrecisionMode, ResourceLimits};
 use faer::Mat;
 
 pub const DUAL_TOL: f64 = 1e-10;
@@ -19,8 +19,9 @@ pub struct NnlsWorkspace {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NnlsSolution {
     /// Unit-space NNLS coefficients (solving `min ||A_unit * w - y_unit||_2` s.t. `w >= 0`).
-    pub weights: Vec<f64>,
-    /// Unscaled projection `A_unit * (weights * target_norm)` in original target space.
+    pub direction_weights: Vec<f64>,
+    column_norms: Vec<f64>,
+    /// Unscaled projection `A_unit * (direction_weights * target_norm)` in original target space.
     pub projection: Vec<f64>,
     /// Unscaled residual `target - projection`.
     pub residual: Vec<f64>,
@@ -32,12 +33,41 @@ pub struct NnlsSolution {
     pub residual_ratio: f64,
     /// Explained energy ratio `(1.0 - residual_ratio).clamp(0.0, 1.0)`.
     pub explained_ratio: f64,
-    /// Count of active positive weights (`weights[i] > 0.0`).
+    /// Count of active positive direction weights (`direction_weights[i] > 0.0`).
     pub active_columns: usize,
     /// Number of Lawson-Hanson active-set iterations performed.
     pub iterations: usize,
     /// Maximum KKT violation across dual, stationarity, complementarity, and energy closure.
     pub max_kkt_violation: f64,
+}
+
+impl NnlsSolution {
+    /// Coefficients in the original matrix and target units.
+    pub fn coefficients(&self) -> Result<Vec<f64>, VcpError> {
+        self.direction_weights
+            .iter()
+            .zip(&self.column_norms)
+            .map(|(&weight, &norm)| {
+                if weight == 0.0 || norm == 0.0 {
+                    return Ok(0.0);
+                }
+                let coefficient = weight * (self.target_norm / norm);
+                let coefficient = if coefficient.is_finite() && coefficient > 0.0 {
+                    coefficient
+                } else {
+                    (weight * self.target_norm) / norm
+                };
+                if coefficient.is_finite() {
+                    Ok(coefficient)
+                } else {
+                    Err(VcpError::NumericDivergence {
+                        stage: "nnls.coefficients",
+                        detail: "original matrix coefficient overflowed".into(),
+                    })
+                }
+            })
+            .collect()
+    }
 }
 
 #[inline]
@@ -49,7 +79,7 @@ fn col_slice(cols: &[f64], dim: usize, col: usize) -> &[f64] {
 #[inline]
 fn euclidean_norm_f64(v: &[f64]) -> f64 {
     let norm_sq = norm_sq_f64(v, PrecisionMode::StrictLeftFold);
-    if norm_sq.is_finite() {
+    if norm_sq.is_finite() && norm_sq >= f64::MIN_POSITIVE {
         return norm_sq.sqrt();
     }
     let max_abs = v.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
@@ -281,7 +311,7 @@ fn solve_nnls_indexed_impl<'a, I>(
     target: &[f64],
     tagged_columns: I,
     num_cols: usize,
-    limits: &ResourceLimits,
+    max_columns: usize,
     cancel: &CancellationToken<'_>,
     scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError>
@@ -296,12 +326,12 @@ where
             detail: "target must be non-empty and finite".into(),
         });
     }
-    if num_cols > limits.nnls_max_columns {
+    if num_cols > max_columns {
         return Err(VcpError::ResourceLimitExceeded {
             stage,
-            limit_name: "nnls_max_columns",
+            limit_name: "max_columns",
             actual: num_cols,
-            limit: limits.nnls_max_columns,
+            limit: max_columns,
         });
     }
 
@@ -330,9 +360,38 @@ where
         }
         entries.push((id, slot, col));
     }
+    entries.sort_by_key(|(id, slot, _)| (*id, *slot));
+
+    let mut unit_cols = Vec::with_capacity(entries.len() * dim);
+    let mut active_slots = Vec::with_capacity(entries.len());
+    let mut norm_col = Vec::with_capacity(dim);
+
+    let mut column_norms = vec![0.0; num_cols];
+    for (_id, slot, col) in entries {
+        let col_norm = euclidean_norm_f64(col);
+        if !col_norm.is_finite() {
+            return Err(VcpError::NumericDivergence {
+                stage,
+                detail: format!("column {slot} norm overflow"),
+            });
+        }
+        column_norms[slot] = col_norm;
+        if target_norm > 0.0 && col_norm > 0.0 {
+            norm_col.clear();
+            norm_col.extend(col.iter().map(|&val| val / col_norm));
+            let is_duplicate = (0..active_slots.len())
+                .any(|existing| col_slice(&unit_cols, dim, existing) == norm_col.as_slice());
+            if !is_duplicate {
+                unit_cols.extend_from_slice(&norm_col);
+                active_slots.push(slot);
+            }
+        }
+    }
+
     if target_norm == 0.0 {
         return Ok(NnlsSolution {
-            weights: vec![0.0; num_cols],
+            direction_weights: vec![0.0; num_cols],
+            column_norms,
             projection: vec![0.0; dim],
             residual: target.to_vec(),
             residual_norm: 0.0,
@@ -345,36 +404,11 @@ where
         });
     }
 
-    entries.sort_by_key(|(id, slot, _)| (*id, *slot));
-
-    let mut unit_cols = Vec::with_capacity(entries.len() * dim);
-    let mut active_slots = Vec::with_capacity(entries.len());
-    let mut norm_col = Vec::with_capacity(dim);
-
-    for (_id, slot, col) in entries {
-        let col_norm = euclidean_norm_f64(col);
-        if !col_norm.is_finite() {
-            return Err(VcpError::NumericDivergence {
-                stage,
-                detail: format!("column {slot} norm overflow"),
-            });
-        }
-        if col_norm > 0.0 {
-            norm_col.clear();
-            norm_col.extend(col.iter().map(|&val| val / col_norm));
-            let is_duplicate = (0..active_slots.len())
-                .any(|existing| col_slice(&unit_cols, dim, existing) == norm_col.as_slice());
-            if !is_duplicate {
-                unit_cols.extend_from_slice(&norm_col);
-                active_slots.push(slot);
-            }
-        }
-    }
-
     let count = active_slots.len();
     if count == 0 {
         return Ok(NnlsSolution {
-            weights: vec![0.0; num_cols],
+            direction_weights: vec![0.0; num_cols],
+            column_norms,
             projection: vec![0.0; dim],
             residual: target.to_vec(),
             residual_norm: target_norm,
@@ -474,10 +508,10 @@ where
     let (max_kkt_violation, residual_ratio) =
         compute_kkt_and_check(stage, &unit_cols, y_unit, &x_unit, &mut p_unit, &mut r_unit)?;
 
-    let mut weights = vec![0.0_f64; num_cols];
+    let mut direction_weights = vec![0.0_f64; num_cols];
     let mut active_columns = 0usize;
     for (k, &orig_slot) in active_slots.iter().enumerate() {
-        weights[orig_slot] = x_unit[k];
+        direction_weights[orig_slot] = x_unit[k];
         if x_unit[k] > 0.0 {
             active_columns += 1;
         }
@@ -502,7 +536,8 @@ where
     let explained_ratio = (1.0 - residual_ratio).clamp(0.0, 1.0);
 
     Ok(NnlsSolution {
-        weights,
+        direction_weights,
+        column_norms,
         projection,
         residual,
         residual_norm,
@@ -519,7 +554,7 @@ where
 pub fn solve_nnls_with_ids_f64(
     target: &[f64],
     columns: &[(i64, &[f64])],
-    limits: &ResourceLimits,
+    max_columns: usize,
     cancel: &CancellationToken<'_>,
     scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
@@ -531,7 +566,7 @@ pub fn solve_nnls_with_ids_f64(
             .enumerate()
             .map(|(slot, &(id, col))| (id, slot, col)),
         columns.len(),
-        limits,
+        max_columns,
         cancel,
         scratch,
     )
@@ -541,7 +576,7 @@ pub fn solve_nnls_with_ids_f64(
 pub fn solve_nnls_f64(
     target: &[f64],
     columns: &[&[f64]],
-    limits: &ResourceLimits,
+    max_columns: usize,
     cancel: &CancellationToken<'_>,
     scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
@@ -553,7 +588,7 @@ pub fn solve_nnls_f64(
             .enumerate()
             .map(|(slot, &col)| (slot as i64, slot, col)),
         columns.len(),
-        limits,
+        max_columns,
         cancel,
         scratch,
     )
@@ -565,7 +600,7 @@ pub fn solve_nnls_flat_f64(
     cols_flat: &[f64],
     num_cols: usize,
     dim: usize,
-    limits: &ResourceLimits,
+    max_columns: usize,
     cancel: &CancellationToken<'_>,
     scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
@@ -595,7 +630,7 @@ pub fn solve_nnls_flat_f64(
         target,
         (0..num_cols).map(|slot| (slot as i64, slot, &cols_flat[slot * dim..(slot + 1) * dim])),
         num_cols,
-        limits,
+        max_columns,
         cancel,
         scratch,
     )
@@ -605,7 +640,7 @@ pub fn solve_nnls_flat_f64(
 pub fn solve_nnls_f32(
     target: &[f32],
     columns: &[&[f32]],
-    limits: &ResourceLimits,
+    max_columns: usize,
     cancel: &CancellationToken<'_>,
     scratch: &mut NnlsWorkspace,
 ) -> Result<NnlsSolution, VcpError> {
@@ -617,12 +652,12 @@ pub fn solve_nnls_f32(
             detail: "target must be non-empty and finite".into(),
         });
     }
-    if columns.len() > limits.nnls_max_columns {
+    if columns.len() > max_columns {
         return Err(VcpError::ResourceLimitExceeded {
             stage: STAGE,
-            limit_name: "nnls_max_columns",
+            limit_name: "max_columns",
             actual: columns.len(),
-            limit: limits.nnls_max_columns,
+            limit: max_columns,
         });
     }
     for (slot, col) in columns.iter().enumerate() {
@@ -652,7 +687,7 @@ pub fn solve_nnls_f32(
         &cols_flat,
         columns.len(),
         dim,
-        limits,
+        max_columns,
         cancel,
         scratch,
     )

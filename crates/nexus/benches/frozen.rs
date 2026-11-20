@@ -5,7 +5,7 @@ use nexus::math::DtscConfig;
 use nexus::*;
 use nexus_core::kernel::{cosine_f32, normalize_direction};
 use nexus_core::*;
-use nexus_vcp::{EpaBasis, EvidencePolicy, ObservationConfig, ThinkingConfig};
+use nexus_vcp::{EpaBasis, EvidencePolicy, ObservationConfig, RiverAnalysisConfig, ThinkingConfig};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::hint::black_box;
@@ -15,7 +15,7 @@ use std::time::Instant;
 #[derive(Deserialize)]
 struct Fixture {
     dim: usize,
-    docs: Vec<DocumentId>,
+    docs: Vec<u64>,
     candidate_root_offsets: Vec<u32>,
     candidate_roots: Vec<RootId>,
     candidate_path_offsets: Vec<u32>,
@@ -38,11 +38,12 @@ struct Fixture {
 
 fn vectors(path: &Path) -> Vec<f32> {
     let bytes = std::fs::read(path).expect("read frozen vector file");
-    assert_eq!(bytes.len() % 4, 0);
-    bytes
-        .chunks_exact(4)
-        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
-        .collect()
+    let (rows, remainder) = bytes.as_chunks::<4>();
+    assert!(
+        remainder.is_empty(),
+        "frozen vector file ends inside a float"
+    );
+    rows.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 struct QueryCase {
@@ -123,7 +124,7 @@ fn run_frozen(criterion: &mut Criterion) {
     let source_checksums = vec![0; root_count];
     let source_offsets = vec![0; root_count + 1];
     let ids: Vec<_> = (0..count as u64).collect();
-    let document_ids: Vec<_> = fixture.docs.iter().map(|id| u64::from(id.0)).collect();
+    let document_ids = &fixture.docs;
     let concept_ids: Vec<_> = (1..=tags.rows as u64).collect();
     let nexus = Nexus::from_prepared(PreparedDataset {
         concept_ids: &concept_ids,
@@ -136,11 +137,12 @@ fn run_frozen(criterion: &mut Criterion) {
         groups,
         documents: Some(Catalog {
             ids: &ids,
-            document_ids: Some(&document_ids),
+            document_ids: Some(document_ids),
             vectors: matrix,
             root_offsets: &fixture.candidate_root_offsets,
             roots: &fixture.candidate_roots,
             path_offsets: &fixture.candidate_path_offsets,
+            path_sources: None,
             tag_offsets: &fixture.path_tag_offsets,
             tags: &fixture.path_tags,
             positions: &fixture.path_positions,
@@ -155,12 +157,13 @@ fn run_frozen(criterion: &mut Criterion) {
             root_required_roots: &[],
         },
         counterevidence: CounterevidenceAdjView::empty(),
+        tag_residuals: None,
     })
     .unwrap();
     let candidates = nexus.candidates(CandidateInput::Ids(&ids)).unwrap();
     let config = ObservationConfig::default();
     let thinking_config = ThinkingConfig::default();
-    let readout = RiverConfig {
+    let analysis = RiverAnalysisConfig {
         evidence: EvidencePolicy::DiscountWhenUnattributed,
         ..Default::default()
     };
@@ -183,8 +186,8 @@ fn run_frozen(criterion: &mut Criterion) {
             Ok(())
         };
         let query = Query::new(vector, &fixture.query_texts[index]).with_tag_recall(&recall);
-        let observation = nexus.observe(&query, &config, ctx).unwrap();
-        let evaluation = observation.evaluate(&candidates).unwrap();
+        let observation = nexus.observe(&query, &config, &ctx).unwrap();
+        let evaluation = observation.evaluate(&candidates, &ctx).unwrap();
         let mut scored: Vec<_> = candidate_values
             .chunks_exact(dim)
             .zip(&ids)
@@ -200,6 +203,7 @@ fn run_frozen(criterion: &mut Criterion) {
                     candidates: &stage,
                 }],
                 &thinking_config,
+                &ctx,
             )
             .unwrap();
         if thinking.stages[0]
@@ -230,15 +234,25 @@ fn run_frozen(criterion: &mut Criterion) {
         };
         let query =
             Query::new(queries[index], &fixture.query_texts[index]).with_tag_recall(&recall);
-        let observation = nexus.observe(&query, &config, ctx).unwrap();
-        let evaluation = observation.evaluate(&candidates).unwrap();
-        let fields = observation.fields(&Default::default()).unwrap();
-        let river = evaluation.river(&fields, &readout).unwrap();
+        let observation = nexus.observe(&query, &config, &ctx).unwrap();
+        let evaluation = observation.evaluate(&candidates, &ctx).unwrap();
+        let fields = observation.fields(&Default::default(), &ctx).unwrap();
+        let river = evaluation
+            .river_evidence(&fields, &analysis, &ctx)
+            .unwrap()
+            .readout(&Default::default(), &ctx)
+            .unwrap();
         assert_eq!(river.items.len(), count);
         black_box(river);
         if fanout {
-            let field = observation.dtsc_field(&dtsc_config.field).unwrap();
-            black_box(evaluation.dtsc(&field, &dtsc_config.scoring).unwrap());
+            let field = observation.dtsc_field(&dtsc_config.field, &ctx).unwrap();
+            black_box(
+                evaluation
+                    .dtsc_evidence(&field, &dtsc_config.scoring.evidence, &ctx)
+                    .unwrap()
+                    .readout(&dtsc_config.scoring.readout, &ctx)
+                    .unwrap(),
+            );
             let thinking = evaluation
                 .thinking(
                     &[Stage {
@@ -247,6 +261,7 @@ fn run_frozen(criterion: &mut Criterion) {
                         candidates: &case.stage,
                     }],
                     &thinking_config,
+                    &ctx,
                 )
                 .unwrap();
             assert!(

@@ -50,7 +50,6 @@ macro_rules! define_slot_id {
 
 define_slot_id!(NodeId, "Dense 0-based concept/tag node slot index.");
 define_slot_id!(CandidateId, "Dense 0-based candidate slot index.");
-define_slot_id!(DocumentId, "Dense 0-based document slot index.");
 define_slot_id!(RootId, "Dense 0-based provenance root slot index.");
 define_slot_id!(GroupId, "Dense 0-based support-group slot index.");
 define_slot_id!(PathId, "Dense 0-based curve/path slot index.");

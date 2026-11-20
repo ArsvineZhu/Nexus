@@ -80,31 +80,10 @@ impl<'a> ParallelPolicy<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct ResourceLimits {
-    pub pair_work_limit: usize,
-    pub max_propagation_states: usize,
-    pub max_transition_records: usize,
-    pub nnls_max_columns: usize,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            pair_work_limit: 2_000_000,
-            max_propagation_states: 2000,
-            max_transition_records: 16_000,
-            nnls_max_columns: 256,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct ExecutionContext<'a> {
     pub parallel: ParallelPolicy<'a>,
     pub cancel: CancellationToken<'a>,
-    pub limits: ResourceLimits,
 }
 
 impl Default for ExecutionContext<'_> {
@@ -112,7 +91,6 @@ impl Default for ExecutionContext<'_> {
         Self {
             parallel: ParallelPolicy::Sequential,
             cancel: CancellationToken::none(),
-            limits: ResourceLimits::default(),
         }
     }
 }
@@ -128,21 +106,4 @@ impl<'a> ExecutionContext<'a> {
     pub fn check_cancelled(&self, stage: &'static str) -> Result<(), VcpError> {
         self.cancel.check(stage)
     }
-}
-
-pub trait Operator: Send + Sync {
-    type Config: Send + Sync;
-    type Input<'call>
-    where
-        Self: 'call;
-    type Output: Send + Sync + 'static;
-
-    fn name(&self) -> &'static str;
-
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> Result<Self::Output, VcpError>;
 }

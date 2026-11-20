@@ -9,4 +9,6 @@ python scripts/live-retrieval.py temp/live-retrieval/embeddings.json --endpoint 
 cargo run -p nexus --example live_retrieval --locked -- temp/live-retrieval/embeddings.json
 ```
 
+To compare embedding widths, run the exporter with `--dimensions` set to a width your model supports. Keep concepts, passages and queries in the same model and dimension for each run.
+
 The output shows the expected rank, River score, DTSC result count and number of grounded routes. Use the [frozen corpus benchmark](benchmarks.md) for larger host-style inputs.

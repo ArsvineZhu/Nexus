@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use nexus_math::nexus_core::{
-    CancellationToken, CandidateId, CandidateRowsView, CsrGraph, CsrStorage, DocumentId,
-    ExecutionContext, NodeId, Operator, PathId, QueryCosines, TransportGraph, TransportGraphView,
-    VcpError, VcpResult, VectorMatrixView,
+    CancellationToken, CandidateId, CandidateRowsView, CsrGraph, CsrStorage, ExecutionContext,
+    NodeId, PathId, QueryCosines, TransportGraph, TransportGraphView, VcpError, VcpResult,
+    VectorMatrixView,
 };
 use nexus_math::{
-    DtscAuxConfig, DtscConfig, DtscEvidenceConfig, DtscEvidenceInput, DtscEvidenceOperator,
-    DtscEvidenceValues, DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig,
-    DtscFieldSampler, DtscFieldValues, DtscGeometryState, DtscIdentityConfig, DtscNodeInput,
-    DtscOrder, DtscOutput, DtscReadoutConfig, DtscReadoutInput, DtscReadoutOperator,
-    DtscRewardConfig, DtscSourceType, DtscTrustConfig, dtsc_cosine,
+    DtscAuxConfig, DtscConfig, DtscDecision, DtscEvidenceConfig, DtscEvidenceInput,
+    DtscEvidenceValues, DtscFallbackOrder, DtscFallbackReason, DtscFieldBuildInput,
+    DtscFieldConfig, DtscFieldSampler, DtscFieldValues, DtscGeometryState, DtscIdentityConfig,
+    DtscNodeInput, DtscOutput, DtscReadoutConfig, DtscRewardConfig, DtscSourceType,
+    DtscTrustConfig, build_dtsc_field, dtsc_cosine, prepare_dtsc_evidence, readout_dtsc,
 };
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct CandidateRows {
     matrix: Vec<f32>,
     dim: usize,
-    document_ids: Vec<DocumentId>,
+    document_ids: Vec<u64>,
     root_offsets: Vec<u32>,
     candidate_path_offsets: Vec<u32>,
     path_tag_offsets: Vec<u32>,
@@ -34,7 +34,7 @@ impl CandidateRows {
         let mut rows = Self {
             matrix: Vec::new(),
             dim,
-            document_ids: (0..items.len() as u32).map(DocumentId).collect(),
+            document_ids: (0..items.len() as u64).collect(),
             root_offsets: vec![0; items.len() + 1],
             candidate_path_offsets: vec![0],
             path_tag_offsets: vec![0],
@@ -140,8 +140,8 @@ fn seeds(values: &[(u32, f64)]) -> Vec<DtscNodeInput> {
         .iter()
         .map(|&(node, energy)| DtscNodeInput {
             node: NodeId(node),
-            energy,
-            normalized_energy: energy,
+            mass: energy,
+
             source_type: DtscSourceType::Seed,
         })
         .collect()
@@ -152,13 +152,12 @@ fn build_field(
     tag_vectors: VectorMatrixView<'_, f32>,
     config: &DtscFieldConfig,
 ) -> DtscFieldValues {
-    DtscFieldBuildOperator
-        .execute(
-            &ExecutionContext::default(),
-            config,
-            DtscFieldBuildInput { nodes, tag_vectors },
-        )
-        .unwrap()
+    build_dtsc_field(
+        DtscFieldBuildInput { nodes, tag_vectors },
+        config,
+        &ExecutionContext::default(),
+    )
+    .unwrap()
 }
 
 fn evidence(
@@ -168,9 +167,7 @@ fn evidence(
     tag_vectors: VectorMatrixView<'_, f32>,
     config: &DtscEvidenceConfig,
 ) -> VcpResult<DtscEvidenceValues> {
-    DtscEvidenceOperator.execute(
-        &ExecutionContext::default(),
-        config,
+    prepare_dtsc_evidence(
         DtscEvidenceInput {
             field,
             query,
@@ -178,17 +175,13 @@ fn evidence(
             tag_vectors,
             geometry: DtscGeometryState::default(),
         },
+        config,
+        &ExecutionContext::default(),
     )
 }
 
 fn readout(evidence: &DtscEvidenceValues, config: &DtscReadoutConfig) -> DtscOutput {
-    DtscReadoutOperator
-        .execute(
-            &ExecutionContext::default(),
-            config,
-            DtscReadoutInput { evidence },
-        )
-        .unwrap()
+    readout_dtsc(evidence, config, &ExecutionContext::default()).unwrap()
 }
 
 #[test]
@@ -211,10 +204,16 @@ fn evidence_is_candidate_local_and_fallback_uses_the_entire_pool() {
     let b_evidence = evidence(&field, &b_query, graph.view(), tags, &scoring).unwrap();
     let a_contact = &a_evidence.items()[0];
     let b_contact = &b_evidence.items()[1];
-    assert_eq!(a_contact.geo_score.to_bits(), b_contact.geo_score.to_bits());
-    assert_eq!(a_contact.geo_bonus.to_bits(), b_contact.geo_bonus.to_bits());
+    assert_eq!(
+        a_contact.scores.geo_score.to_bits(),
+        b_contact.scores.geo_score.to_bits()
+    );
+    assert_eq!(
+        a_contact.scores.geo_bonus.to_bits(),
+        b_contact.scores.geo_bonus.to_bits()
+    );
     assert_eq!(b_contact.chosen_path, Some(PathId(0)));
-    assert!(b_contact.geo_bonus > 0.0);
+    assert!(b_contact.scores.geo_bonus > 0.0);
 
     let mut config = DtscReadoutConfig {
         trust: DtscTrustConfig {
@@ -226,53 +225,78 @@ fn evidence_is_candidate_local_and_fallback_uses_the_entire_pool() {
         ..Default::default()
     };
     let alone = readout(&a_evidence, &config);
-    assert!(!alone.fallback_used);
-    assert!(alone.results[0].score > 1.0);
+    assert_eq!(alone.decision, DtscDecision::Scored);
+    assert!(alone.results[0].scores.score > 1.0);
     let mixed = readout(&b_evidence, &config);
-    assert_eq!(mixed.order, DtscOrder::Input);
     assert_eq!(
-        mixed.fallback_reason,
-        Some("candidate-curve-readout-jointly-low-trust")
+        mixed.decision,
+        DtscDecision::Fallback {
+            reason: DtscFallbackReason::InsufficientCandidateCoverage,
+            order: DtscFallbackOrder::OriginalCosine,
+        }
     );
     assert_eq!(
         mixed
             .results
             .iter()
-            .map(|item| item.score)
+            .map(|item| item.scores.score)
             .collect::<Vec<_>>(),
-        [0.0, 1.0]
+        [1.0, 0.0]
     );
     for item in &mixed.results {
-        assert_eq!(item.score, item.original_cosine);
-        assert_eq!(item.geo_bonus, 0.0);
-        assert_eq!(item.geo_base_bonus, 0.0);
-        assert_eq!(item.geo_aux_bonus, 0.0);
-        assert_eq!(item.geo_effect, "neutral");
+        assert_eq!(item.scores.score, item.scores.original_cosine);
+        assert_eq!(item.scores.geo_bonus, 0.0);
+        assert_eq!(item.scores.geo_base_bonus, 0.0);
+        assert_eq!(item.scores.geo_aux_bonus, 0.0);
+        assert_eq!(item.scores.geo_effect, "neutral");
     }
-    assert!(b_evidence.items()[1].geo_bonus > 0.0);
+    assert!(b_evidence.items()[1].scores.geo_bonus > 0.0);
+
+    config.top_k = 1;
+    let dense_fallback = readout(&b_evidence, &config);
+    assert_eq!(dense_fallback.results[0].candidate, CandidateId(1));
+    config.fallback_order = DtscFallbackOrder::InputOrder;
+    let host_fallback = readout(&b_evidence, &config);
+    assert_eq!(
+        host_fallback.decision,
+        DtscDecision::Fallback {
+            reason: DtscFallbackReason::InsufficientCandidateCoverage,
+            order: DtscFallbackOrder::InputOrder,
+        }
+    );
+    assert_eq!(host_fallback.results[0].candidate, CandidateId(0));
 
     config.fallback_on_low_trust = false;
-    config.top_k = 1;
+    config.fallback_order = DtscFallbackOrder::OriginalCosine;
     let first = readout(&b_evidence, &config);
-    assert_eq!(first.order, DtscOrder::Score);
+    assert_eq!(first.decision, DtscDecision::Scored);
     assert_eq!(first.available, 2);
     assert_eq!(first.results.len(), 1);
     assert_eq!(first.results[0].candidate, CandidateId(1));
-    assert_eq!(first.results[0].score.to_bits(), b_contact.score.to_bits());
-    assert!(!first.diagnostics.truncated);
+    close(
+        "default weighted score",
+        first.results[0].scores.score,
+        b_contact.scores.original_cosine + 0.15 * b_contact.scores.geo_bonus,
+    );
 
     let short = build_field(&nodes[..1], tags, &DtscFieldConfig::default());
     let short_evidence = evidence(&short, &a_query, graph.view(), tags, &scoring).unwrap();
     assert_eq!(
-        readout(&short_evidence, &config).fallback_reason,
-        Some("query-energy-field-low-trust")
+        readout(&short_evidence, &config).decision,
+        DtscDecision::Fallback {
+            reason: DtscFallbackReason::InsufficientFieldSupport,
+            order: DtscFallbackOrder::OriginalCosine,
+        }
     );
     let cold = CandidateRows::new(2, &[no_path]);
     let cold_query = QueryCosines::prepare(&ctx, cold.view(), &q, &q).unwrap();
     let cold_evidence = evidence(&field, &cold_query, graph.view(), tags, &scoring).unwrap();
     assert_eq!(
-        readout(&cold_evidence, &config).fallback_reason,
-        Some("no-candidate-curve-contacted-query-field")
+        readout(&cold_evidence, &config).decision,
+        DtscDecision::Fallback {
+            reason: DtscFallbackReason::NoCurveContact,
+            order: DtscFallbackOrder::OriginalCosine,
+        }
     );
 }
 
@@ -297,18 +321,18 @@ fn identity_auxiliary_adds_the_expected_reward() {
     };
     let disabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
     let baseline = &disabled.items()[0];
-    assert_eq!(baseline.geo_base_bonus, 0.0);
-    assert_eq!(baseline.geo_aux_bonus, 0.0);
-    assert_eq!(baseline.auxiliary_evidence, None);
+    assert_eq!(baseline.scores.geo_base_bonus, 0.0);
+    assert_eq!(baseline.scores.geo_aux_bonus, 0.0);
+    assert_eq!(baseline.scores.auxiliary_evidence, None);
     config.auxiliary = Some(DtscAuxConfig::default());
     let geometry = evidence(&field, &query, graph.view(), tags, &config).unwrap();
     let item = &geometry.items()[0];
-    let auxiliary = item.auxiliary_evidence.unwrap();
+    let auxiliary = item.scores.auxiliary_evidence.unwrap();
     assert!(auxiliary.geometry_floor > 0.0);
     assert_eq!(auxiliary.identity_floor, 0.0);
     close(
         "geometry-only auxiliary bonus",
-        item.geo_aux_bonus,
+        item.scores.geo_aux_bonus,
         auxiliary.geometry_floor,
     );
 
@@ -317,14 +341,53 @@ fn identity_auxiliary_adds_the_expected_reward() {
         ..Default::default()
     });
     let enabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let result = readout(&enabled, &DtscReadoutConfig::default());
+    let result = readout(
+        &enabled,
+        &DtscReadoutConfig {
+            geometry_weight: 1.0,
+            ..Default::default()
+        },
+    );
     let item = &result.results[0];
-    let auxiliary = item.auxiliary_evidence.unwrap();
+    let auxiliary = item.scores.auxiliary_evidence.unwrap();
     assert!(auxiliary.shadow_score > 0.0);
     close("identity floor", auxiliary.identity_floor, 0.018);
-    close("auxiliary bonus", item.geo_aux_bonus, 0.018);
-    close("score", item.score, 1.018);
-    assert!(item.geo_bonus <= config.reward.direct_bonus_cap);
+    close("auxiliary bonus", item.scores.geo_aux_bonus, 0.018);
+    close("score", item.scores.score, 1.018);
+    assert!(item.scores.geo_bonus <= config.reward.direct_bonus_cap);
+}
+
+#[test]
+fn inferred_contact_contributes_structure_without_a_direct_anchor() {
+    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
+    let mut nodes = seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]);
+    let graph = empty_graph(3);
+    let rows = CandidateRows::new(2, &[(vec![1.0, 0.0], vec![path(&[0])])]);
+    let q = [1.0, 0.0];
+    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
+    let score = |nodes: &[DtscNodeInput]| {
+        let field = build_field(nodes, tags, &DtscFieldConfig::default());
+        evidence(
+            &field,
+            &query,
+            graph.view(),
+            tags,
+            &DtscEvidenceConfig::default(),
+        )
+        .unwrap()
+        .items()[0]
+            .scores
+            .clone()
+    };
+
+    let direct = score(&nodes);
+    nodes[0].source_type = DtscSourceType::Inferred;
+    let inferred = score(&nodes);
+
+    assert_eq!(direct.geo_evidence_class, "direct");
+    assert_eq!(inferred.geo_evidence_class, "structural");
+    assert_eq!(inferred.geo_exact_hits, direct.geo_exact_hits);
+    assert!(inferred.geo_bonus > 0.0 && inferred.geo_bonus < direct.geo_bonus);
 }
 
 #[test]
@@ -361,11 +424,11 @@ fn sparse_association_uses_effective_transport_edges() {
     let without_relief = evidence(&field, &query, graph.view(), tags, &config).unwrap();
     let on = &with_relief.items()[0];
     let off = &without_relief.items()[0];
-    assert!(on.geo_isolated_ratio < off.geo_isolated_ratio);
-    assert!(on.geo_score > off.geo_score);
+    assert!(on.scores.geo_isolated_ratio < off.scores.geo_isolated_ratio);
+    assert!(on.scores.geo_score > off.scores.geo_score);
     assert_eq!(
-        off.geo_isolated_ratio.to_bits(),
-        with_gate.items()[0].geo_isolated_ratio.to_bits()
+        off.scores.geo_isolated_ratio.to_bits(),
+        with_gate.items()[0].scores.geo_isolated_ratio.to_bits()
     );
 }
 
@@ -411,12 +474,12 @@ fn full_path_scoring_keeps_path_identity_and_stable_ties() {
     .unwrap();
     assert_eq!(raw.items()[0].chosen_path, Some(PathId(1)));
     assert_eq!(
-        raw.items()[0].score.to_bits(),
-        raw.items()[1].score.to_bits()
+        raw.items()[0].scores.score.to_bits(),
+        raw.items()[1].scores.score.to_bits()
     );
-    assert_eq!(raw.items()[0].geo_hit_count, 3);
-    assert_eq!(raw.items()[2].geo_hit_count, 1);
-    assert!(raw.items()[0].score > raw.items()[2].score);
+    assert_eq!(raw.items()[0].scores.geo_hit_count, 3);
+    assert_eq!(raw.items()[2].scores.geo_hit_count, 1);
+    assert!(raw.items()[0].scores.score > raw.items()[2].scores.score);
     let result = readout(
         &raw,
         &DtscReadoutConfig {
@@ -465,11 +528,14 @@ fn trust_rejects_an_undifferentiated_pool_until_policy_changes() {
         ..Default::default()
     };
     assert_eq!(
-        readout(&evidence, &config).fallback_reason,
-        Some("candidate-curve-scores-lack-discrimination")
+        readout(&evidence, &config).decision,
+        DtscDecision::Fallback {
+            reason: DtscFallbackReason::InsufficientScoreSpread,
+            order: DtscFallbackOrder::OriginalCosine,
+        }
     );
     config.fallback_on_low_trust = false;
-    assert!(!readout(&evidence, &config).fallback_used);
+    assert_eq!(readout(&evidence, &config).decision, DtscDecision::Scored);
 
     let flag = AtomicBool::new(false);
     let ctx = ExecutionContext {
@@ -477,25 +543,21 @@ fn trust_rejects_an_undifferentiated_pool_until_policy_changes() {
         ..Default::default()
     };
     flag.store(true, Ordering::Relaxed);
-    let cancelled = DtscReadoutOperator.execute(
-        &ctx,
-        &config,
-        DtscReadoutInput {
-            evidence: &evidence,
-        },
-    );
+    let cancelled = readout_dtsc(&evidence, &config, &ctx);
     assert!(matches!(cancelled, Err(VcpError::Cancelled { .. })));
 }
 
 #[test]
 fn config_deserialization_and_validation_follow_stage_ownership() {
     let config: DtscConfig = serde_json::from_value(serde_json::json!({
-        "field": {"min_field_entropy": 0.5},
-        "scoring": {"evidence": {"reward": {"alpha": 0.2}}, "readout": {"top_k": 7}}
+        "scoring": {
+            "evidence": {"reward": {"alpha": 0.2}},
+            "readout": {"top_k": 7, "trust": {"min_field_entropy": 0.5}}
+        }
     }))
     .unwrap();
     config.validate().unwrap();
-    assert_eq!(config.field.min_field_entropy, 0.5);
+    assert_eq!(config.scoring.readout.trust.min_field_entropy, 0.5);
     assert_eq!(config.scoring.evidence.reward.alpha, 0.2);
     assert_eq!(config.scoring.readout.top_k, 7);
     assert!(serde_json::from_value::<DtscConfig>(serde_json::json!({"top_k": 7})).is_err());
@@ -539,8 +601,8 @@ fn fixture_nodes(input: &Value) -> Vec<DtscNodeInput> {
         .iter()
         .map(|node| DtscNodeInput {
             node: NodeId((node["id"].as_u64().unwrap() - 1) as u32),
-            energy: node["energy"].as_f64().unwrap(),
-            normalized_energy: node["normalizedEnergy"].as_f64().unwrap(),
+            mass: node["energy"].as_f64().unwrap(),
+
             source_type: serde_json::from_value(node["sourceType"].clone()).unwrap(),
         })
         .collect()
@@ -631,17 +693,34 @@ fn nous_wave_field_corpus() {
             &DtscEvidenceConfig::default(),
         )
         .unwrap();
-        assert_eq!(
-            readout(&raw, &DtscReadoutConfig::default()).field_trusted,
-            expected["fieldTrusted"].as_bool().unwrap()
-        );
-        if expected["fieldTrusted"] == false {
-            let permissive = DtscReadoutConfig {
+        let strict = readout(&raw, &DtscReadoutConfig::default());
+        let permissive = readout(
+            &raw,
+            &DtscReadoutConfig {
                 fallback_on_low_trust: false,
                 ..Default::default()
-            };
-            assert!(readout(&raw, &permissive).field_trusted);
-        }
+            },
+        );
+        assert_eq!(strict.field, permissive.field);
+        let expected_reason = if expected["fieldTrusted"] == false {
+            DtscFallbackReason::LowFieldEntropy
+        } else {
+            DtscFallbackReason::NoCurveContact
+        };
+        assert_eq!(
+            strict.decision,
+            DtscDecision::Fallback {
+                reason: expected_reason,
+                order: DtscFallbackOrder::OriginalCosine,
+            }
+        );
+        assert_eq!(
+            permissive.decision,
+            DtscDecision::Fallback {
+                reason: DtscFallbackReason::NoCurveContact,
+                order: DtscFallbackOrder::OriginalCosine,
+            }
+        );
     }
 }
 
@@ -723,20 +802,39 @@ fn nous_wave_curve_and_fallback_corpus() {
             &raw,
             &DtscReadoutConfig {
                 top_k,
+                fallback_order: DtscFallbackOrder::InputOrder,
+                geometry_weight: 1.0,
                 ..Default::default()
             },
         );
         let expected = &case["expected"];
         let diagnostics = &expected["diagnostics"];
-        assert_eq!(
-            actual.fallback_reason,
-            diagnostics["fallbackReason"].as_str()
-        );
-        let trusted = diagnostics["fieldTrusted"].as_bool().unwrap();
-        assert_eq!(actual.field_trusted, trusted);
+        let expected_decision = match diagnostics["fallbackReason"].as_str() {
+            None => DtscDecision::Scored,
+            Some(reason) => DtscDecision::Fallback {
+                reason: match reason {
+                    "query-energy-field-low-trust" if actual.field.positive_nodes < 3 => {
+                        DtscFallbackReason::InsufficientFieldSupport
+                    }
+                    "query-energy-field-low-trust" => DtscFallbackReason::LowFieldEntropy,
+                    "no-candidate-curve-contacted-query-field" => {
+                        DtscFallbackReason::NoCurveContact
+                    }
+                    "candidate-curve-readout-jointly-low-trust" => {
+                        DtscFallbackReason::InsufficientCandidateCoverage
+                    }
+                    "candidate-curve-scores-lack-discrimination" => {
+                        DtscFallbackReason::InsufficientScoreSpread
+                    }
+                    _ => panic!("unknown fixture reason {reason}"),
+                },
+                order: DtscFallbackOrder::InputOrder,
+            },
+        };
+        assert_eq!(actual.decision, expected_decision);
         close(
             "curve field entropy",
-            actual.field_entropy,
+            actual.field.entropy,
             diagnostics["fieldEntropy"].as_f64().unwrap(),
         );
 
@@ -763,13 +861,13 @@ fn nous_wave_curve_and_fallback_corpus() {
             actual.results.iter().zip(expected_scores)
         {
             assert_eq!(item.candidate, candidate);
-            close("original cosine", item.original_cosine, cosine);
-            close("score", item.score, score);
+            close("original cosine", item.scores.original_cosine, cosine);
+            close("score", item.scores.score, score);
             for (label, value) in [
-                ("geoScore", item.geo_score),
-                ("geoBonus", item.geo_bonus),
-                ("geoConfidence", item.geo_confidence),
-                ("geoIsolatedRatio", item.geo_isolated_ratio),
+                ("geoScore", item.scores.geo_score),
+                ("geoBonus", item.scores.geo_bonus),
+                ("geoConfidence", item.scores.geo_confidence),
+                ("geoIsolatedRatio", item.scores.geo_isolated_ratio),
             ] {
                 close(label, value, expected[label].as_f64().unwrap());
             }

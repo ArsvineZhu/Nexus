@@ -3,20 +3,21 @@
 use crate::dataset::{invalid, slot};
 use crate::query::PyramidRecall;
 use crate::{Nexus, Query};
+use nexus_core::csr::EffectiveTransport;
 use nexus_core::kernel::normalize_direction;
-use nexus_core::{ExecutionContext, NodeId, Operator, VcpResult, VectorMatrixView};
+use nexus_core::{ExecutionContext, NodeId, VcpResult, VectorMatrixView};
 use nexus_math::{
-    DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig, DtscFieldValues, DtscNodeInput,
-    DtscSourceType,
+    DtscFieldBuildInput, DtscFieldConfig, DtscFieldValues, DtscNodeInput, DtscSourceType,
+    build_dtsc_field,
 };
 use nexus_vcp::{
-    ComputeFields, FieldConfig, FieldInput, FieldValues, ObservationConfig, ObservationInput,
-    ObservationState, Observe, SeedSourceKind,
+    FieldConfig, FieldInput, FieldValues, ObservationConfig, ObservationInput, ObservationState,
+    SeedSourceKind, compute_fields, observe,
 };
 
 pub struct Observation<'data> {
     pub(crate) nexus: &'data Nexus<'data>,
-    ctx: ExecutionContext<'data>,
+    effective: Option<EffectiveTransport<'data>>,
     values: ObservationState,
 }
 
@@ -35,29 +36,35 @@ impl Nexus<'_> {
         &'data self,
         query: &Query<'_>,
         config: &ObservationConfig,
-        ctx: ExecutionContext<'data>,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<Observation<'data>> {
         const STAGE: &str = "observe";
         ctx.check_cancelled(STAGE)?;
         let assets = self.prepared();
-        let recall = query
-            .tag_recall
-            .ok_or_else(|| invalid(STAGE, "supply a concept recall provider on Query"))?;
+        let effective = query
+            .edge_gates
+            .map(|gates| assets.graph.attenuate(gates))
+            .transpose()?;
+        let graph = effective
+            .as_ref()
+            .map_or(assets.graph, EffectiveTransport::view);
         let original = normalize_direction(query.vector, assets.tags.dim, STAGE)?;
         let core_tags = query
             .core_concepts
             .iter()
             .map(|&id| NodeId::from_index(slot(&self.concept_slots, id)?, STAGE))
             .collect::<VcpResult<Vec<_>>>()?;
-        let adapter = PyramidRecall::new(self, &ctx, recall);
-        let recall = |layer,
-                      residual: &[f32],
-                      limit,
-                      out: &mut Vec<NodeId>,
-                      epa: Option<&nexus_vcp::EpaAnalysis>,
-                      excluded: &[NodeId]| {
-            adapter.recall(layer, residual, limit, out, epa, excluded)
-        };
+        let recall = query.tag_recall.map(|provider| {
+            let adapter = PyramidRecall::new(self, ctx, provider);
+            move |layer,
+                  residual: &[f32],
+                  limit,
+                  out: &mut Vec<NodeId>,
+                  epa: Option<&nexus_vcp::EpaAnalysis>,
+                  excluded: &[NodeId]| {
+                adapter.recall(layer, residual, limit, out, epa, excluded)
+            }
+        });
         let mut ghosts = Vec::new();
         let ghost_vectors = if let Some(matrix) = query.ghost_vectors {
             matrix.validate(STAGE)?;
@@ -74,14 +81,14 @@ impl Nexus<'_> {
         } else {
             None
         };
-        let values = Observe.execute(
-            &ctx,
-            config,
+        let values = observe(
             ObservationInput {
                 query: &original,
                 query_text: query.text,
-                candidates: &recall,
-                graph: assets.graph,
+                candidates: recall
+                    .as_ref()
+                    .map(|callback| callback as &nexus_vcp::PyramidCandidates<'_>),
+                graph,
                 tag_vectors: assets.tags,
                 lexical_meta: assets.lexical,
                 epa_basis: assets.basis,
@@ -89,33 +96,41 @@ impl Nexus<'_> {
                 ghost_vectors,
                 ghost_is_core: query.ghost_is_core,
             },
+            config,
+            ctx,
         )?;
         Ok(Observation {
             nexus: self,
-            ctx,
+            effective,
             values,
         })
     }
 }
 
 impl<'data> Observation<'data> {
-    pub fn context(&self) -> &ExecutionContext<'data> {
-        &self.ctx
+    pub fn graph(&self) -> nexus_core::TransportGraphView<'_> {
+        self.effective
+            .as_ref()
+            .map_or_else(|| self.nexus.prepared().graph, EffectiveTransport::view)
     }
     pub fn values(&self) -> &ObservationState {
         &self.values
     }
 
-    pub fn fields<'obs>(&'obs self, config: &FieldConfig) -> VcpResult<FieldState<'obs, 'data>> {
+    pub fn fields<'obs>(
+        &'obs self,
+        config: &FieldConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<FieldState<'obs, 'data>> {
         let assets = self.nexus.prepared();
-        let values = ComputeFields.execute(
-            &self.ctx,
-            config,
+        let values = compute_fields(
             FieldInput {
-                graph: assets.graph,
+                graph: self.graph(),
                 tag_vectors: assets.tags,
                 observation: &self.values,
             },
+            config,
+            ctx,
         )?;
         Ok(FieldState {
             observation: self,
@@ -126,6 +141,7 @@ impl<'data> Observation<'data> {
     pub fn dtsc_field<'obs>(
         &'obs self,
         config: &DtscFieldConfig,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<DtscField<'obs, 'data>> {
         let nodes = self
             .values
@@ -134,24 +150,22 @@ impl<'data> Observation<'data> {
             .iter()
             .map(|node| DtscNodeInput {
                 node: node.node,
-                energy: node.energy,
-                normalized_energy: node.normalized_energy,
-                source_type: if node.hop > 0 {
-                    DtscSourceType::Emergent
-                } else if node.source_kind == SeedSourceKind::Core {
-                    DtscSourceType::Core
-                } else {
-                    DtscSourceType::Seed
+                mass: node.energy,
+                source_type: match node.source_kind {
+                    SeedSourceKind::Core => DtscSourceType::Core,
+                    SeedSourceKind::LexicalSeed => DtscSourceType::Seed,
+                    SeedSourceKind::Seed => DtscSourceType::Inferred,
+                    SeedSourceKind::Emergent => DtscSourceType::Emergent,
                 },
             })
             .collect::<Vec<_>>();
-        let values = DtscFieldBuildOperator.execute(
-            &self.ctx,
-            config,
+        let values = build_dtsc_field(
             DtscFieldBuildInput {
                 nodes: &nodes,
                 tag_vectors: self.nexus.prepared().tags,
             },
+            config,
+            ctx,
         )?;
         Ok(DtscField {
             observation: self,

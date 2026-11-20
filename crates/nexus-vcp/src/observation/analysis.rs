@@ -4,7 +4,7 @@ use super::{invalid, unit_direction};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f32, norm_sq_f64};
 use nexus_core::nnls::solve_nnls_with_ids_f64;
 use nexus_core::{
-    EpaBasisView, ExecutionContext, NodeId, Operator, PrecisionMode, VcpResult, VectorMatrixView,
+    EpaBasisView, ExecutionContext, NodeId, PrecisionMode, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,142 +82,129 @@ impl Default for EpaAnalysis {
     }
 }
 
-pub struct EpaAnalyzeOperator;
-
-impl Operator for EpaAnalyzeOperator {
-    type Config = EpaConfig;
-    type Input<'call> = EpaAnalyzeInput<'call>;
-    type Output = EpaAnalysis;
-
-    fn name(&self) -> &'static str {
-        "epa.analyze"
+pub fn analyze_epa(
+    input: EpaAnalyzeInput<'_>,
+    config: &EpaConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<EpaAnalysis> {
+    let stage = "epa.analyze";
+    ctx.check_cancelled(stage)?;
+    let basis = input.basis.filter(|basis| !basis.is_empty());
+    unit_direction(
+        stage,
+        input.query,
+        basis.map_or(input.query.len(), |basis| basis.dim),
+    )?;
+    let Some(basis) = basis else {
+        return Ok(EpaAnalysis::default());
+    };
+    basis.validate(stage)?;
+    let mut centered_buffer = vec![0.0; basis.dim];
+    let centered = centered_buffer.as_mut_slice();
+    for ((slot, &value), &mean) in centered.iter_mut().zip(input.query).zip(basis.mean) {
+        *slot = f64::from(value) - mean;
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
+    let count = basis.k_sem.max(1).min(basis.basis_count);
+    let mode = PrecisionMode::FastSimd;
+    let centered_energy = norm_sq_f64(centered, mode);
+    let mut semantic = Vec::with_capacity(count);
+    let mut captured = 0.0;
+    let mut mean_captured = 0.0;
+    for (index, axis) in basis.basis.chunks_exact(basis.dim).enumerate() {
         ctx.check_cancelled(stage)?;
-        let basis = input.basis.filter(|basis| !basis.is_empty());
-        unit_direction(
-            stage,
-            input.query,
-            basis.map_or(input.query.len(), |basis| basis.dim),
-        )?;
-        let Some(basis) = basis else {
-            return Ok(EpaAnalysis::default());
-        };
-        basis.validate(stage)?;
-        let mut centered_buffer = vec![0.0; basis.dim];
-        let centered = centered_buffer.as_mut_slice();
-        for ((slot, &value), &mean) in centered.iter_mut().zip(input.query).zip(basis.mean) {
-            *slot = f64::from(value) - mean;
+        let projection = dot_f64(centered, axis, mode);
+        captured += projection * projection;
+        if index < count {
+            semantic.push(projection);
+            mean_captured += dot_f64(basis.mean, axis, mode).powi(2);
         }
-        let count = basis.k_sem.max(1).min(basis.basis_count);
-        let mode = PrecisionMode::FastSimd;
-        let centered_energy = norm_sq_f64(centered, mode);
-        let mut semantic = Vec::with_capacity(count);
-        let mut captured = 0.0;
-        let mut mean_captured = 0.0;
-        for (index, axis) in basis.basis.chunks_exact(basis.dim).enumerate() {
-            ctx.check_cancelled(stage)?;
-            let projection = dot_f64(centered, axis, mode);
-            captured += projection * projection;
-            if index < count {
-                semantic.push(projection);
-                mean_captured += dot_f64(basis.mean, axis, mode).powi(2);
-            }
-        }
-        let energy = semantic.iter().map(|v| v * v).sum::<f64>();
-        let raw_background = count as f64 / basis.dim as f64;
-        let baseline = if basis.coverage[count - 1] > 0.0 && basis.coverage[count - 1] <= 1.0 {
-            basis.coverage[count - 1]
-        } else {
-            raw_background
-        }
-        .max(1e-4);
-        let background = ((raw_background + mean_captured) / (1.0 + norm_sq_f64(basis.mean, mode)))
-            .clamp(0.0, 1.0);
-        let ratio = if centered_energy > 1e-12 {
-            (energy / centered_energy).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let gate = if centered_energy <= 1e-12 {
-            0.0
-        } else {
-            match config.gate_mode {
-                EpaGateMode::BackgroundRelative if baseline > background + 1e-8 => {
-                    (ratio - background) / (baseline - background)
-                }
-                EpaGateMode::BackgroundRelative => 0.0,
-                EpaGateMode::RelativeLinear => ratio / baseline,
-                EpaGateMode::RelativeSqrt => (ratio / baseline).sqrt(),
-                EpaGateMode::Raw => ratio,
-            }
-            .clamp(0.0, 1.0)
-        };
-        let mut entropy = 0.0;
-        let mut dominant_axes = Vec::new();
-        if energy > 1e-12 {
-            for (index, projection) in semantic.into_iter().enumerate() {
-                let probability = projection * projection / energy;
-                if probability > 1e-9 {
-                    entropy -= probability * probability.log2();
-                }
-                if probability > 0.05 {
-                    dominant_axes.push(EpaAxis {
-                        index,
-                        energy: probability,
-                        projection,
-                        score: probability,
-                    });
-                }
-            }
-            if basis.k_sem > 1 {
-                entropy = (entropy / (basis.k_sem as f64).log2()).clamp(0.0, 1.0);
-            }
-        } else {
-            entropy = 1.0;
-        }
-        dominant_axes
-            .sort_unstable_by(|a, b| b.energy.total_cmp(&a.energy).then(a.index.cmp(&b.index)));
-        let mut bridges = Vec::new();
-        if let Some(primary) = dominant_axes.first() {
-            for secondary in &dominant_axes[1..] {
-                let strength = (primary.energy * secondary.energy).sqrt();
-                if strength > 0.15 {
-                    bridges.push(EpaBridge {
-                        from_axis: primary.index,
-                        to_axis: secondary.index,
-                        strength,
-                        balance: secondary.energy / primary.energy,
-                    });
-                }
-            }
-        }
-        Ok(EpaAnalysis {
-            spectral_concentration: (1.0 - entropy) * gate,
-            entropy,
-            resonance: bridges.iter().map(|bridge| bridge.strength).sum(),
-            dominant_axes,
-            bridges,
-            basis_count: basis.basis_count,
-            cache_available: true,
-            out_of_domain: if centered_energy > 1e-12 {
-                (1.0 - captured / centered_energy).clamp(0.0, 1.0).sqrt()
-            } else {
-                0.0
-            },
-            semantic_explained_ratio: ratio,
-            in_domain_gate: gate,
-            baseline_coverage: baseline,
-            background_ratio: background,
-        })
     }
+    let energy = semantic.iter().map(|v| v * v).sum::<f64>();
+    let raw_background = count as f64 / basis.dim as f64;
+    let baseline = if basis.coverage[count - 1] > 0.0 && basis.coverage[count - 1] <= 1.0 {
+        basis.coverage[count - 1]
+    } else {
+        raw_background
+    }
+    .max(1e-4);
+    let background =
+        ((raw_background + mean_captured) / (1.0 + norm_sq_f64(basis.mean, mode))).clamp(0.0, 1.0);
+    let ratio = if centered_energy > 1e-12 {
+        (energy / centered_energy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gate = if centered_energy <= 1e-12 {
+        0.0
+    } else {
+        match config.gate_mode {
+            EpaGateMode::BackgroundRelative if baseline > background + 1e-8 => {
+                (ratio - background) / (baseline - background)
+            }
+            EpaGateMode::BackgroundRelative => 0.0,
+            EpaGateMode::RelativeLinear => ratio / baseline,
+            EpaGateMode::RelativeSqrt => (ratio / baseline).sqrt(),
+            EpaGateMode::Raw => ratio,
+        }
+        .clamp(0.0, 1.0)
+    };
+    let mut entropy = 0.0;
+    let mut dominant_axes = Vec::new();
+    if energy > 1e-12 {
+        for (index, projection) in semantic.into_iter().enumerate() {
+            let probability = projection * projection / energy;
+            if probability > 1e-9 {
+                entropy -= probability * probability.log2();
+            }
+            if probability > 0.05 {
+                dominant_axes.push(EpaAxis {
+                    index,
+                    energy: probability,
+                    projection,
+                    score: probability,
+                });
+            }
+        }
+        if basis.k_sem > 1 {
+            entropy = (entropy / (basis.k_sem as f64).log2()).clamp(0.0, 1.0);
+        }
+    } else {
+        entropy = 1.0;
+    }
+    dominant_axes
+        .sort_unstable_by(|a, b| b.energy.total_cmp(&a.energy).then(a.index.cmp(&b.index)));
+    let mut bridges = Vec::new();
+    if let Some(primary) = dominant_axes.first() {
+        for secondary in &dominant_axes[1..] {
+            let strength = (primary.energy * secondary.energy).sqrt();
+            if strength > 0.15 {
+                bridges.push(EpaBridge {
+                    from_axis: primary.index,
+                    to_axis: secondary.index,
+                    strength,
+                    balance: secondary.energy / primary.energy,
+                });
+            }
+        }
+    }
+    Ok(EpaAnalysis {
+        spectral_concentration: (1.0 - entropy) * gate,
+        entropy,
+        resonance: bridges.iter().map(|bridge| bridge.strength).sum(),
+        dominant_axes,
+        bridges,
+        basis_count: basis.basis_count,
+        cache_available: true,
+        out_of_domain: if centered_energy > 1e-12 {
+            (1.0 - captured / centered_energy).clamp(0.0, 1.0).sqrt()
+        } else {
+            0.0
+        },
+        semantic_explained_ratio: ratio,
+        in_domain_gate: gate,
+        baseline_coverage: baseline,
+        background_ratio: background,
+    })
 }
 
 /// The host fills up to `limit` graph-local candidates for the current residual.
@@ -253,7 +240,7 @@ impl Default for PyramidConfig {
 #[derive(Clone, Copy)]
 pub struct PyramidAnalyzeInput<'call> {
     pub query: &'call [f32],
-    pub candidates: &'call PyramidCandidates<'call>,
+    pub candidates: Option<&'call PyramidCandidates<'call>>,
     pub epa: Option<&'call EpaAnalysis>,
     pub tag_vectors: VectorMatrixView<'call, f32>,
 }
@@ -344,151 +331,146 @@ fn handshakes(
     }
 }
 
-pub struct PyramidAnalyzeOperator;
-
-impl Operator for PyramidAnalyzeOperator {
-    type Config = PyramidConfig;
-    type Input<'call> = PyramidAnalyzeInput<'call>;
-    type Output = PyramidResidual;
-
-    fn name(&self) -> &'static str {
-        "pyramid.analyze"
+pub fn analyze_pyramid(
+    input: PyramidAnalyzeInput<'_>,
+    config: &PyramidConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<PyramidResidual> {
+    let stage = "pyramid.analyze";
+    ctx.check_cancelled(stage)?;
+    input.tag_vectors.validate(stage)?;
+    unit_direction(stage, input.query, input.tag_vectors.dim)?;
+    if ![
+        config.min_energy_ratio,
+        config.min_layer_explained_energy,
+        config.tail_residual_min_ratio,
+    ]
+    .into_iter()
+    .all(|v| (0.0..=1.0).contains(&v))
+    {
+        return Err(invalid(
+            stage,
+            "pyramid energy thresholds must be in [0, 1]",
+        ));
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
+    let mut output = PyramidResidual {
+        novelty: 1.0,
+        ..PyramidResidual::default()
+    };
+    let precision = PrecisionMode::FastSimd;
+    let original_energy = norm_sq_f32(input.query, precision);
+    let limit = config.pyramid_top_k;
+    if config.max_levels == 0 {
+        return Err(invalid(stage, "max_levels must be positive"));
+    }
+    if original_energy <= 1e-12 || limit == 0 {
+        return Ok(output);
+    }
+    let recall = input.candidates.ok_or_else(|| {
+        invalid(
+            stage,
+            "pyramid decomposition requires a concept recall provider",
+        )
+    })?;
+    let mut residual = input.query.to_vec();
+    let mut remaining = original_energy;
+    let mut candidates = Vec::new();
+    let mut excluded = Vec::new();
+    let mut columns = Vec::<Vec<f64>>::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut workspace = nexus_core::NnlsWorkspace::default();
+    for level in 0..config.max_levels {
         ctx.check_cancelled(stage)?;
-        input.tag_vectors.validate(stage)?;
-        unit_direction(stage, input.query, input.tag_vectors.dim)?;
-        if ![
-            config.min_energy_ratio,
-            config.min_layer_explained_energy,
-            config.tail_residual_min_ratio,
-        ]
-        .into_iter()
-        .all(|v| (0.0..=1.0).contains(&v))
-        {
+        candidates.clear();
+        recall(
+            level,
+            &residual,
+            limit,
+            &mut candidates,
+            input.epa,
+            &excluded,
+        )?;
+        ctx.check_cancelled(stage)?;
+        if candidates.len() > limit {
             return Err(invalid(
                 stage,
-                "pyramid energy thresholds must be in [0, 1]",
+                "candidate provider exceeded the requested Top-K",
             ));
         }
-        let mut output = PyramidResidual {
-            novelty: 1.0,
-            ..PyramidResidual::default()
-        };
-        let precision = PrecisionMode::FastSimd;
-        let original_energy = norm_sq_f32(input.query, precision);
-        let limit = config.pyramid_top_k.min(ctx.limits.nnls_max_columns);
-        if original_energy <= 1e-12 || limit == 0 {
-            return Ok(output);
-        }
-        let mut residual = input.query.to_vec();
-        let mut remaining = original_energy;
-        let mut candidates = Vec::new();
-        let mut excluded = Vec::new();
-        let mut columns = Vec::<Vec<f64>>::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut workspace = nexus_core::NnlsWorkspace::default();
-        for level in 0..config.max_levels {
-            ctx.check_cancelled(stage)?;
-            candidates.clear();
-            (input.candidates)(
-                level,
-                &residual,
-                limit,
-                &mut candidates,
-                input.epa,
-                &excluded,
-            )?;
-            ctx.check_cancelled(stage)?;
-            if candidates.len() > limit {
-                return Err(invalid(
+        seen.clear();
+        let mut tags = Vec::with_capacity(candidates.len());
+        columns.clear();
+        for &node in &candidates {
+            let vector = input.tag_vectors.row(node.index()).ok_or_else(|| {
+                invalid(
                     stage,
-                    "candidate provider exceeded the requested Top-K",
-                ));
-            }
-            seen.clear();
-            let mut tags = Vec::with_capacity(candidates.len());
-            columns.clear();
-            for &node in &candidates {
-                let vector = input.tag_vectors.row(node.index()).ok_or_else(|| {
-                    invalid(
-                        stage,
-                        "candidate provider returned a node outside the graph",
-                    )
-                })?;
-                if seen.insert(node) {
-                    tags.push(PyramidTagEntry {
-                        node,
-                        similarity: cosine_f32(&residual, vector, precision),
-                        contribution: 0.0,
-                        handshake_magnitude: 0.0,
-                    });
-                    columns.push(vector.iter().map(|&v| f64::from(v)).collect());
-                }
-            }
-            if tags.is_empty() {
-                break;
-            }
-            let target: Vec<_> = residual.iter().map(|&v| f64::from(v)).collect();
-            let cone: Vec<_> = tags
-                .iter()
-                .zip(&columns)
-                .map(|(tag, column)| (i64::from(tag.node.0), column.as_slice()))
-                .collect();
-            let solution =
-                solve_nnls_with_ids_f64(&target, &cone, &ctx.limits, &ctx.cancel, &mut workspace)?;
-            let energy = solution.residual_norm.powi(2);
-            let explained = (remaining - energy).max(0.0) / original_energy;
-            if explained <= 0.0 || explained < config.min_layer_explained_energy {
-                break;
-            }
-            for (tag, weight) in tags.iter_mut().zip(solution.weights) {
-                tag.contribution = weight;
-            }
-            excluded.extend(tags.iter().map(|tag| tag.node));
-            let handshake = handshakes(&residual, &mut tags, input.tag_vectors);
-            output.total_explained_energy += explained;
-            output.levels.push(PyramidLevel {
-                level,
-                tags,
-                projection_magnitude: norm_sq_f64(&solution.projection, precision).sqrt(),
-                residual_magnitude: solution.residual_norm,
-                residual_energy_ratio: energy / original_energy,
-                energy_explained: explained,
-                handshake,
-            });
-            let next = solution.residual.into_iter().map(|v| v as f32).collect();
-            output
-                .residuals
-                .push(std::mem::replace(&mut residual, next));
-            remaining = energy;
-            if remaining <= 1e-12 || remaining / original_energy < config.min_energy_ratio {
-                break;
+                    "candidate provider returned a node outside the graph",
+                )
+            })?;
+            if seen.insert(node) {
+                tags.push(PyramidTagEntry {
+                    node,
+                    similarity: cosine_f32(&residual, vector, precision),
+                    contribution: 0.0,
+                    handshake_magnitude: 0.0,
+                });
+                columns.push(vector.iter().map(|&v| f64::from(v)).collect());
             }
         }
-        if let Some(first) = output.levels.first() {
-            if config.append_tail_residual
-                && remaining > 1e-12
-                && remaining / original_energy >= config.tail_residual_min_ratio
-            {
-                output.residuals.push(residual);
-                output.has_tail_residual = true;
-            }
-            output.coverage = output.total_explained_energy.clamp(0.0, 1.0);
-            output.novelty = ((1.0 - output.coverage) * 0.7 + first.handshake.novelty_signal * 0.3)
-                .clamp(0.0, 1.0);
-            output.coherence = first.handshake.pattern_strength;
-            output.activation =
-                (output.coverage * output.coherence * (1.0 - first.handshake.noise_signal))
-                    .clamp(0.0, 1.0);
+        if tags.is_empty() {
+            break;
         }
-        Ok(output)
+        let target: Vec<_> = residual.iter().map(|&v| f64::from(v)).collect();
+        let cone: Vec<_> = tags
+            .iter()
+            .zip(&columns)
+            .map(|(tag, column)| (i64::from(tag.node.0), column.as_slice()))
+            .collect();
+        let solution = solve_nnls_with_ids_f64(&target, &cone, limit, &ctx.cancel, &mut workspace)?;
+        let energy = solution.residual_norm.powi(2);
+        let explained = (remaining - energy).max(0.0) / original_energy;
+        if explained <= 0.0 || explained < config.min_layer_explained_energy {
+            break;
+        }
+        for (tag, weight) in tags.iter_mut().zip(solution.direction_weights) {
+            tag.contribution = weight;
+        }
+        excluded.extend(tags.iter().map(|tag| tag.node));
+        let handshake = handshakes(&residual, &mut tags, input.tag_vectors);
+        output.total_explained_energy += explained;
+        output.levels.push(PyramidLevel {
+            level,
+            tags,
+            projection_magnitude: norm_sq_f64(&solution.projection, precision).sqrt(),
+            residual_magnitude: solution.residual_norm,
+            residual_energy_ratio: energy / original_energy,
+            energy_explained: explained,
+            handshake,
+        });
+        let next = solution.residual.into_iter().map(|v| v as f32).collect();
+        output
+            .residuals
+            .push(std::mem::replace(&mut residual, next));
+        remaining = energy;
+        if remaining <= 1e-12 || remaining / original_energy < config.min_energy_ratio {
+            break;
+        }
     }
+    if let Some(first) = output.levels.first() {
+        if config.append_tail_residual
+            && remaining > 1e-12
+            && remaining / original_energy >= config.tail_residual_min_ratio
+        {
+            output.residuals.push(residual);
+            output.has_tail_residual = true;
+        }
+        output.coverage = output.total_explained_energy.clamp(0.0, 1.0);
+        output.novelty =
+            ((1.0 - output.coverage) * 0.7 + first.handshake.novelty_signal * 0.3).clamp(0.0, 1.0);
+        output.coherence = first.handshake.pattern_strength;
+        output.activation =
+            (output.coverage * output.coherence * (1.0 - first.handshake.noise_signal))
+                .clamp(0.0, 1.0);
+    }
+    Ok(output)
 }

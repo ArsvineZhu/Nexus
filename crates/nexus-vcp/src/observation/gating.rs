@@ -3,8 +3,7 @@
 use super::{EpaAnalysis, PyramidResidual, PyramidTagEntry, invalid, unit_direction};
 use nexus_core::kernel::{cosine_f32, dot_f64, norm_sq_f64, normalize_f64};
 use nexus_core::{
-    ExecutionContext, NodeId, Operator, PrecisionMode, TagLexicalMetaView, VcpResult,
-    VectorMatrixView,
+    ExecutionContext, NodeId, PrecisionMode, TagLexicalMetaView, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -44,8 +43,7 @@ fn lexical_tokens(text: &str) -> HashSet<String> {
     tokens
 }
 
-fn lexical_grounding(query: &HashSet<String>, text: &str) -> bool {
-    let tag = lexical_tokens(text);
+fn lexical_grounding(query: &HashSet<String>, tag: &HashSet<String>) -> bool {
     !tag.is_empty() && tag.intersection(query).count() * 2 >= tag.len()
 }
 
@@ -70,7 +68,6 @@ fn validate_metadata(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HypernymConfig {
-    pub enabled: bool,
     pub peer_max_cosine: f64,
     pub query_parent_min_cosine: f64,
     pub differentia_confidence_scale: f64,
@@ -79,7 +76,6 @@ pub struct HypernymConfig {
 impl Default for HypernymConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             peer_max_cosine: 0.90,
             query_parent_min_cosine: 0.65,
             differentia_confidence_scale: 0.1,
@@ -87,20 +83,8 @@ impl Default for HypernymConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct HypernymPruneInput<'call> {
-    pub query: &'call [f32],
-    pub pyramid: &'call PyramidResidual,
-    pub tag_vectors: VectorMatrixView<'call, f32>,
-    pub lexical_meta: TagLexicalMetaView<'call>,
-    pub core_tags: &'call [NodeId],
-    pub seed_contribution_floor: f64,
-    pub seed_contribution_ratio: f64,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DisambiguatedTags {
-    pub retained_levels: Vec<Vec<PyramidTagEntry>>,
     pub pruned_hypernyms: Vec<NodeId>,
     pub differentia_q_perp: Option<Vec<f32>>,
     pub differentia_confidence: f64,
@@ -117,130 +101,52 @@ fn remove_span(vector: &mut [f64], axes: &[Vec<f64>]) {
     }
 }
 
-pub struct HypernymPruneOperator;
-
-impl Operator for HypernymPruneOperator {
-    type Config = HypernymConfig;
-    type Input<'call> = HypernymPruneInput<'call>;
-    type Output = DisambiguatedTags;
-
-    fn name(&self) -> &'static str {
-        "hypernym.prune"
+fn project_differentia(
+    input: SeedSelectionInput<'_>,
+    config: &HypernymConfig,
+    result: &mut DisambiguatedTags,
+) {
+    result.pruned_hypernyms.sort_unstable();
+    result.pruned_hypernyms.dedup();
+    if result.pruned_hypernyms.is_empty() {
+        return;
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        ctx.check_cancelled(stage)?;
-        input.tag_vectors.validate(stage)?;
-        unit_direction(stage, input.query, input.tag_vectors.dim)?;
-        validate_metadata(stage, input.lexical_meta, input.tag_vectors.rows)?;
-        if ![config.peer_max_cosine, config.query_parent_min_cosine]
-            .into_iter()
-            .all(|v| (-1.0..=1.0).contains(&v))
-            || !config.differentia_confidence_scale.is_finite()
-            || config.differentia_confidence_scale <= 0.0
-            || ![input.seed_contribution_floor, input.seed_contribution_ratio]
-                .into_iter()
-                .all(|v| (0.0..=1.0).contains(&v))
-        {
-            return Err(invalid(stage, "invalid disambiguation thresholds"));
+    let mut axes = Vec::new();
+    let precision = PrecisionMode::StrictLeftFold;
+    for &node in &result.pruned_hypernyms {
+        let mut axis: Vec<_> = input
+            .tag_vectors
+            .row(node.index())
+            .unwrap()
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect();
+        let minimum = 1e-5 * norm_sq_f64(&axis, precision).sqrt();
+        remove_span(&mut axis, &axes);
+        if normalize_f64(&mut axis, minimum.max(1e-12), precision) {
+            axes.push(axis);
         }
-
-        let mut result = DisambiguatedTags::default();
-        for level in &input.pyramid.levels {
-            ctx.check_cancelled(stage)?;
-            let (_, threshold) = level_threshold(
-                &level.tags,
-                input.seed_contribution_floor,
-                input.seed_contribution_ratio,
-            );
-            let mut retained = Vec::with_capacity(level.tags.len());
-            let mut vectors = Vec::with_capacity(level.tags.len());
-            let mut tokens = Vec::with_capacity(level.tags.len());
-            for tag in &level.tags {
-                let vector = input
-                    .tag_vectors
-                    .row(tag.node.index())
-                    .ok_or_else(|| invalid(stage, "pyramid node is outside the tag matrix"))?;
-                vectors.push(vector);
-                tokens.push(lexical_tokens(input.lexical_meta.name(tag.node)));
-            }
-            for (index, tag) in level.tags.iter().enumerate() {
-                ctx.check_cancelled(stage)?;
-                let vector = vectors[index];
-                let parent = &tokens[index];
-                let is_parent = config.enabled
-                    && !input.core_tags.contains(&tag.node)
-                    && tag.contribution < threshold
-                    && !parent.is_empty()
-                    && cosine_f32(input.query, vector, PrecisionMode::FastSimd)
-                        >= config.query_parent_min_cosine
-                    && level.tags.iter().enumerate().any(|(peer, entry)| {
-                        entry.node != tag.node
-                            && entry.contribution >= threshold
-                            && entry.similarity > 0.0
-                            && parent.len() < tokens[peer].len()
-                            && parent.is_subset(&tokens[peer])
-                            && cosine_f32(vector, vectors[peer], PrecisionMode::FastSimd)
-                                < config.peer_max_cosine
-                    });
-                if is_parent {
-                    result.pruned_hypernyms.push(tag.node);
-                } else {
-                    retained.push(*tag);
-                }
-            }
-            result.retained_levels.push(retained);
+    }
+    if axes.is_empty() {
+        return;
+    }
+    let mut residual: Vec<_> = input.query.iter().map(|&v| f64::from(v)).collect();
+    if normalize_f64(&mut residual, 1e-12, precision) {
+        remove_span(&mut residual, &axes);
+        let norm = norm_sq_f64(&residual, precision).sqrt();
+        if norm >= 1e-4 {
+            result.differentia_confidence = (norm / config.differentia_confidence_scale).min(1.0);
+            result.differentia_q_perp =
+                Some(residual.into_iter().map(|v| (v / norm) as f32).collect());
         }
-
-        result.pruned_hypernyms.sort_unstable();
-        result.pruned_hypernyms.dedup();
-        if result.pruned_hypernyms.is_empty() {
-            return Ok(result);
-        }
-        let mut axes = Vec::new();
-        let precision = PrecisionMode::StrictLeftFold;
-        for &node in &result.pruned_hypernyms {
-            let mut axis: Vec<_> = input
-                .tag_vectors
-                .row(node.index())
-                .unwrap()
-                .iter()
-                .map(|&v| f64::from(v))
-                .collect();
-            let minimum = 1e-5 * norm_sq_f64(&axis, precision).sqrt();
-            remove_span(&mut axis, &axes);
-            if normalize_f64(&mut axis, minimum.max(1e-12), precision) {
-                axes.push(axis);
-            }
-        }
-        if axes.is_empty() {
-            return Ok(result);
-        }
-        let mut residual: Vec<_> = input.query.iter().map(|&v| f64::from(v)).collect();
-        if normalize_f64(&mut residual, 1e-12, precision) {
-            remove_span(&mut residual, &axes);
-            let norm = norm_sq_f64(&residual, precision).sqrt();
-            if norm >= 1e-4 {
-                result.differentia_confidence =
-                    (norm / config.differentia_confidence_scale).min(1.0);
-                result.differentia_q_perp =
-                    Some(residual.into_iter().map(|v| (v / norm) as f32).collect());
-            }
-        }
-        Ok(result)
     }
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct TagGatingConfig {
+pub struct SeedSelectionConfig {
+    pub hypernym: Option<HypernymConfig>,
     pub base_tag_boost: f64,
     pub layer_decay: f64,
     pub seed_contribution_floor: f64,
@@ -253,9 +159,10 @@ pub struct TagGatingConfig {
     pub core_boost_range: [f64; 2],
 }
 
-impl Default for TagGatingConfig {
+impl Default for SeedSelectionConfig {
     fn default() -> Self {
         Self {
+            hypernym: Some(HypernymConfig::default()),
             base_tag_boost: 0.6,
             layer_decay: 0.7,
             seed_contribution_floor: 0.05,
@@ -271,15 +178,14 @@ impl Default for TagGatingConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TagGatingInput<'call> {
+pub struct SeedSelectionInput<'call> {
     pub epa: &'call EpaAnalysis,
     pub pyramid: &'call PyramidResidual,
-    pub disambiguated: &'call DisambiguatedTags,
+    pub query: &'call [f32],
     pub query_text: &'call str,
     pub core_tags: &'call [NodeId],
     pub tag_vectors: VectorMatrixView<'call, f32>,
     pub lexical_meta: TagLexicalMetaView<'call>,
-    pub graph_node_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -300,252 +206,295 @@ pub struct GatedSeeds {
     pub exact_focus: Option<NodeId>,
 }
 
-pub struct TagGatingOperator;
+pub struct SeedSelection {
+    pub disambiguated: DisambiguatedTags,
+    pub gated_seeds: GatedSeeds,
+}
 
-impl Operator for TagGatingOperator {
-    type Config = TagGatingConfig;
-    type Input<'call> = TagGatingInput<'call>;
-    type Output = GatedSeeds;
-
-    fn name(&self) -> &'static str {
-        "tag.gating"
-    }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        ctx.check_cancelled(stage)?;
-        validate_metadata(stage, input.lexical_meta, input.graph_node_count)?;
-        input.tag_vectors.validate(stage)?;
-        if input.tag_vectors.rows != input.graph_node_count {
-            return Err(invalid(stage, "tag matrix must cover the graph"));
-        }
-        let [activation_min, activation_max] = config.activation_multiplier;
-        let [boost_min, boost_max] = config.dynamic_boost_range;
-        let [core_min, core_max] = config.core_boost_range;
-        if ![
-            config.layer_decay,
-            config.seed_contribution_floor,
-            config.seed_contribution_ratio,
-            config.implicit_max_ratio_of_explicit,
-            config.lang_penalty_unknown,
+pub fn select_seeds(
+    input: SeedSelectionInput<'_>,
+    config: &SeedSelectionConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<SeedSelection> {
+    let stage = "observation.select_seeds";
+    ctx.check_cancelled(stage)?;
+    input.tag_vectors.validate(stage)?;
+    validate_metadata(stage, input.lexical_meta, input.tag_vectors.rows)?;
+    let [activation_min, activation_max] = config.activation_multiplier;
+    let [boost_min, boost_max] = config.dynamic_boost_range;
+    let [core_min, core_max] = config.core_boost_range;
+    if ![
+        config.layer_decay,
+        config.seed_contribution_floor,
+        config.seed_contribution_ratio,
+        config.implicit_max_ratio_of_explicit,
+        config.lang_penalty_unknown,
+    ]
+    .into_iter()
+    .all(|v| (0.0..=1.0).contains(&v))
+        || ![
+            config.base_tag_boost,
+            activation_min,
+            activation_max,
+            boost_min,
+            boost_max,
+            core_min,
+            core_max,
         ]
         .into_iter()
-        .all(|v| (0.0..=1.0).contains(&v))
-            || ![
-                config.base_tag_boost,
-                activation_min,
-                activation_max,
-                boost_min,
-                boost_max,
-                core_min,
-                core_max,
-            ]
+        .all(|v| v.is_finite() && v >= 0.0)
+        || activation_min > activation_max
+        || boost_min > boost_max
+        || core_min > core_max
+    {
+        return Err(invalid(stage, "invalid seed gating configuration"));
+    }
+    unit_direction(stage, input.query, input.tag_vectors.dim)?;
+    if let Some(hypernym) = &config.hypernym
+        && (![hypernym.peer_max_cosine, hypernym.query_parent_min_cosine]
             .into_iter()
-            .all(|v| v.is_finite() && v >= 0.0)
-            || activation_min > activation_max
-            || boost_min > boost_max
-            || core_min > core_max
-        {
-            return Err(invalid(stage, "invalid seed gating configuration"));
-        }
-        let activation = activation_min
-            + input.pyramid.activation.clamp(0.0, 1.0) * (activation_max - activation_min);
-        let dynamic_factor = input.epa.spectral_concentration * (1.0 + input.epa.resonance.ln_1p())
-            / (1.0 + input.epa.entropy * 0.5)
-            * activation;
-        let core_metric =
-            (input.epa.spectral_concentration + 1.0 - input.pyramid.coverage).clamp(0.0, 2.0) * 0.5;
-        let core_boost = core_min + core_metric * (core_max - core_min);
-        let query_name = input.query_text.trim().to_lowercase();
-        let exact_focus = input.pyramid.levels.first().and_then(|level| {
-            level
-                .tags
-                .iter()
-                .filter(|tag| {
-                    !query_name.is_empty()
-                        && tag.similarity > 0.0
-                        && tag.contribution > 0.0
-                        && input.lexical_meta.name(tag.node).trim().to_lowercase() == query_name
-                })
-                .max_by(|a, b| {
-                    a.contribution
-                        .total_cmp(&b.contribution)
-                        .then(b.node.cmp(&a.node))
-                })
-                .map(|tag| tag.node)
-        });
-        let mut result = GatedSeeds {
-            effective_tag_boost: (config.base_tag_boost
-                * dynamic_factor.clamp(boost_min, boost_max))
+            .all(|v| (-1.0..=1.0).contains(&v))
+            || !hypernym.differentia_confidence_scale.is_finite()
+            || hypernym.differentia_confidence_scale <= 0.0)
+    {
+        return Err(invalid(stage, "invalid disambiguation thresholds"));
+    }
+    let mut disambiguated = DisambiguatedTags::default();
+    let activation = activation_min
+        + input.pyramid.activation.clamp(0.0, 1.0) * (activation_max - activation_min);
+    let dynamic_factor = input.epa.spectral_concentration * (1.0 + input.epa.resonance.ln_1p())
+        / (1.0 + input.epa.entropy * 0.5)
+        * activation;
+    let core_metric =
+        (input.epa.spectral_concentration + 1.0 - input.pyramid.coverage).clamp(0.0, 2.0) * 0.5;
+    let core_boost = core_min + core_metric * (core_max - core_min);
+    let query_name = input.query_text.trim().to_lowercase();
+    let exact_focus = input.pyramid.levels.first().and_then(|level| {
+        level
+            .tags
+            .iter()
+            .filter(|tag| {
+                !query_name.is_empty()
+                    && tag.similarity > 0.0
+                    && tag.contribution > 0.0
+                    && input.lexical_meta.name(tag.node).trim().to_lowercase() == query_name
+            })
+            .max_by(|a, b| {
+                a.contribution
+                    .total_cmp(&b.contribution)
+                    .then(b.node.cmp(&a.node))
+            })
+            .map(|tag| tag.node)
+    });
+    let mut result = GatedSeeds {
+        effective_tag_boost: (config.base_tag_boost * dynamic_factor.clamp(boost_min, boost_max))
             .clamp(0.0, 1.0),
-            dynamic_core_boost: core_boost,
-            exact_focus,
-            ..GatedSeeds::default()
-        };
-        let query_tokens = lexical_tokens(input.query_text);
-        let mut seen = HashSet::new();
-        for (level, tags) in input.disambiguated.retained_levels.iter().enumerate() {
-            ctx.check_cancelled(stage)?;
-            let (max, threshold) = level_threshold(
-                tags,
-                config.seed_contribution_floor,
-                config.seed_contribution_ratio,
-            );
-            let decay = config.layer_decay.powf(level as f64);
-            let dominant = tags
-                .first()
-                .filter(|tag| tag.contribution.powi(2) > 0.85 && tag.similarity > 0.0);
-            let mut redundancy_left = dominant.map_or(0.0, |tag| 0.3 * tag.contribution);
-            let mut redundancy_slots = 2;
-            for tag in tags {
-                let name = input.lexical_meta.name(tag.node);
+        dynamic_core_boost: core_boost,
+        exact_focus,
+        ..GatedSeeds::default()
+    };
+    let query_tokens = lexical_tokens(input.query_text);
+    let mut seen = HashSet::new();
+    for (level, pyramid_level) in input.pyramid.levels.iter().enumerate() {
+        ctx.check_cancelled(stage)?;
+        let tags = &pyramid_level.tags;
+        let (max, threshold) = level_threshold(
+            tags,
+            config.seed_contribution_floor,
+            config.seed_contribution_ratio,
+        );
+        let facts = tags
+            .iter()
+            .map(|tag| {
                 let vector = input
                     .tag_vectors
                     .row(tag.node.index())
-                    .ok_or_else(|| invalid(stage, "pyramid node is outside the graph"))?;
-                if seen.contains(&tag.node) {
-                    continue;
-                }
+                    .ok_or_else(|| invalid(stage, "pyramid node is outside the tag matrix"))?;
+                let name = input.lexical_meta.name(tag.node);
+                let tokens = lexical_tokens(name);
                 let is_core = input.core_tags.contains(&tag.node);
-                let lexical = std::iter::once(name)
-                    .chain(input.lexical_meta.aliases(tag.node))
-                    .any(|name| lexical_grounding(&query_tokens, name));
-                let sponsor = tags
-                    .iter()
-                    .filter(|peer| {
-                        peer.node != tag.node
-                            && peer.contribution >= threshold
-                            && peer.similarity > 0.0
-                    })
-                    .filter_map(|peer| {
-                        let peer_vector = input.tag_vectors.row(peer.node.index())?;
-                        let tightness = cosine_f32(vector, peer_vector, PrecisionMode::FastSimd)
-                            .clamp(0.0, 1.0);
-                        (tightness >= 0.8).then_some(peer.contribution * tightness)
-                    })
-                    .fold(0.0, f64::max);
-                let alias = tag.similarity >= 0.2 && sponsor > 0.0;
-                let mut redundancy_floor = 0.0;
-                if !is_core
-                    && !lexical
-                    && tag.contribution < 1e-6
-                    && tag.similarity >= 0.75
-                    && let Some(first) = dominant.filter(|first| first.node != tag.node)
-                    && let Some(first_vector) = input.tag_vectors.row(first.node.index())
-                {
-                    let tightness =
-                        cosine_f32(vector, first_vector, PrecisionMode::FastSimd).clamp(0.0, 1.0);
-                    if tightness >= 0.90 {
-                        if redundancy_slots == 0 {
-                            continue;
-                        }
-                        redundancy_floor = (0.15
-                            * first.contribution
-                            * (tag.similarity / first.similarity).clamp(0.0, 1.0)
-                            * tightness)
-                            .min(redundancy_left);
-                        redundancy_left -= redundancy_floor;
-                        redundancy_slots -= 1;
-                    }
-                }
-                if !is_core
-                    && !lexical
-                    && !alias
-                    && (tag.contribution < threshold || tag.similarity <= 0.0)
-                {
+                let lexical = lexical_grounding(&query_tokens, &tokens)
+                    || input
+                        .lexical_meta
+                        .aliases(tag.node)
+                        .any(|alias| lexical_grounding(&query_tokens, &lexical_tokens(alias)));
+                Ok((tag, name, vector, tokens, is_core, lexical))
+            })
+            .collect::<VcpResult<Vec<_>>>()?;
+        let peers = facts
+            .iter()
+            .filter(|(tag, ..)| tag.contribution >= threshold && tag.similarity > 0.0)
+            .collect::<Vec<_>>();
+        let decay = config.layer_decay.powf(level as f64);
+        let mut dominant = None;
+        let mut redundancy_left = 0.0;
+        let mut redundancy_slots = 2;
+        let mut first = true;
+        for (tag, name, vector, tokens, is_core, lexical) in &facts {
+            ctx.check_cancelled(stage)?;
+            let (is_core, lexical) = (*is_core, *lexical);
+            let can_be_parent = config.hypernym.as_ref().filter(|hypernym| {
+                !is_core
+                    && tag.contribution < threshold
+                    && !tokens.is_empty()
+                    && cosine_f32(input.query, vector, PrecisionMode::FastSimd)
+                        >= hypernym.query_parent_min_cosine
+            });
+            let mut parent = false;
+            let mut sponsor = 0.0_f64;
+            for &&(peer, _, peer_vector, ref peer_tokens, _, _) in &peers {
+                if peer.node == tag.node {
                     continue;
                 }
-                let contribution = if lexical {
-                    tag.contribution.max(0.6 * sponsor).max(0.6 * max)
-                } else if redundancy_floor > 0.0 {
-                    tag.contribution.max(redundancy_floor)
-                } else if alias {
-                    tag.contribution
-                        .max(0.6 * sponsor * tag.similarity.clamp(0.2, 1.0))
-                } else {
-                    tag.contribution
-                };
-                let layer_gain = if lexical {
-                    1.0
-                } else {
-                    decay + (1.0 - decay) * (contribution / max.max(1e-12)).clamp(0.0, 1.0)
-                };
-                let core_gain = if is_core {
-                    core_boost * (0.95 + tag.similarity * 0.1)
-                } else {
-                    1.0
-                };
-                let technical = name.is_ascii() && name.chars().any(|ch| ch.is_ascii_alphabetic());
-                let language_gain = if !lexical && config.lang_confidence_enabled && technical {
-                    config.lang_penalty_unknown
-                } else {
-                    1.0
-                };
-                let mut weight = contribution * layer_gain * core_gain * language_gain;
-                if lexical && !is_core {
-                    weight *= 1.6;
+                let cosine = cosine_f32(vector, peer_vector, PrecisionMode::FastSimd);
+                if can_be_parent.is_some_and(|hypernym| {
+                    tokens.len() < peer_tokens.len()
+                        && tokens.is_subset(peer_tokens)
+                        && cosine < hypernym.peer_max_cosine
+                }) {
+                    parent = true;
+                    break;
                 }
-                if !is_core {
-                    weight = weight.min(1.0);
-                }
-                if weight > 0.0 {
-                    seen.insert(tag.node);
-                    result.seeds.push(GatedSeed {
-                        node: tag.node,
-                        weight,
-                        is_core,
-                        lexical,
-                        residual_level: level,
-                    });
+                if cosine >= 0.8 {
+                    sponsor = sponsor.max(peer.contribution * cosine.min(1.0));
                 }
             }
-        }
-
-        for &node in input.core_tags {
-            if node.index() >= input.graph_node_count {
-                return Err(invalid(stage, "explicit core node is outside the graph"));
+            if parent {
+                disambiguated.pruned_hypernyms.push(tag.node);
+                continue;
             }
-            if let Some(seed) = result.seeds.iter_mut().find(|seed| seed.node == node) {
-                seed.is_core = true;
-                seed.weight = seed.weight.max(core_boost);
-            } else if core_boost > 0.0 {
+            if first {
+                first = false;
+                if tag.contribution.powi(2) > 0.85 && tag.similarity > 0.0 {
+                    dominant = Some((*tag, *vector));
+                    redundancy_left = 0.3 * tag.contribution;
+                }
+            }
+            if seen.contains(&tag.node) {
+                continue;
+            }
+            let alias = tag.similarity >= 0.2 && sponsor > 0.0;
+            let mut redundancy_floor = 0.0;
+            if !is_core
+                && !lexical
+                && tag.contribution < 1e-6
+                && tag.similarity >= 0.75
+                && let Some((first, first_vector)) =
+                    dominant.filter(|(first, _)| first.node != tag.node)
+            {
+                let tightness =
+                    cosine_f32(vector, first_vector, PrecisionMode::FastSimd).clamp(0.0, 1.0);
+                if tightness >= 0.90 {
+                    if redundancy_slots == 0 {
+                        continue;
+                    }
+                    redundancy_floor = (0.15
+                        * first.contribution
+                        * (tag.similarity / first.similarity).clamp(0.0, 1.0)
+                        * tightness)
+                        .min(redundancy_left);
+                    redundancy_left -= redundancy_floor;
+                    redundancy_slots -= 1;
+                }
+            }
+            if !is_core
+                && !lexical
+                && !alias
+                && (tag.contribution < threshold || tag.similarity <= 0.0)
+            {
+                continue;
+            }
+            let contribution = if lexical {
+                tag.contribution.max(0.6 * sponsor).max(0.6 * max)
+            } else if redundancy_floor > 0.0 {
+                tag.contribution.max(redundancy_floor)
+            } else if alias {
+                tag.contribution
+                    .max(0.6 * sponsor * tag.similarity.clamp(0.2, 1.0))
+            } else {
+                tag.contribution
+            };
+            let layer_gain = if lexical {
+                1.0
+            } else {
+                decay + (1.0 - decay) * (contribution / max.max(1e-12)).clamp(0.0, 1.0)
+            };
+            let core_gain = if is_core {
+                core_boost * (0.95 + tag.similarity * 0.1)
+            } else {
+                1.0
+            };
+            let technical = name.is_ascii() && name.chars().any(|ch| ch.is_ascii_alphabetic());
+            let language_gain = if !lexical && config.lang_confidence_enabled && technical {
+                config.lang_penalty_unknown
+            } else {
+                1.0
+            };
+            let mut weight = contribution * layer_gain * core_gain * language_gain;
+            if lexical && !is_core {
+                weight *= 1.6;
+            }
+            if !is_core {
+                weight = weight.min(1.0);
+            }
+            if weight > 0.0 {
+                seen.insert(tag.node);
                 result.seeds.push(GatedSeed {
-                    node,
-                    weight: core_boost,
-                    is_core: true,
-                    lexical: false,
-                    residual_level: usize::MAX,
+                    node: tag.node,
+                    weight,
+                    is_core,
+                    lexical,
+                    residual_level: level,
                 });
             }
         }
-
-        let explicit = result
-            .seeds
-            .iter()
-            .filter(|seed| seed.is_core || seed.lexical)
-            .map(|seed| seed.weight)
-            .fold(0.0, f64::max);
-        let implicit = result
-            .seeds
-            .iter()
-            .filter(|seed| !seed.is_core && !seed.lexical)
-            .map(|seed| seed.weight)
-            .fold(0.0, f64::max);
-        let cap = explicit * config.implicit_max_ratio_of_explicit;
-        if explicit > 0.0 && implicit > cap {
-            for seed in result
-                .seeds
-                .iter_mut()
-                .filter(|seed| !seed.is_core && !seed.lexical)
-            {
-                seed.weight *= cap / implicit;
-            }
-        }
-        Ok(result)
     }
+
+    for &node in input.core_tags {
+        if node.index() >= input.tag_vectors.rows {
+            return Err(invalid(stage, "explicit core node is outside the graph"));
+        }
+        if let Some(seed) = result.seeds.iter_mut().find(|seed| seed.node == node) {
+            seed.is_core = true;
+            seed.weight = seed.weight.max(core_boost);
+        } else if core_boost > 0.0 {
+            result.seeds.push(GatedSeed {
+                node,
+                weight: core_boost,
+                is_core: true,
+                lexical: false,
+                residual_level: usize::MAX,
+            });
+        }
+    }
+
+    let explicit = result
+        .seeds
+        .iter()
+        .filter(|seed| seed.is_core || seed.lexical)
+        .map(|seed| seed.weight)
+        .fold(0.0, f64::max);
+    let implicit = result
+        .seeds
+        .iter()
+        .filter(|seed| !seed.is_core && !seed.lexical)
+        .map(|seed| seed.weight)
+        .fold(0.0, f64::max);
+    let cap = explicit * config.implicit_max_ratio_of_explicit;
+    if explicit > 0.0 && implicit > cap {
+        for seed in result
+            .seeds
+            .iter_mut()
+            .filter(|seed| !seed.is_core && !seed.lexical)
+        {
+            seed.weight *= cap / implicit;
+        }
+    }
+    if let Some(hypernym) = &config.hypernym {
+        project_differentia(input, hypernym, &mut disambiguated);
+    }
+    Ok(SeedSelection {
+        disambiguated,
+        gated_seeds: result,
+    })
 }

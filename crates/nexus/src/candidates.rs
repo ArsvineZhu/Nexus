@@ -1,35 +1,17 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::dataset::{invalid, path_steps, push_offset, slot, validate_unit_matrix};
-use crate::{Nexus, Sequence};
+use crate::{Document, Nexus, Sequence};
 use nexus_core::kernel::normalize_direction;
-use nexus_core::{CandidateRowsView, DocumentId, NodeId, RootId, VcpResult, VectorMatrixView};
+use nexus_core::{CandidateRowsView, NodeId, RootId, VcpResult, VectorMatrixView};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 const STAGE: &str = "candidates";
 
-pub struct Candidate {
-    pub id: u64,
-    pub document_id: Option<u64>,
-    pub vector: Vec<f32>,
-    pub paths: Vec<Sequence>,
-}
-
-impl Candidate {
-    pub fn new(id: u64, vector: Vec<f32>) -> Self {
-        Self {
-            id,
-            document_id: None,
-            vector,
-            paths: Vec::new(),
-        }
-    }
-}
-
 pub enum CandidateInput<'rows> {
     Ids(&'rows [u64]),
-    Owned(Vec<Candidate>),
+    Owned(Vec<Document>),
     Borrowed(BorrowedCandidates<'rows>),
 }
 
@@ -77,10 +59,10 @@ enum CandidateVectors<'data> {
 }
 
 struct CandidateColumns {
-    documents: Vec<DocumentId>,
     root_offsets: Vec<u32>,
     roots: Vec<RootId>,
     path_offsets: Vec<u32>,
+    path_sources: Vec<Option<u64>>,
     path_tag_offsets: Vec<u32>,
     path_tags: Vec<NodeId>,
     path_positions: Vec<u32>,
@@ -89,19 +71,29 @@ struct CandidateColumns {
 impl CandidateColumns {
     fn new() -> Self {
         Self {
-            documents: Vec::new(),
             root_offsets: vec![0],
             roots: Vec::new(),
             path_offsets: vec![0],
+            path_sources: Vec::new(),
             path_tag_offsets: vec![0],
             path_tags: Vec::new(),
             path_positions: Vec::new(),
         }
     }
 
-    fn add_path(&mut self, tags: &[NodeId], positions: &[u32]) -> VcpResult<()> {
+    fn add_path(
+        &mut self,
+        tags: &[NodeId],
+        positions: &[u32],
+        source: Option<u64>,
+    ) -> VcpResult<()> {
         self.path_tags.extend_from_slice(tags);
         self.path_positions.extend_from_slice(positions);
+        self.finish_path(source)
+    }
+
+    fn finish_path(&mut self, source: Option<u64>) -> VcpResult<()> {
+        self.path_sources.push(source);
         push_offset(&mut self.path_tag_offsets, self.path_tags.len())
     }
 
@@ -122,7 +114,7 @@ impl CandidateColumns {
                 self.path_positions.push(position);
                 self.path_tags.push(tag);
             }
-            push_offset(&mut self.path_tag_offsets, self.path_tags.len())?;
+            self.finish_path(Some(path.source))?;
         }
         self.finish_row(roots)
     }
@@ -138,14 +130,9 @@ impl<'data> CandidateSet<'data> {
         ids: Cow<'data, [u64]>,
         document_ids: Cow<'data, [u64]>,
         vectors: CandidateVectors<'data>,
-        mut columns: CandidateColumns,
+        columns: CandidateColumns,
     ) -> VcpResult<Self> {
         let slots = crate::dataset::ids(ids.iter().copied())?;
-        let mut documents = HashMap::new();
-        for &id in document_ids.iter() {
-            let next = DocumentId::from_index(documents.len(), STAGE)?;
-            columns.documents.push(*documents.entry(id).or_insert(next));
-        }
         Ok(Self {
             nexus,
             ids,
@@ -175,7 +162,14 @@ impl<'data> CandidateSet<'data> {
             vectors.extend_from_slice(catalog.vectors.row(row).expect("validated catalog"));
             for path in offsets(catalog.path_offsets, row) {
                 let steps = offsets(catalog.tag_offsets, path);
-                columns.add_path(&catalog.tags[steps.clone()], &catalog.positions[steps])?;
+                let source = catalog
+                    .path_sources
+                    .map(|roots| assets.source_ids[roots[path].index()]);
+                columns.add_path(
+                    &catalog.tags[steps.clone()],
+                    &catalog.positions[steps],
+                    source,
+                )?;
             }
             columns.finish_row(
                 catalog.roots[offsets(catalog.root_offsets, row)]
@@ -202,6 +196,10 @@ impl<'data> CandidateSet<'data> {
         &self.document_ids
     }
 
+    pub(crate) fn path_sources(&self) -> &[Option<u64>] {
+        &self.columns.path_sources
+    }
+
     pub(crate) fn rows(&self) -> CandidateRowsView<'_> {
         let columns = &self.columns;
         CandidateRowsView {
@@ -213,7 +211,7 @@ impl<'data> CandidateSet<'data> {
                 }
                 CandidateVectors::Borrowed(view) => *view,
             },
-            document_ids: &columns.documents,
+            document_ids: &self.document_ids,
             candidate_root_offsets: &columns.root_offsets,
             candidate_roots: &columns.roots,
             candidate_path_offsets: &columns.path_offsets,

@@ -29,7 +29,7 @@ pub(super) fn contacts(
             if is_direct(s) {
                 score.geo_direct_exact_hits += 1;
             } else {
-                score.geo_emergent_exact_hits += 1;
+                score.geo_indirect_exact_hits += 1;
             }
         } else if is_direct(s)
             && s.field.potential >= ctx.config.reward.direct_semantic_min_potential
@@ -231,7 +231,7 @@ pub(super) fn shadow(
     );
 
     let contact = unit(
-        (score.geo_emergent_exact_hits + score.geo_strong_hits.min(target)) as f64
+        (score.geo_indirect_exact_hits + score.geo_strong_hits.min(target)) as f64
             / (target + 1) as f64,
     );
     score.geo_structural_score = unit(

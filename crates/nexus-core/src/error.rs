@@ -1,23 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #![forbid(unsafe_code)]
 
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct Diagnostics {
-    pub truncated: bool,
-    pub truncation_reason: Option<String>,
-    pub elapsed_ms: f64,
-}
-
-impl Diagnostics {
-    pub fn mark_truncated(&mut self, reason: impl Into<String>) {
-        if !self.truncated {
-            self.truncated = true;
-            self.truncation_reason = Some(reason.into());
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum VcpError {
     #[error("CANCELLED at stage `{stage}`")]

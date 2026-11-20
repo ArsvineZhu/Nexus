@@ -14,6 +14,8 @@ use rayon::prelude::*;
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LocalConeAgsConfig {
+    /// Maximum number of visited sequence position pairs.
+    pub pair_work_limit: Option<usize>,
     pub max_neighbors: usize,
     pub min_neighbors: usize,
     pub max_basis: usize,
@@ -37,6 +39,7 @@ pub struct LocalConeAgsConfig {
 impl Default for LocalConeAgsConfig {
     fn default() -> Self {
         Self {
+            pair_work_limit: Some(2_000_000),
             max_neighbors: 96,
             min_neighbors: 3,
             max_basis: 24,
@@ -145,7 +148,7 @@ pub struct GeometryState {
     pub dim: usize,
     #[serde(default)]
     pub computed_nodes: Vec<bool>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,7 +166,7 @@ pub struct EpaBasis {
     pub mean: Vec<f64>,
     pub basis: Vec<f64>,
     pub coverage: Vec<f64>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 impl EpaBasis {
@@ -178,12 +181,6 @@ impl EpaBasis {
         }
     }
 }
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalConeAgsOperator;
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct GlobalEpaOperator;
 
 #[derive(Clone, Copy, Debug)]
 struct AgsCandidate {
@@ -219,13 +216,12 @@ fn semantic_weight(
 
 fn dot_neighbors(target: &[f64], neighbor_vecs: &[&[f64]], mode: PrecisionMode) -> Vec<f64> {
     let mut out = vec![0.0; neighbor_vecs.len()];
-    let mut groups = neighbor_vecs.chunks_exact(4).zip(out.chunks_exact_mut(4));
-    for (vecs, dst) in &mut groups {
-        let sums = batch_dot_4_f64(target, [vecs[0], vecs[1], vecs[2], vecs[3]], mode);
-        dst.copy_from_slice(&sums);
+    let (groups, tail) = neighbor_vecs.as_chunks::<4>();
+    let (sums, tail_sums) = out.as_chunks_mut::<4>();
+    for (&vecs, dst) in groups.iter().zip(sums) {
+        *dst = batch_dot_4_f64(target, vecs, mode);
     }
-    let start = neighbor_vecs.len() & !3;
-    for (dst, &v) in out[start..].iter_mut().zip(&neighbor_vecs[start..]) {
+    for (dst, &v) in tail_sums.iter_mut().zip(tail) {
         *dst = dot_f64(target, v, mode);
     }
     out
@@ -295,34 +291,28 @@ fn orthogonal_residual_with_projections(
     let mut residual = vector.to_vec();
 
     // Pass 1: 4-way fused subtraction using cached <vector, b_m>.
-    let mut axis_groups = basis.chunks_exact(4);
-    let mut coeff_groups = coeffs.chunks_exact(4);
-    for (axes, c) in (&mut axis_groups).zip(&mut coeff_groups) {
+    let (axis_groups, axis_tail) = basis.as_chunks::<4>();
+    let (coeff_groups, coeff_tail) = coeffs.as_chunks::<4>();
+    for (axes, &coefficients) in axis_groups.iter().zip(coeff_groups) {
         sub_4_f64(
             &mut residual,
-            [c[0], c[1], c[2], c[3]],
-            [&axes[0], &axes[1], &axes[2], &axes[3]],
+            coefficients,
+            axes.each_ref().map(Vec::as_slice),
         );
     }
-    for (axis, &c) in axis_groups.remainder().iter().zip(coeff_groups.remainder()) {
+    for (axis, &c) in axis_tail.iter().zip(coeff_tail) {
         for (value, &q) in residual.iter_mut().zip(axis) {
             *value -= c * q;
         }
     }
 
     // Pass 2: 4-way blocked CGS reorthogonalization pass.
-    let mut axis_groups = basis.chunks_exact(4);
-    for axes in &mut axis_groups {
-        let refs = [
-            axes[0].as_slice(),
-            axes[1].as_slice(),
-            axes[2].as_slice(),
-            axes[3].as_slice(),
-        ];
+    for axes in axis_groups {
+        let refs = axes.each_ref().map(Vec::as_slice);
         let c = batch_dot_4_f64(&residual, refs, mode);
         sub_4_f64(&mut residual, c, refs);
     }
-    for axis in axis_groups.remainder() {
+    for axis in axis_tail {
         let c = dot_f64(&residual, axis, mode);
         for (value, &q) in residual.iter_mut().zip(axis) {
             *value -= c * q;
@@ -341,16 +331,15 @@ fn project_active_into(
     row: &mut [f64],
     mode: PrecisionMode,
 ) {
-    let mut groups = active.chunks_exact(4);
-    for group in &mut groups {
-        let [a, b, c, d] = [group[0], group[1], group[2], group[3]];
+    let (groups, tail) = active.as_chunks::<4>();
+    for &[a, b, c, d] in groups {
         let sums = batch_dot_4_f64(axis, [vectors[a], vectors[b], vectors[c], vectors[d]], mode);
         row[a] = sums[0];
         row[b] = sums[1];
         row[c] = sums[2];
         row[d] = sums[3];
     }
-    for &index in groups.remainder() {
+    for &index in tail {
         row[index] = dot_f64(axis, vectors[index], mode);
     }
 }
@@ -597,554 +586,220 @@ fn build_unit_vectors(
     })
 }
 
-impl Operator for LocalConeAgsOperator {
-    type Config = LocalConeAgsConfig;
-    type Input<'call> = LocalConeAgsInput<'call>;
-    type Output = GeometryState;
-
-    fn name(&self) -> &'static str {
-        "unified_geometry_cone_t6_ags_selected_qr_nnls"
+pub fn local_cone<'call>(
+    input: LocalConeAgsInput<'call>,
+    config: &LocalConeAgsConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<GeometryState> {
+    const STAGE: &str = "local_cone";
+    let start_time = Instant::now();
+    ctx.check_cancelled(STAGE)?;
+    if config.max_neighbors == 0
+        || config.min_neighbors == 0
+        || config.min_neighbors > config.max_neighbors
+        || config.max_basis == 0
+        || config.star_neighbors == 0
+    {
+        return Err(crate::observation::invalid(
+            STAGE,
+            "min_neighbors and max_neighbors must be ordered and positive; max_basis and star_neighbors must be positive",
+        ));
+    }
+    for (name, value, min, max) in [
+        ("min_gain", config.min_gain, 0.0, 1.0),
+        ("position_decay", config.position_decay, 0.0, f64::INFINITY),
+        ("star_mix", config.star_mix, 0.0, 1.0),
+        (
+            "semantic_gate_sigma",
+            config.semantic_gate_sigma,
+            0.02,
+            f64::INFINITY,
+        ),
+        ("semantic_gate_peak", config.semantic_gate_peak, -1.0, 1.0),
+        (
+            "semantic_gate_hard_floor",
+            config.semantic_gate_hard_floor,
+            -1.0,
+            1.0,
+        ),
+        ("semantic_gate_floor", config.semantic_gate_floor, 0.0, 1.0),
+        (
+            "anchor_gain_min",
+            config.anchor_gain_min,
+            0.0,
+            f64::INFINITY,
+        ),
+        (
+            "anchor_gain_max",
+            config.anchor_gain_max,
+            config.anchor_gain_min,
+            f64::INFINITY,
+        ),
+        (
+            "anchor_gain_base",
+            config.anchor_gain_base,
+            0.0,
+            f64::INFINITY,
+        ),
+        (
+            "anchor_gain_gamma",
+            config.anchor_gain_gamma,
+            0.0,
+            f64::INFINITY,
+        ),
+        (
+            "anchor_gain_scale",
+            config.anchor_gain_scale,
+            0.0,
+            f64::INFINITY,
+        ),
+        (
+            "reorth_loss_threshold",
+            config.reorth_loss_threshold,
+            0.0,
+            1.0,
+        ),
+    ] {
+        crate::parameter(STAGE, name, value, min, max)?;
     }
 
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> VcpResult<Self::Output> {
-        const STAGE: &str = "LocalConeAgsOperator::execute";
-        let start_time = Instant::now();
-        ctx.check_cancelled(STAGE)?;
-        if config.max_neighbors == 0
-            || config.min_neighbors == 0
-            || config.min_neighbors > config.max_neighbors
-            || config.max_basis == 0
-            || config.star_neighbors == 0
-        {
-            return Err(crate::observation::invalid(
-                STAGE,
-                "min_neighbors and max_neighbors must be ordered and positive; max_basis and star_neighbors must be positive",
-            ));
-        }
-        for (name, value, min, max) in [
-            ("min_gain", config.min_gain, 0.0, 1.0),
-            ("position_decay", config.position_decay, 0.0, f64::INFINITY),
-            ("star_mix", config.star_mix, 0.0, 1.0),
-            (
-                "semantic_gate_sigma",
-                config.semantic_gate_sigma,
-                0.02,
-                f64::INFINITY,
-            ),
-            ("semantic_gate_peak", config.semantic_gate_peak, -1.0, 1.0),
-            (
-                "semantic_gate_hard_floor",
-                config.semantic_gate_hard_floor,
-                -1.0,
-                1.0,
-            ),
-            ("semantic_gate_floor", config.semantic_gate_floor, 0.0, 1.0),
-            (
-                "anchor_gain_min",
-                config.anchor_gain_min,
-                0.0,
-                f64::INFINITY,
-            ),
-            (
-                "anchor_gain_max",
-                config.anchor_gain_max,
-                config.anchor_gain_min,
-                f64::INFINITY,
-            ),
-            (
-                "anchor_gain_base",
-                config.anchor_gain_base,
-                0.0,
-                f64::INFINITY,
-            ),
-            (
-                "anchor_gain_gamma",
-                config.anchor_gain_gamma,
-                0.0,
-                f64::INFINITY,
-            ),
-            (
-                "anchor_gain_scale",
-                config.anchor_gain_scale,
-                0.0,
-                f64::INFINITY,
-            ),
-            (
-                "reorth_loss_threshold",
-                config.reorth_loss_threshold,
-                0.0,
-                1.0,
-            ),
-        ] {
-            crate::parameter(STAGE, name, value, min, max)?;
-        }
+    input.tag_vectors.validate(STAGE)?;
+    let node_count = input.tag_vectors.rows;
+    let dim = input.tag_vectors.dim;
+    input.sequences.validate(node_count, STAGE)?;
 
-        input.tag_vectors.validate(STAGE)?;
-        let node_count = input.tag_vectors.rows;
-        let dim = input.tag_vectors.dim;
-        input.sequences.validate(node_count, STAGE)?;
-
-        if let Some(edges) = input.explicit_edges {
-            for &(src, dst, weight) in edges {
-                if src.index() >= node_count || dst.index() >= node_count {
-                    return Err(VcpError::InvalidInput {
-                        stage: STAGE,
-                        detail: "explicit_edges contains out-of-bounds NodeId".into(),
-                    });
-                }
-                if !weight.is_finite() || weight < 0.0 {
-                    return Err(VcpError::InvalidInput {
-                        stage: STAGE,
-                        detail: "explicit_edges weight must be finite and non-negative".into(),
-                    });
-                }
+    if let Some(edges) = input.explicit_edges {
+        for &(src, dst, weight) in edges {
+            if src.index() >= node_count || dst.index() >= node_count {
+                return Err(VcpError::InvalidInput {
+                    stage: STAGE,
+                    detail: "explicit_edges contains out-of-bounds NodeId".into(),
+                });
+            }
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(VcpError::InvalidInput {
+                    stage: STAGE,
+                    detail: "explicit_edges weight must be finite and non-negative".into(),
+                });
             }
         }
+    }
 
-        if node_count == 0 {
-            return Ok(GeometryState {
-                node_count: 0,
-                anchor_gains: Vec::new(),
-                local_residuals: Vec::new(),
-                intrinsics: Vec::new(),
-                node_supports: Vec::new(),
-                star_directions: Vec::new(),
-                dim,
-                computed_nodes: Vec::new(),
-                diagnostics: Diagnostics {
-                    truncated: false,
-                    truncation_reason: None,
-                    elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-                },
-            });
-        }
+    if node_count == 0 {
+        return Ok(GeometryState {
+            node_count: 0,
+            anchor_gains: Vec::new(),
+            local_residuals: Vec::new(),
+            intrinsics: Vec::new(),
+            node_supports: Vec::new(),
+            star_directions: Vec::new(),
+            dim,
+            computed_nodes: Vec::new(),
+            elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
 
-        let UnitVectors {
-            vecs: unit_vecs,
-            diag_norms,
-            valid_count,
-        } = build_unit_vectors(&input.tag_vectors, STAGE)?;
+    let UnitVectors {
+        vecs: unit_vecs,
+        diag_norms,
+        valid_count,
+    } = build_unit_vectors(&input.tag_vectors, STAGE)?;
 
-        let mut adjacency: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); node_count];
-        if let Some(edges) = input.explicit_edges {
-            for &(src, dst, weight) in edges {
-                if src == dst || weight <= 0.0 {
-                    continue;
-                }
-                *adjacency[src.index()].entry(dst.index()).or_default() += weight;
-            }
-        }
-
-        let position_decay = config.position_decay;
-        let pair_limit = ctx.limits.pair_work_limit;
-        let mut pair_work = 0usize;
-        let mut seq_buf: Vec<(u32, NodeId)> = Vec::new();
-
-        for seq_idx in 0..input.sequences.sequence_count {
-            ctx.check_cancelled(STAGE)?;
-            let (tags, positions) = input.sequences.sequence(SequenceId(seq_idx as u32));
-            if tags.len() < 2 {
+    let mut adjacency: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); node_count];
+    if let Some(edges) = input.explicit_edges {
+        for &(src, dst, weight) in edges {
+            if src == dst || weight <= 0.0 {
                 continue;
             }
-            seq_buf.clear();
-            seq_buf.extend(positions.iter().copied().zip(tags.iter().copied()));
-            let is_sorted = seq_buf.windows(2).all(|w| w[0].0 <= w[1].0);
-            if !is_sorted {
-                seq_buf.sort_by_key(|step| step.0);
-            }
+            *adjacency[src.index()].entry(dst.index()).or_default() += weight;
+        }
+    }
 
-            for i in 0..seq_buf.len() {
-                let (p, a) = seq_buf[i];
-                for &(q, b) in &seq_buf[i + 1..] {
-                    if pair_work.is_multiple_of(1024) {
-                        ctx.check_cancelled(STAGE)?;
-                    }
-                    pair_work += 1;
-                    if pair_limit > 0 && pair_work > pair_limit {
-                        return Err(VcpError::ResourceLimitExceeded {
-                            stage: STAGE,
-                            limit_name: "pair_work_limit",
-                            actual: pair_work,
-                            limit: pair_limit,
-                        });
-                    }
-                    if a == b {
-                        continue;
-                    }
-                    let delta = if p > 0 && q > 0 {
-                        p.abs_diff(q).max(1) as f64
-                    } else {
-                        1.0
-                    };
-                    let weight = (-position_decay * (delta - 1.0)).exp();
-                    let ai = a.index();
-                    let bi = b.index();
-                    *adjacency[ai].entry(bi).or_default() += weight;
-                    *adjacency[bi].entry(ai).or_default() += weight;
-                }
-            }
+    let position_decay = config.position_decay;
+    if config.pair_work_limit == Some(0) {
+        return Err(crate::observation::invalid(
+            STAGE,
+            "pair_work_limit must be positive",
+        ));
+    }
+    let mut pair_work = 0usize;
+    let mut seq_buf: Vec<(u32, NodeId)> = Vec::new();
+
+    for seq_idx in 0..input.sequences.sequence_count {
+        ctx.check_cancelled(STAGE)?;
+        let (tags, positions) = input.sequences.sequence(SequenceId(seq_idx as u32));
+        if tags.len() < 2 {
+            continue;
+        }
+        seq_buf.clear();
+        seq_buf.extend(positions.iter().copied().zip(tags.iter().copied()));
+        let is_sorted = seq_buf.windows(2).all(|w| w[0].0 <= w[1].0);
+        if !is_sorted {
+            seq_buf.sort_by_key(|step| step.0);
         }
 
-        let max_keep = config.max_neighbors.max(config.star_neighbors);
-        let cmp_edge = |a: &(usize, f64), b: &(usize, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
-
-        let mut node_supports = Vec::with_capacity(node_count);
-        let mut row_offsets = Vec::with_capacity(node_count + 1);
-        let mut valid_edges: Vec<(usize, f64)> = Vec::new();
-        row_offsets.push(0);
-
-        for (i, neighbors) in adjacency.into_iter().enumerate() {
-            let support: f64 = neighbors.values().sum();
-            node_supports.push(support);
-            if unit_vecs[i].is_some() {
-                let mut filtered: Vec<(usize, f64)> = neighbors
-                    .into_iter()
-                    .filter(|&(nid, w)| w > 0.0 && unit_vecs[nid].is_some())
-                    .collect();
-                if filtered.len() > max_keep {
-                    filtered.select_nth_unstable_by(max_keep - 1, cmp_edge);
-                    filtered.truncate(max_keep);
+        for i in 0..seq_buf.len() {
+            let (p, a) = seq_buf[i];
+            for &(q, b) in &seq_buf[i + 1..] {
+                if pair_work.is_multiple_of(1024) {
+                    ctx.check_cancelled(STAGE)?;
                 }
-                filtered.sort_unstable_by(cmp_edge);
-                valid_edges.extend(filtered);
-            }
-            row_offsets.push(valid_edges.len());
-        }
-
-        // Compute global mean of valid unit vectors for star_direction cache.
-        let mut mean = vec![0.0; dim];
-        if dim > 0 && valid_count > 0 {
-            for v in unit_vecs.iter().flatten() {
-                for (m, &x) in mean.iter_mut().zip(v) {
-                    *m += x;
-                }
-            }
-            for m in &mut mean {
-                *m /= valid_count as f64;
-            }
-        }
-
-        let max_neighbors = config.max_neighbors;
-        let min_neighbors = config.min_neighbors;
-        let max_basis = config.max_basis;
-        let sigma = config.semantic_gate_sigma;
-        let anchor_low = config.anchor_gain_min;
-        let anchor_high = config.anchor_gain_max;
-
-        let compute_node = |i: usize,
-                            local_scratch: &mut nexus_core::NnlsWorkspace|
-         -> VcpResult<(IntrinsicResidual, f64, bool, Vec<f64>)> {
-            ctx.check_cancelled(STAGE)?;
-            let node_id = NodeId(i as u32);
-            let Some(target) = unit_vecs[i].as_deref() else {
-                return Ok((
-                    IntrinsicResidual {
-                        node: node_id,
-                        residual_ratio: 1.0,
-                        neighbor_count: 0,
-                        basis_used: 0,
-                        mgs2_fallback: false,
-                    },
-                    1.0,
-                    false,
-                    vec![0.0; dim],
-                ));
-            };
-
-            let target_norm_sq = norm_sq_f64(target, PrecisionMode::StrictLeftFold);
-            if !target_norm_sq.is_finite() || target_norm_sq <= 1e-24 {
-                return Ok((
-                    IntrinsicResidual {
-                        node: node_id,
-                        residual_ratio: 1.0,
-                        neighbor_count: 0,
-                        basis_used: 0,
-                        mgs2_fallback: false,
-                    },
-                    1.0,
-                    false,
-                    vec![0.0; dim],
-                ));
-            }
-
-            let row_start = row_offsets[i];
-            let row_end = row_offsets[i + 1];
-
-            // Precompute star direction for GlobalEpaOperator parity.
-            let star_end = row_end.min(row_start + config.star_neighbors);
-            let star_slice = &valid_edges[row_start..star_end];
-            let star_vecs: Vec<&[f64]> = star_slice
-                .iter()
-                .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
-                .collect();
-            let star_dots = dot_neighbors(target, &star_vecs, PrecisionMode::FastSimd);
-            let weighted_star: Vec<(&[f64], f64)> = star_slice
-                .iter()
-                .zip(star_vecs.iter().zip(star_dots))
-                .filter_map(|(&(_, w), (&v, raw_dot))| {
-                    let sim = raw_dot.clamp(-1.0, 1.0);
-                    let weight = w.ln_1p()
-                        * semantic_weight(
-                            sim,
-                            config.semantic_gate_enabled,
-                            config.semantic_gate_peak,
-                            sigma,
-                            config.semantic_gate_floor,
-                            config.semantic_gate_hard_floor,
-                        );
-                    (weight > 0.0).then_some((v, weight))
-                })
-                .collect();
-            let star_dir = star_direction(target, &mean, &weighted_star, config.star_mix);
-
-            // Local Cone-AGS candidate preparation.
-            let local_end = row_end.min(row_start + max_neighbors);
-            let neighbors = &valid_edges[row_start..local_end];
-            let neighbor_vecs: Vec<&[f64]> = neighbors
-                .iter()
-                .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
-                .collect();
-            let raw_dots = dot_neighbors(target, &neighbor_vecs, PrecisionMode::FastSimd);
-
-            let mut candidates = Vec::with_capacity(neighbors.len());
-            let mut refs = Vec::with_capacity(neighbors.len());
-            let mut diagonal = Vec::with_capacity(neighbors.len());
-            let mut correlations = Vec::with_capacity(neighbors.len());
-
-            for (&(nid, w), (&v, raw_dot)) in
-                neighbors.iter().zip(neighbor_vecs.iter().zip(raw_dots))
-            {
-                let sim = raw_dot.clamp(-1.0, 1.0);
-                let semantic = semantic_weight(
-                    sim,
-                    config.semantic_gate_enabled,
-                    config.semantic_gate_peak,
-                    sigma,
-                    config.semantic_gate_floor,
-                    config.semantic_gate_hard_floor,
-                );
-                if semantic > 0.0 {
-                    candidates.push(AgsCandidate {
-                        id: nid as i64,
-                        prior: w.ln_1p() * semantic,
+                pair_work += 1;
+                if let Some(pair_limit) = config.pair_work_limit.filter(|&limit| pair_work > limit)
+                {
+                    return Err(VcpError::ResourceLimitExceeded {
+                        stage: STAGE,
+                        limit_name: "pair_work_limit",
+                        actual: pair_work,
+                        limit: pair_limit,
                     });
-                    refs.push(v);
-                    diagonal.push(diag_norms[nid]);
-                    correlations.push(raw_dot);
                 }
-            }
-
-            let candidate_count = candidates.len();
-            if candidate_count < min_neighbors {
-                return Ok((
-                    IntrinsicResidual {
-                        node: node_id,
-                        residual_ratio: 1.0,
-                        neighbor_count: candidate_count,
-                        basis_used: 0,
-                        mgs2_fallback: false,
-                    },
-                    1.0,
-                    false,
-                    star_dir,
-                ));
-            }
-
-            let trace = direct_axes_core(
-                Some(target),
-                &candidates,
-                &refs,
-                Some(&diagonal),
-                Some(&correlations),
-                max_basis,
-                config.min_gain,
-                config.reorth_loss_threshold,
-                false,
-                PrecisionMode::FastSimd,
-            );
-
-            let selected: Vec<(i64, &[f64])> = trace
-                .picked
-                .iter()
-                .map(|&(cand_idx, id, _)| (id, refs[cand_idx]))
-                .collect();
-
-            let basis_used = selected.len();
-            let r_t = if selected.is_empty() {
-                1.0
-            } else {
-                let cone = solve_nnls_with_ids_f64(
-                    target,
-                    &selected,
-                    &ctx.limits,
-                    &ctx.cancel,
-                    local_scratch,
-                )?;
-                if cone.target_norm > 0.0 && cone.target_norm.is_finite() {
-                    (cone.residual_norm / cone.target_norm).clamp(0.0, 1.0)
+                if a == b {
+                    continue;
+                }
+                let delta = if p > 0 && q > 0 {
+                    p.abs_diff(q).max(1) as f64
                 } else {
                     1.0
-                }
-            };
-
-            let anchor_gain = (config.anchor_gain_base
-                + config.anchor_gain_scale * r_t.powf(config.anchor_gain_gamma))
-            .clamp(anchor_low, anchor_high);
-
-            Ok((
-                IntrinsicResidual {
-                    node: node_id,
-                    residual_ratio: r_t,
-                    neighbor_count: candidate_count,
-                    basis_used,
-                    mgs2_fallback: trace.mgs2_fallback,
-                },
-                anchor_gain,
-                true,
-                star_dir,
-            ))
-        };
-
-        let per_node: Vec<(IntrinsicResidual, f64, bool, Vec<f64>)> = if ctx.parallel.is_parallel()
-        {
-            ctx.parallel.install(|| {
-                (0..node_count)
-                    .into_par_iter()
-                    .map_init(nexus_core::NnlsWorkspace::default, |local_scratch, i| {
-                        compute_node(i, local_scratch)
-                    })
-                    .collect::<VcpResult<Vec<_>>>()
-            })?
-        } else {
-            let mut out = Vec::with_capacity(node_count);
-            let mut workspace = nexus_core::NnlsWorkspace::default();
-            for i in 0..node_count {
-                out.push(compute_node(i, &mut workspace)?);
+                };
+                let weight = (-position_decay * (delta - 1.0)).exp();
+                let ai = a.index();
+                let bi = b.index();
+                *adjacency[ai].entry(bi).or_default() += weight;
+                *adjacency[bi].entry(ai).or_default() += weight;
             }
-            out
-        };
-
-        let mut anchor_gains = Vec::with_capacity(node_count);
-        let mut local_residuals = Vec::with_capacity(node_count);
-        let mut intrinsics = Vec::with_capacity(node_count);
-        let mut computed_nodes = Vec::with_capacity(node_count);
-        let mut star_directions = Vec::with_capacity(node_count * dim);
-
-        for (intrinsic, gain, computed, star_dir) in per_node {
-            local_residuals.push(intrinsic.residual_ratio);
-            intrinsics.push(intrinsic);
-            anchor_gains.push(gain);
-            computed_nodes.push(computed);
-            star_directions.extend_from_slice(&star_dir);
         }
-
-        Ok(GeometryState {
-            node_count,
-            anchor_gains,
-            local_residuals,
-            intrinsics,
-            node_supports,
-            star_directions,
-            dim,
-            computed_nodes,
-            diagnostics: Diagnostics {
-                truncated: false,
-                truncation_reason: None,
-                elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-            },
-        })
-    }
-}
-
-impl Operator for GlobalEpaOperator {
-    type Config = GlobalEpaConfig;
-    type Input<'call> = GlobalEpaInput<'call>;
-    type Output = EpaBasis;
-
-    fn name(&self) -> &'static str {
-        "ags-global-star-t4-cached-reorth"
     }
 
-    fn execute<'call>(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'call>,
-    ) -> VcpResult<Self::Output> {
-        const STAGE: &str = "GlobalEpaOperator::execute";
-        let start_time = Instant::now();
-        ctx.check_cancelled(STAGE)?;
-        if config.candidate_pool == 0 || config.k_max == 0 {
-            return Err(crate::observation::invalid(
-                STAGE,
-                "candidate_pool and k_max must be positive",
-            ));
-        }
-        for (name, value, min) in [
-            ("min_gain", config.min_gain, 0.0),
-            ("knee_delta", config.knee_delta, 0.0),
-            ("epsilon", config.epsilon, 0.0),
-            ("min_support", config.min_support, 0.0),
-            ("support_exponent", config.support_exponent, 0.0),
-            ("residual_exponent", config.residual_exponent, 0.0),
-        ] {
-            crate::parameter(STAGE, name, value, min, f64::INFINITY)?;
-        }
+    let max_keep = config.max_neighbors.max(config.star_neighbors);
+    let cmp_edge = |a: &(usize, f64), b: &(usize, f64)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
 
-        input.tag_vectors.validate(STAGE)?;
-        let node_count = input.tag_vectors.rows;
-        let dim = input.tag_vectors.dim;
-        if input.geometry.node_count != node_count {
-            return Err(VcpError::DimensionMismatch {
-                stage: STAGE,
-                expected: node_count,
-                actual: input.geometry.node_count,
-            });
-        }
+    let mut node_supports = Vec::with_capacity(node_count);
+    let mut row_offsets = Vec::with_capacity(node_count + 1);
+    let mut valid_edges: Vec<(usize, f64)> = Vec::new();
+    row_offsets.push(0);
 
-        if node_count == 0 || dim == 0 {
-            return Ok(EpaBasis {
-                dim,
-                k_sem: config.k_sem,
-                basis_count: 0,
-                mean: vec![0.0; dim],
-                basis: Vec::new(),
-                coverage: Vec::new(),
-                diagnostics: Diagnostics {
-                    truncated: false,
-                    truncation_reason: None,
-                    elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-                },
-            });
+    for (i, neighbors) in adjacency.into_iter().enumerate() {
+        let support: f64 = neighbors.values().sum();
+        node_supports.push(support);
+        if unit_vecs[i].is_some() {
+            let mut filtered: Vec<(usize, f64)> = neighbors
+                .into_iter()
+                .filter(|&(nid, w)| w > 0.0 && unit_vecs[nid].is_some())
+                .collect();
+            if filtered.len() > max_keep {
+                filtered.select_nth_unstable_by(max_keep - 1, cmp_edge);
+                filtered.truncate(max_keep);
+            }
+            filtered.sort_unstable_by(cmp_edge);
+            valid_edges.extend(filtered);
         }
+        row_offsets.push(valid_edges.len());
+    }
 
-        let UnitVectors {
-            vecs: unit_vecs,
-            diag_norms: _,
-            valid_count,
-        } = build_unit_vectors(&input.tag_vectors, STAGE)?;
-        if valid_count == 0 {
-            return Ok(EpaBasis {
-                dim,
-                k_sem: config.k_sem,
-                basis_count: 0,
-                mean: vec![0.0; dim],
-                basis: Vec::new(),
-                coverage: Vec::new(),
-                diagnostics: Diagnostics {
-                    truncated: false,
-                    truncation_reason: None,
-                    elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-                },
-            });
-        }
-
-        let mut mean = vec![0.0; dim];
+    // Compute global mean of valid unit vectors for star_direction cache.
+    let mut mean = vec![0.0; dim];
+    if dim > 0 && valid_count > 0 {
         for v in unit_vecs.iter().flatten() {
             for (m, &x) in mean.iter_mut().zip(v) {
                 *m += x;
@@ -1153,192 +808,470 @@ impl Operator for GlobalEpaOperator {
         for m in &mut mean {
             *m /= valid_count as f64;
         }
+    }
 
-        let has_supports = input.geometry.node_supports.len() == node_count;
-        let has_computed = input.geometry.computed_nodes.len() == node_count;
-        let has_stars =
-            input.geometry.dim == dim && input.geometry.star_directions.len() == node_count * dim;
+    let max_neighbors = config.max_neighbors;
+    let min_neighbors = config.min_neighbors;
+    let max_basis = config.max_basis;
+    let sigma = config.semantic_gate_sigma;
+    let anchor_low = config.anchor_gain_min;
+    let anchor_high = config.anchor_gain_max;
 
-        let mut pool: Vec<AgsCandidate> = input
-            .geometry
-            .intrinsics
-            .iter()
-            .filter_map(|r| {
-                let idx = r.node.index();
-                if idx >= node_count || unit_vecs[idx].is_none() {
-                    return None;
-                }
-                let is_computed = if has_computed {
-                    input.geometry.computed_nodes[idx]
-                } else {
-                    r.basis_used > 0 || r.neighbor_count > 0
-                };
-                if !is_computed {
-                    return None;
-                }
-                let support = if has_supports {
-                    input.geometry.node_supports[idx]
-                } else {
-                    r.neighbor_count as f64
-                };
-                if !support.is_finite() || support < config.min_support {
-                    return None;
-                }
-                let res = r.residual_ratio.clamp(0.0, 1.0);
-                let factor = match config.prior_mode {
-                    GlobalEpaPriorMode::Explained => {
-                        (1.0 - res * res).max(0.0).powf(config.residual_exponent)
-                    }
-                    GlobalEpaPriorMode::Residual => res.powf(config.residual_exponent),
-                    GlobalEpaPriorMode::Support => 1.0,
-                };
-                let prior = support.powf(config.support_exponent) * factor;
-                (prior.is_finite() && prior > 0.0).then_some(AgsCandidate {
-                    id: idx as i64,
-                    prior,
-                })
-            })
-            .collect();
-
-        if pool.is_empty() {
-            return Ok(EpaBasis {
-                dim,
-                k_sem: config.k_sem,
-                basis_count: 0,
-                mean,
-                basis: Vec::new(),
-                coverage: Vec::new(),
-                diagnostics: Diagnostics {
-                    truncated: false,
-                    truncation_reason: None,
-                    elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+    let compute_node = |i: usize,
+                        local_scratch: &mut nexus_core::NnlsWorkspace|
+     -> VcpResult<(IntrinsicResidual, f64, bool, Vec<f64>)> {
+        ctx.check_cancelled(STAGE)?;
+        let node_id = NodeId(i as u32);
+        let Some(target) = unit_vecs[i].as_deref() else {
+            return Ok((
+                IntrinsicResidual {
+                    node: node_id,
+                    residual_ratio: 1.0,
+                    neighbor_count: 0,
+                    basis_used: 0,
+                    mgs2_fallback: false,
                 },
-            });
+                1.0,
+                false,
+                vec![0.0; dim],
+            ));
+        };
+
+        let target_norm_sq = norm_sq_f64(target, PrecisionMode::StrictLeftFold);
+        if !target_norm_sq.is_finite() || target_norm_sq <= 1e-24 {
+            return Ok((
+                IntrinsicResidual {
+                    node: node_id,
+                    residual_ratio: 1.0,
+                    neighbor_count: 0,
+                    basis_used: 0,
+                    mgs2_fallback: false,
+                },
+                1.0,
+                false,
+                vec![0.0; dim],
+            ));
         }
 
-        pool.sort_by(|a, b| b.prior.total_cmp(&a.prior).then(a.id.cmp(&b.id)));
-        pool.truncate(config.candidate_pool);
+        let row_start = row_offsets[i];
+        let row_end = row_offsets[i + 1];
 
-        let centered: Vec<Vec<f64>> = pool
+        // Precompute star direction for global_epa parity.
+        let star_end = row_end.min(row_start + config.star_neighbors);
+        let star_slice = &valid_edges[row_start..star_end];
+        let star_vecs: Vec<&[f64]> = star_slice
             .iter()
-            .map(|c| {
-                let idx = c.id as usize;
-                if config.candidate_mode == GlobalEpaCandidateMode::Star && has_stars {
-                    let s = &input.geometry.star_directions[idx * dim..(idx + 1) * dim];
-                    let norm_sq = norm_sq_f64(s, PrecisionMode::StrictLeftFold);
-                    if norm_sq.is_finite() && norm_sq > 1e-24 {
-                        return s.to_vec();
-                    }
-                }
-                let target = unit_vecs[idx].as_deref().unwrap();
-                let mut dir: Vec<f64> = target.iter().zip(&mean).map(|(v, m)| v - m).collect();
-                if !normalize_f64(&mut dir, 1e-12, PrecisionMode::StrictLeftFold) {
-                    dir.fill(0.0);
-                }
-                dir
+            .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
+            .collect();
+        let star_dots = dot_neighbors(target, &star_vecs, PrecisionMode::FastSimd);
+        let weighted_star: Vec<(&[f64], f64)> = star_slice
+            .iter()
+            .zip(star_vecs.iter().zip(star_dots))
+            .filter_map(|(&(_, w), (&v, raw_dot))| {
+                let sim = raw_dot.clamp(-1.0, 1.0);
+                let weight = w.ln_1p()
+                    * semantic_weight(
+                        sim,
+                        config.semantic_gate_enabled,
+                        config.semantic_gate_peak,
+                        sigma,
+                        config.semantic_gate_floor,
+                        config.semantic_gate_hard_floor,
+                    );
+                (weight > 0.0).then_some((v, weight))
             })
             .collect();
+        let star_dir = star_direction(target, &mean, &weighted_star, config.star_mix);
 
-        let refs: Vec<&[f64]> = centered.iter().map(Vec::as_slice).collect();
-        let mut trace = direct_axes_core(
-            None,
-            &pool,
+        // Local Cone-AGS candidate preparation.
+        let local_end = row_end.min(row_start + max_neighbors);
+        let neighbors = &valid_edges[row_start..local_end];
+        let neighbor_vecs: Vec<&[f64]> = neighbors
+            .iter()
+            .map(|&(nid, _)| unit_vecs[nid].as_deref().unwrap())
+            .collect();
+        let raw_dots = dot_neighbors(target, &neighbor_vecs, PrecisionMode::FastSimd);
+
+        let mut candidates = Vec::with_capacity(neighbors.len());
+        let mut refs = Vec::with_capacity(neighbors.len());
+        let mut diagonal = Vec::with_capacity(neighbors.len());
+        let mut correlations = Vec::with_capacity(neighbors.len());
+
+        for (&(nid, w), (&v, raw_dot)) in neighbors.iter().zip(neighbor_vecs.iter().zip(raw_dots)) {
+            let sim = raw_dot.clamp(-1.0, 1.0);
+            let semantic = semantic_weight(
+                sim,
+                config.semantic_gate_enabled,
+                config.semantic_gate_peak,
+                sigma,
+                config.semantic_gate_floor,
+                config.semantic_gate_hard_floor,
+            );
+            if semantic > 0.0 {
+                candidates.push(AgsCandidate {
+                    id: nid as i64,
+                    prior: w.ln_1p() * semantic,
+                });
+                refs.push(v);
+                diagonal.push(diag_norms[nid]);
+                correlations.push(raw_dot);
+            }
+        }
+
+        let candidate_count = candidates.len();
+        if candidate_count < min_neighbors {
+            return Ok((
+                IntrinsicResidual {
+                    node: node_id,
+                    residual_ratio: 1.0,
+                    neighbor_count: candidate_count,
+                    basis_used: 0,
+                    mgs2_fallback: false,
+                },
+                1.0,
+                false,
+                star_dir,
+            ));
+        }
+
+        let trace = direct_axes_core(
+            Some(target),
+            &candidates,
             &refs,
-            None,
-            None,
-            config.k_max,
+            Some(&diagonal),
+            Some(&correlations),
+            max_basis,
             config.min_gain,
-            1e-3,
-            true,
+            config.reorth_loss_threshold,
+            false,
             PrecisionMode::FastSimd,
         );
 
-        ctx.check_cancelled(STAGE)?;
-
-        let basis_refs: Vec<&[f64]> = trace.basis.iter().map(Vec::as_slice).collect();
-        let compute_chunk = |chunk: &[Option<Vec<f64>>]| -> (f64, Vec<f64>) {
-            let mut energy = 0.0;
-            let mut captured = vec![0.0; basis_refs.len()];
-            let mut x = vec![0.0; dim];
-            for v in chunk.iter().flatten() {
-                for ((out, &val), &m) in x.iter_mut().zip(v).zip(&mean) {
-                    *out = val - m;
-                }
-                energy += norm_sq_f64(&x, PrecisionMode::FastSimd);
-                let mut axis_groups = basis_refs.chunks_exact(4);
-                let mut cap_groups = captured.chunks_exact_mut(4);
-                for (axes, cap) in (&mut axis_groups).zip(&mut cap_groups) {
-                    let sums = batch_dot_4_f64(
-                        &x,
-                        [axes[0], axes[1], axes[2], axes[3]],
-                        PrecisionMode::FastSimd,
-                    );
-                    cap[0] += sums[0].powi(2);
-                    cap[1] += sums[1].powi(2);
-                    cap[2] += sums[2].powi(2);
-                    cap[3] += sums[3].powi(2);
-                }
-                for (c, axis) in cap_groups
-                    .into_remainder()
-                    .iter_mut()
-                    .zip(axis_groups.remainder())
-                {
-                    *c += dot_f64(&x, axis, PrecisionMode::FastSimd).powi(2);
-                }
-            }
-            (energy, captured)
-        };
-
-        let partial: Vec<(f64, Vec<f64>)> = if ctx.parallel.is_parallel() {
-            ctx.parallel
-                .install(|| unit_vecs.par_chunks(128).map(compute_chunk).collect())
-        } else {
-            unit_vecs.chunks(128).map(compute_chunk).collect()
-        };
-
-        let mut total_energy = 0.0;
-        let mut energies = vec![0.0; trace.basis.len()];
-        for (energy, values) in partial {
-            total_energy += energy;
-            for (e, v) in energies.iter_mut().zip(values) {
-                *e += v;
-            }
-        }
-
-        let mut cumulative = 0.0;
-        let mut coverage: Vec<f64> = energies
+        let selected: Vec<(i64, &[f64])> = trace
+            .picked
             .iter()
-            .map(|e| {
-                cumulative += e;
-                if total_energy > 1e-12 {
-                    (cumulative / total_energy).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                }
-            })
+            .map(|&(cand_idx, id, _)| (id, refs[cand_idx]))
             .collect();
 
-        let k = effective_k(&coverage, config.k_sem, config.epsilon, config.knee_delta);
-        trace.basis.truncate(k);
-        coverage.truncate(k);
+        let basis_used = selected.len();
+        let r_t = if selected.is_empty() {
+            1.0
+        } else {
+            let cone =
+                solve_nnls_with_ids_f64(target, &selected, max_basis, &ctx.cancel, local_scratch)?;
+            if cone.target_norm > 0.0 && cone.target_norm.is_finite() {
+                (cone.residual_norm / cone.target_norm).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
 
-        let mut flat_basis = Vec::with_capacity(k * dim);
-        for axis in &trace.basis {
-            flat_basis.extend_from_slice(axis);
+        let anchor_gain = (config.anchor_gain_base
+            + config.anchor_gain_scale * r_t.powf(config.anchor_gain_gamma))
+        .clamp(anchor_low, anchor_high);
+
+        Ok((
+            IntrinsicResidual {
+                node: node_id,
+                residual_ratio: r_t,
+                neighbor_count: candidate_count,
+                basis_used,
+                mgs2_fallback: trace.mgs2_fallback,
+            },
+            anchor_gain,
+            true,
+            star_dir,
+        ))
+    };
+
+    let per_node: Vec<(IntrinsicResidual, f64, bool, Vec<f64>)> = if ctx.parallel.is_parallel() {
+        ctx.parallel.install(|| {
+            (0..node_count)
+                .into_par_iter()
+                .map_init(nexus_core::NnlsWorkspace::default, |local_scratch, i| {
+                    compute_node(i, local_scratch)
+                })
+                .collect::<VcpResult<Vec<_>>>()
+        })?
+    } else {
+        let mut out = Vec::with_capacity(node_count);
+        let mut workspace = nexus_core::NnlsWorkspace::default();
+        for i in 0..node_count {
+            out.push(compute_node(i, &mut workspace)?);
         }
+        out
+    };
 
-        Ok(EpaBasis {
+    let mut anchor_gains = Vec::with_capacity(node_count);
+    let mut local_residuals = Vec::with_capacity(node_count);
+    let mut intrinsics = Vec::with_capacity(node_count);
+    let mut computed_nodes = Vec::with_capacity(node_count);
+    let mut star_directions = Vec::with_capacity(node_count * dim);
+
+    for (intrinsic, gain, computed, star_dir) in per_node {
+        local_residuals.push(intrinsic.residual_ratio);
+        intrinsics.push(intrinsic);
+        anchor_gains.push(gain);
+        computed_nodes.push(computed);
+        star_directions.extend_from_slice(&star_dir);
+    }
+
+    Ok(GeometryState {
+        node_count,
+        anchor_gains,
+        local_residuals,
+        intrinsics,
+        node_supports,
+        star_directions,
+        dim,
+        computed_nodes,
+        elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+pub fn global_epa<'call>(
+    input: GlobalEpaInput<'call>,
+    config: &GlobalEpaConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<EpaBasis> {
+    const STAGE: &str = "global_epa";
+    let start_time = Instant::now();
+    ctx.check_cancelled(STAGE)?;
+    if config.candidate_pool == 0 || config.k_max == 0 {
+        return Err(crate::observation::invalid(
+            STAGE,
+            "candidate_pool and k_max must be positive",
+        ));
+    }
+    for (name, value, min) in [
+        ("min_gain", config.min_gain, 0.0),
+        ("knee_delta", config.knee_delta, 0.0),
+        ("epsilon", config.epsilon, 0.0),
+        ("min_support", config.min_support, 0.0),
+        ("support_exponent", config.support_exponent, 0.0),
+        ("residual_exponent", config.residual_exponent, 0.0),
+    ] {
+        crate::parameter(STAGE, name, value, min, f64::INFINITY)?;
+    }
+
+    input.tag_vectors.validate(STAGE)?;
+    let node_count = input.tag_vectors.rows;
+    let dim = input.tag_vectors.dim;
+    if input.geometry.node_count != node_count {
+        return Err(VcpError::DimensionMismatch {
+            stage: STAGE,
+            expected: node_count,
+            actual: input.geometry.node_count,
+        });
+    }
+
+    if node_count == 0 || dim == 0 {
+        return Ok(EpaBasis {
             dim,
             k_sem: config.k_sem,
-            basis_count: k,
-            mean,
-            basis: flat_basis,
-            coverage,
-            diagnostics: Diagnostics {
-                truncated: false,
-                truncation_reason: None,
-                elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
-            },
-        })
+            basis_count: 0,
+            mean: vec![0.0; dim],
+            basis: Vec::new(),
+            coverage: Vec::new(),
+            elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        });
     }
+
+    let UnitVectors {
+        vecs: unit_vecs,
+        diag_norms: _,
+        valid_count,
+    } = build_unit_vectors(&input.tag_vectors, STAGE)?;
+    if valid_count == 0 {
+        return Ok(EpaBasis {
+            dim,
+            k_sem: config.k_sem,
+            basis_count: 0,
+            mean: vec![0.0; dim],
+            basis: Vec::new(),
+            coverage: Vec::new(),
+            elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    let mut mean = vec![0.0; dim];
+    for v in unit_vecs.iter().flatten() {
+        for (m, &x) in mean.iter_mut().zip(v) {
+            *m += x;
+        }
+    }
+    for m in &mut mean {
+        *m /= valid_count as f64;
+    }
+
+    let has_supports = input.geometry.node_supports.len() == node_count;
+    let has_computed = input.geometry.computed_nodes.len() == node_count;
+    let has_stars =
+        input.geometry.dim == dim && input.geometry.star_directions.len() == node_count * dim;
+
+    let mut pool: Vec<AgsCandidate> = input
+        .geometry
+        .intrinsics
+        .iter()
+        .filter_map(|r| {
+            let idx = r.node.index();
+            if idx >= node_count || unit_vecs[idx].is_none() {
+                return None;
+            }
+            let is_computed = if has_computed {
+                input.geometry.computed_nodes[idx]
+            } else {
+                r.basis_used > 0 || r.neighbor_count > 0
+            };
+            if !is_computed {
+                return None;
+            }
+            let support = if has_supports {
+                input.geometry.node_supports[idx]
+            } else {
+                r.neighbor_count as f64
+            };
+            if !support.is_finite() || support < config.min_support {
+                return None;
+            }
+            let res = r.residual_ratio.clamp(0.0, 1.0);
+            let factor = match config.prior_mode {
+                GlobalEpaPriorMode::Explained => {
+                    (1.0 - res * res).max(0.0).powf(config.residual_exponent)
+                }
+                GlobalEpaPriorMode::Residual => res.powf(config.residual_exponent),
+                GlobalEpaPriorMode::Support => 1.0,
+            };
+            let prior = support.powf(config.support_exponent) * factor;
+            (prior.is_finite() && prior > 0.0).then_some(AgsCandidate {
+                id: idx as i64,
+                prior,
+            })
+        })
+        .collect();
+
+    if pool.is_empty() {
+        return Ok(EpaBasis {
+            dim,
+            k_sem: config.k_sem,
+            basis_count: 0,
+            mean,
+            basis: Vec::new(),
+            coverage: Vec::new(),
+            elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    pool.sort_by(|a, b| b.prior.total_cmp(&a.prior).then(a.id.cmp(&b.id)));
+    pool.truncate(config.candidate_pool);
+
+    let centered: Vec<Vec<f64>> = pool
+        .iter()
+        .map(|c| {
+            let idx = c.id as usize;
+            if config.candidate_mode == GlobalEpaCandidateMode::Star && has_stars {
+                let s = &input.geometry.star_directions[idx * dim..(idx + 1) * dim];
+                let norm_sq = norm_sq_f64(s, PrecisionMode::StrictLeftFold);
+                if norm_sq.is_finite() && norm_sq > 1e-24 {
+                    return s.to_vec();
+                }
+            }
+            let target = unit_vecs[idx].as_deref().unwrap();
+            let mut dir: Vec<f64> = target.iter().zip(&mean).map(|(v, m)| v - m).collect();
+            if !normalize_f64(&mut dir, 1e-12, PrecisionMode::StrictLeftFold) {
+                dir.fill(0.0);
+            }
+            dir
+        })
+        .collect();
+
+    let refs: Vec<&[f64]> = centered.iter().map(Vec::as_slice).collect();
+    let mut trace = direct_axes_core(
+        None,
+        &pool,
+        &refs,
+        None,
+        None,
+        config.k_max,
+        config.min_gain,
+        1e-3,
+        true,
+        PrecisionMode::FastSimd,
+    );
+
+    ctx.check_cancelled(STAGE)?;
+
+    let basis_refs: Vec<&[f64]> = trace.basis.iter().map(Vec::as_slice).collect();
+    let compute_chunk = |chunk: &[Option<Vec<f64>>]| -> (f64, Vec<f64>) {
+        let mut energy = 0.0;
+        let mut captured = vec![0.0; basis_refs.len()];
+        let mut x = vec![0.0; dim];
+        for v in chunk.iter().flatten() {
+            for ((out, &val), &m) in x.iter_mut().zip(v).zip(&mean) {
+                *out = val - m;
+            }
+            energy += norm_sq_f64(&x, PrecisionMode::FastSimd);
+            let (axis_groups, axis_tail) = basis_refs.as_chunks::<4>();
+            let (cap_groups, cap_tail) = captured.as_chunks_mut::<4>();
+            for (&axes, cap) in axis_groups.iter().zip(cap_groups) {
+                let sums = batch_dot_4_f64(&x, axes, PrecisionMode::FastSimd);
+                cap[0] += sums[0].powi(2);
+                cap[1] += sums[1].powi(2);
+                cap[2] += sums[2].powi(2);
+                cap[3] += sums[3].powi(2);
+            }
+            for (c, axis) in cap_tail.iter_mut().zip(axis_tail) {
+                *c += dot_f64(&x, axis, PrecisionMode::FastSimd).powi(2);
+            }
+        }
+        (energy, captured)
+    };
+
+    let partial: Vec<(f64, Vec<f64>)> = if ctx.parallel.is_parallel() {
+        ctx.parallel
+            .install(|| unit_vecs.par_chunks(128).map(compute_chunk).collect())
+    } else {
+        unit_vecs.chunks(128).map(compute_chunk).collect()
+    };
+
+    let mut total_energy = 0.0;
+    let mut energies = vec![0.0; trace.basis.len()];
+    for (energy, values) in partial {
+        total_energy += energy;
+        for (e, v) in energies.iter_mut().zip(values) {
+            *e += v;
+        }
+    }
+
+    let mut cumulative = 0.0;
+    let mut coverage: Vec<f64> = energies
+        .iter()
+        .map(|e| {
+            cumulative += e;
+            if total_energy > 1e-12 {
+                (cumulative / total_energy).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    let k = effective_k(&coverage, config.k_sem, config.epsilon, config.knee_delta);
+    trace.basis.truncate(k);
+    coverage.truncate(k);
+
+    let mut flat_basis = Vec::with_capacity(k * dim);
+    for axis in &trace.basis {
+        flat_basis.extend_from_slice(axis);
+    }
+
+    Ok(EpaBasis {
+        dim,
+        k_sem: config.k_sem,
+        basis_count: k,
+        mean,
+        basis: flat_basis,
+        coverage,
+        elapsed_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+    })
 }

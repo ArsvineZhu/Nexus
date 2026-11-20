@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::dataset::{invalid, slot};
-use crate::{CandidateSet, Nexus, Observation, TagRecall, TagRecallRequest};
-use nexus_core::kernel::norm_sq_f32;
-use nexus_core::{ExecutionContext, NodeId, PrecisionMode, VcpResult};
-use nexus_vcp::geometry::IntrinsicResidual;
+use crate::{CandidateSet, Nexus, Observation, Query, TagRecallRequest};
+use nexus_core::kernel::{norm_sq_f32, normalize_direction};
+use nexus_core::{ExecutionContext, PrecisionMode, VcpResult};
+use nexus_vcp::ObservationConfig;
 use nexus_vcp::hyperbolic::{
-    ChunkField, SearchConfig, WarpedConfig, WarpedIndex, residual_radius, tag_field,
+    ChunkField, SearchConfig, SearchHit, WarpedConfig, WarpedIndex, residual_radius, tag_field,
 };
 
 const STAGE: &str = "recall";
@@ -14,6 +14,8 @@ const STAGE: &str = "recall";
 pub struct RecallConfig {
     pub concepts: Option<WarpedConfig>,
     pub documents: Option<WarpedConfig>,
+    /// Concept search settings used at each residual-pyramid layer.
+    pub concept_search: SearchConfig,
 }
 
 impl Default for RecallConfig {
@@ -21,12 +23,14 @@ impl Default for RecallConfig {
         Self {
             concepts: Some(WarpedConfig::default()),
             documents: Some(WarpedConfig::default()),
+            concept_search: SearchConfig::default(),
         }
     }
 }
 
 pub struct RecallRequest<'a> {
     pub limit: usize,
+    /// Restricts this search to the supplied candidate IDs.
     pub allowed: Option<&'a [u64]>,
     pub search: SearchConfig,
 }
@@ -45,6 +49,15 @@ pub struct RecallIndexes<'data> {
     nexus: &'data Nexus<'data>,
     concepts: Option<WarpedIndex>,
     documents: Option<ChunkField>,
+    concept_search: SearchConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DocumentHit {
+    pub id: u64,
+    pub document_id: u64,
+    /// Warped distance. Nearer vectors sort first.
+    pub distance: f64,
 }
 
 impl Nexus<'_> {
@@ -70,24 +83,13 @@ impl Nexus<'_> {
         let concepts = config
             .concepts
             .map(|config| {
-                let default = |node| IntrinsicResidual {
-                    node,
-                    residual_ratio: 1.0,
-                    neighbor_count: 0,
-                    basis_used: 0,
-                    mgs2_fallback: false,
-                };
-                let mut residuals = (0..assets.tags.rows)
-                    .map(|i| NodeId::from_index(i, STAGE).map(default))
-                    .collect::<VcpResult<Vec<_>>>()?;
-                for value in self.tag_residuals() {
-                    residuals[value.node.index()] = value.clone();
-                }
                 tag_field(
                     assets.tags,
                     assets.basis.map_or(&[], |basis| basis.mean),
                     assets.graph.inbound,
-                    &residuals,
+                    assets.tag_residuals.ok_or_else(|| {
+                        invalid(STAGE, "concept recall requires prepared tag residuals")
+                    })?,
                     config,
                     ctx,
                 )
@@ -97,12 +99,56 @@ impl Nexus<'_> {
             nexus: self,
             concepts,
             documents,
+            concept_search: config.concept_search,
         })
     }
 }
 
-impl TagRecall for RecallIndexes<'_> {
-    fn recall(
+impl<'data> RecallIndexes<'data> {
+    /// Builds an observation with the prepared concept index or the query's host provider.
+    pub fn observe(
+        &self,
+        query: &Query<'_>,
+        config: &ObservationConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<Observation<'data>> {
+        if query.tag_recall.is_some() || self.concepts.is_none() {
+            return self.nexus.observe(query, config, ctx);
+        }
+        let recall = |ctx: &ExecutionContext<'_>, req: TagRecallRequest<'_>, out: &mut Vec<u64>| {
+            self.recall_tags(ctx, req, out)
+        };
+        self.nexus
+            .observe(&query.with_tag_recall(&recall), config, ctx)
+    }
+
+    /// Searches the document index with a raw vector from any retrieval lane.
+    /// Use the returned IDs to fuse or filter lanes before preparing a candidate set.
+    pub fn search_documents(
+        &self,
+        vector: &[f32],
+        request: &RecallRequest<'_>,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<Vec<DocumentHit>> {
+        ctx.check_cancelled(STAGE)?;
+        let assets = self.nexus.prepared();
+        let unit = normalize_direction(vector, assets.tags.dim, STAGE)?;
+        let hits = self.document_hits(&unit, request, ctx)?;
+        let catalog = assets.documents.expect("document index requires a catalog");
+        Ok(hits
+            .into_iter()
+            .map(|hit| {
+                let id = catalog.ids[hit.slot];
+                DocumentHit {
+                    id,
+                    document_id: catalog.document_ids.map_or(id, |ids| ids[hit.slot]),
+                    distance: hit.distance,
+                }
+            })
+            .collect())
+    }
+
+    fn recall_tags(
         &self,
         ctx: &ExecutionContext<'_>,
         request: TagRecallRequest<'_>,
@@ -123,34 +169,26 @@ impl TagRecall for RecallIndexes<'_> {
             return Ok(());
         }
         let radius = residual_radius(request.epa, request.layer, energy);
-        let search = SearchConfig {
-            rerank: Some(64),
-            ..SearchConfig::default()
-        };
         let hits = index.search(
             request.residual,
             radius,
-            request.limit.min(64),
+            request.limit,
             Some(&scope),
-            search,
+            self.concept_search,
             ctx,
         )?;
         out.extend(hits.into_iter().map(|hit| assets.concept_ids[hit.slot]));
         Ok(())
     }
-}
 
-impl<'data> Observation<'data> {
-    pub fn recall(
+    fn document_hits(
         &self,
-        indexes: &RecallIndexes<'data>,
+        unit: &[f32],
         request: &RecallRequest<'_>,
-    ) -> VcpResult<CandidateSet<'data>> {
-        if !std::ptr::eq(self.nexus, indexes.nexus) {
-            return Err(invalid(STAGE, "recall indexes belong to a different Nexus"));
-        }
-        self.context().check_cancelled(STAGE)?;
-        let documents = indexes
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<Vec<SearchHit>> {
+        ctx.check_cancelled(STAGE)?;
+        let documents = self
             .documents
             .as_ref()
             .ok_or_else(|| invalid(STAGE, "document index was not prepared"))?;
@@ -165,15 +203,24 @@ impl<'data> Observation<'data> {
             })
             .transpose()?;
         if request.limit == 0 {
-            return CandidateSet::from_catalog_slots(self.nexus, []);
+            return Ok(Vec::new());
         }
-        let hits = documents.search(
-            &self.values().original_query,
-            request.limit,
-            scope.as_deref(),
-            request.search,
-            self.context(),
-        )?;
+        documents.search(unit, request.limit, scope.as_deref(), request.search, ctx)
+    }
+}
+
+impl<'data> Observation<'data> {
+    /// Uses the original query direction to recall and prepare an ordered candidate set.
+    pub fn recall(
+        &self,
+        indexes: &RecallIndexes<'data>,
+        request: &RecallRequest<'_>,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<CandidateSet<'data>> {
+        if !std::ptr::eq(self.nexus, indexes.nexus) {
+            return Err(invalid(STAGE, "recall indexes belong to a different Nexus"));
+        }
+        let hits = indexes.document_hits(&self.values().original_query, request, ctx)?;
         CandidateSet::from_catalog_slots(self.nexus, hits.into_iter().map(|hit| hit.slot))
     }
 }

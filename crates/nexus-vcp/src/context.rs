@@ -3,8 +3,7 @@
 use crate::observation::{finite_vector, invalid, numeric_failure};
 use nexus_core::kernel::{dot_f32, norm_sq_f32, normalize_f64};
 use nexus_core::{
-    ContextFragmentsView, Diagnostics, ExecutionContext, Operator, PrecisionMode, VcpResult,
-    VectorMatrixView,
+    ContextFragmentsView, ExecutionContext, PrecisionMode, VcpResult, VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -75,7 +74,7 @@ pub struct ContextAggregation {
     pub query_origin: &'static str,
     pub allocations: Vec<ContextAllocation>,
     pub role_diagnostics: Vec<RoleMassDiagnostics>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 /// Return the part of [start, end) not already allocated to another fragment.
@@ -135,163 +134,149 @@ fn prepare_parent(fragments: ContextFragmentsView<'_>, rows: Vec<usize>) -> Pare
     }
 }
 
-pub struct ContextAggregateOperator;
-
-impl Operator for ContextAggregateOperator {
-    type Config = ContextConfig;
-    type Input<'call> = ContextAggregateInput<'call>;
-    type Output = ContextAggregation;
-
-    fn name(&self) -> &'static str {
-        "context.aggregate"
+pub fn aggregate(
+    input: ContextAggregateInput<'_>,
+    config: &ContextConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<ContextAggregation> {
+    let start = std::time::Instant::now();
+    let stage = "context.aggregate";
+    ctx.check_cancelled(stage)?;
+    let fragments = input.fragments;
+    fragments.validate(stage)?;
+    input.fragment_vectors.validate(stage)?;
+    let dim = input.fragment_vectors.dim;
+    if dim == 0
+        || fragments.count != input.fragment_vectors.rows
+        || !(1..=10_000).contains(&config.window)
+        || !(0.0..=1.0).contains(&config.context_mix)
+        || !config.null_mass.is_finite()
+        || config.null_mass <= 0.0
+        || std::iter::once(&config.default_role_weight)
+            .chain(config.role_weights.values())
+            .any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err(invalid(
+            stage,
+            "invalid context configuration or input dimensions",
+        ));
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
+    type Grouped<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<usize>>>;
+    let mut groups = Grouped::new();
+    let mut seen = BTreeSet::new();
+    let mut norm_buffer = vec![0.0; fragments.count];
+    let norm = norm_buffer.as_mut_slice();
+    for (row, scale) in norm.iter_mut().enumerate() {
         ctx.check_cancelled(stage)?;
-        let fragments = input.fragments;
-        fragments.validate(stage)?;
-        input.fragment_vectors.validate(stage)?;
-        let dim = input.fragment_vectors.dim;
-        if dim == 0
-            || fragments.count != input.fragment_vectors.rows
-            || !(1..=10_000).contains(&config.window)
-            || !(0.0..=1.0).contains(&config.context_mix)
-            || !config.null_mass.is_finite()
-            || config.null_mass <= 0.0
-            || std::iter::once(&config.default_role_weight)
-                .chain(config.role_weights.values())
-                .any(|v| !v.is_finite() || *v < 0.0)
+        let [key, role, phase] = [
+            fragments.keys[row],
+            fragments.roles[row],
+            fragments.stages[row],
+        ];
+        if [key, role, phase].into_iter().any(str::is_empty)
+            || fragments.weights[row] < 0.0
+            || fragments.distances[row] < 0.0
+            || !(0.0..=1.0).contains(&fragments.relevances[row])
+            || !(0.0..=1.0).contains(&fragments.validities[row])
+            || fragments.half_lives[row].is_some_and(|v| v <= 0.0)
         {
-            return Err(invalid(
-                stage,
-                "invalid context configuration or input dimensions",
-            ));
+            return Err(invalid(stage, "invalid context fragment"));
         }
-        type Grouped<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Vec<usize>>>;
-        let mut groups = Grouped::new();
-        let mut seen = BTreeSet::new();
-        let mut norm_buffer = vec![0.0; fragments.count];
-        let norm = norm_buffer.as_mut_slice();
-        for (row, scale) in norm.iter_mut().enumerate() {
-            ctx.check_cancelled(stage)?;
-            let [key, role, phase] = [
-                fragments.keys[row],
-                fragments.roles[row],
-                fragments.stages[row],
-            ];
-            if [key, role, phase].into_iter().any(str::is_empty)
-                || fragments.weights[row] < 0.0
-                || fragments.distances[row] < 0.0
-                || !(0.0..=1.0).contains(&fragments.relevances[row])
-                || !(0.0..=1.0).contains(&fragments.validities[row])
-                || fragments.half_lives[row].is_some_and(|v| v <= 0.0)
-            {
-                return Err(invalid(stage, "invalid context fragment"));
-            }
-            let vector = input.fragment_vectors.row(row).unwrap();
-            finite_vector(stage, vector, dim)?;
-            *scale = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
-            if *scale > 1e-12 && seen.insert(key) {
-                groups
-                    .entry((phase, role))
-                    .or_default()
-                    .entry(fragments.parent_keys[row].unwrap_or(key))
-                    .or_default()
-                    .push(row);
-            }
+        let vector = input.fragment_vectors.row(row).unwrap();
+        finite_vector(stage, vector, dim)?;
+        *scale = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
+        if *scale > 1e-12 && seen.insert(key) {
+            groups
+                .entry((phase, role))
+                .or_default()
+                .entry(fragments.parent_keys[row].unwrap_or(key))
+                .or_default()
+                .push(row);
         }
-        let mut allocations = Vec::new();
-        let mut role_diagnostics = Vec::new();
-        let mut combined_buffer = vec![0.0; dim];
-        let combined = combined_buffer.as_mut_slice();
-        for ((phase, role), parents) in groups {
-            ctx.check_cancelled(stage)?;
-            let mut parents: Vec<_> = parents.into_values().collect();
-            parents.sort_by_key(|rows| {
-                Reverse(rows.iter().map(|&row| fragments.sequences[row]).max())
-            });
-            let supplied = parents.len();
-            let prepared: Vec<_> = parents
-                .into_iter()
-                .take(config.window)
-                .map(|rows| prepare_parent(fragments, rows))
-                .collect();
-            let denominator =
-                config.null_mass + prepared.iter().map(|parent| parent.utility).sum::<f64>();
-            let budget = config.context_mix
-                * config
-                    .role_weights
-                    .get(role)
-                    .copied()
-                    .unwrap_or(config.default_role_weight);
-            if !denominator.is_finite() {
-                return Err(numeric_failure(stage, "context utility overflowed"));
-            }
-            let mut contribution = 0.0;
-            for parent in prepared.into_iter().filter(|parent| parent.utility > 0.0) {
-                let parent_mass = budget * (parent.utility / denominator);
-                contribution += parent_mass;
-                for (row, coverage, value) in parent.rows {
-                    let mass = parent_mass * (coverage / parent.coverage);
-                    if mass == 0.0 {
-                        continue;
-                    }
-                    for (out, &v) in combined
-                        .iter_mut()
-                        .zip(input.fragment_vectors.row(row).unwrap())
-                    {
-                        *out += mass * (f64::from(v) / norm[row]);
-                    }
-                    allocations.push(ContextAllocation {
-                        row,
-                        role: role.into(),
-                        stage: phase.into(),
-                        contribution: mass,
-                        decayed_weight: value,
-                        role_weight: budget,
-                    });
-                }
-            }
-            role_diagnostics.push(RoleMassDiagnostics {
-                role: role.into(),
-                stage: phase.into(),
-                supplied,
-                budget,
-                contribution,
-                null_mass: config.null_mass,
-            });
-        }
-        let has_context = combined.iter().any(|v| *v != 0.0);
-        let query_origin = if let Some(query) = input.raw_query {
-            finite_vector(stage, query, dim)?;
-            let scale = norm_sq_f32(query, PrecisionMode::FastSimd).sqrt();
-            if scale <= 1e-12 {
-                return Err(invalid(stage, "raw query has no direction"));
-            }
-            for (out, &v) in combined.iter_mut().zip(query) {
-                *out += f64::from(v) / scale;
-            }
-            if has_context { "raw+context" } else { "raw" }
-        } else {
-            "context"
-        };
-        if !normalize_f64(combined, 1e-12, PrecisionMode::FastSimd) {
-            return Err(invalid(stage, "query signals have no net direction"));
-        }
-        Ok(ContextAggregation {
-            effective_vector: combined.iter().map(|&v| v as f32).collect(),
-            query_origin,
-            allocations,
-            role_diagnostics,
-            diagnostics: Diagnostics::default(),
-        })
     }
+    let mut allocations = Vec::new();
+    let mut role_diagnostics = Vec::new();
+    let mut combined_buffer = vec![0.0; dim];
+    let combined = combined_buffer.as_mut_slice();
+    for ((phase, role), parents) in groups {
+        ctx.check_cancelled(stage)?;
+        let mut parents: Vec<_> = parents.into_values().collect();
+        parents.sort_by_key(|rows| Reverse(rows.iter().map(|&row| fragments.sequences[row]).max()));
+        let supplied = parents.len();
+        let prepared: Vec<_> = parents
+            .into_iter()
+            .take(config.window)
+            .map(|rows| prepare_parent(fragments, rows))
+            .collect();
+        let denominator =
+            config.null_mass + prepared.iter().map(|parent| parent.utility).sum::<f64>();
+        let budget = config.context_mix
+            * config
+                .role_weights
+                .get(role)
+                .copied()
+                .unwrap_or(config.default_role_weight);
+        if !denominator.is_finite() {
+            return Err(numeric_failure(stage, "context utility overflowed"));
+        }
+        let mut contribution = 0.0;
+        for parent in prepared.into_iter().filter(|parent| parent.utility > 0.0) {
+            let parent_mass = budget * (parent.utility / denominator);
+            contribution += parent_mass;
+            for (row, coverage, value) in parent.rows {
+                let mass = parent_mass * (coverage / parent.coverage);
+                if mass == 0.0 {
+                    continue;
+                }
+                for (out, &v) in combined
+                    .iter_mut()
+                    .zip(input.fragment_vectors.row(row).unwrap())
+                {
+                    *out += mass * (f64::from(v) / norm[row]);
+                }
+                allocations.push(ContextAllocation {
+                    row,
+                    role: role.into(),
+                    stage: phase.into(),
+                    contribution: mass,
+                    decayed_weight: value,
+                    role_weight: budget,
+                });
+            }
+        }
+        role_diagnostics.push(RoleMassDiagnostics {
+            role: role.into(),
+            stage: phase.into(),
+            supplied,
+            budget,
+            contribution,
+            null_mass: config.null_mass,
+        });
+    }
+    let has_context = combined.iter().any(|v| *v != 0.0);
+    let query_origin = if let Some(query) = input.raw_query {
+        finite_vector(stage, query, dim)?;
+        let scale = norm_sq_f32(query, PrecisionMode::FastSimd).sqrt();
+        if scale <= 1e-12 {
+            return Err(invalid(stage, "raw query has no direction"));
+        }
+        for (out, &v) in combined.iter_mut().zip(query) {
+            *out += f64::from(v) / scale;
+        }
+        if has_context { "raw+context" } else { "raw" }
+    } else {
+        "context"
+    };
+    if !normalize_f64(combined, 1e-12, PrecisionMode::FastSimd) {
+        return Err(invalid(stage, "query signals have no net direction"));
+    }
+    Ok(ContextAggregation {
+        effective_vector: combined.iter().map(|&v| v as f32).collect(),
+        query_origin,
+        allocations,
+        role_diagnostics,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+    })
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -326,42 +311,28 @@ pub struct ContextSegments {
     pub ranges: Vec<SegmentRange>,
 }
 
-pub struct ContextSegmentOperator;
-
-impl Operator for ContextSegmentOperator {
-    type Config = ContextSegmentConfig;
-    type Input<'call> = ContextSegmentInput<'call>;
-    type Output = ContextSegments;
-
-    fn name(&self) -> &'static str {
-        "context.segment"
+pub fn segment(
+    input: ContextSegmentInput<'_>,
+    config: &ContextSegmentConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<ContextSegments> {
+    let stage = "context.segment";
+    ctx.check_cancelled(stage)?;
+    let vectors = input.vectors;
+    vectors.validate(stage)?;
+    if vectors.dim == 0 || !(-1.0..=1.0).contains(&config.similarity_threshold) {
+        return Err(invalid(
+            stage,
+            "invalid segment dimensions or similarity threshold",
+        ));
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        ctx.check_cancelled(stage)?;
-        let vectors = input.vectors;
-        vectors.validate(stage)?;
-        if vectors.dim == 0 || !(-1.0..=1.0).contains(&config.similarity_threshold) {
-            return Err(invalid(
-                stage,
-                "invalid segment dimensions or similarity threshold",
-            ));
-        }
-        let mut result = ContextSegments::default();
-        let mut start = 0;
-        let mut previous = None;
-        let mut mean_buffer = vec![0.0; vectors.dim];
-        let mean = mean_buffer.as_mut_slice();
-        let append = |range: SegmentRange,
-                      mean: &mut [f64],
-                      result: &mut ContextSegments|
-         -> VcpResult<()> {
+    let mut result = ContextSegments::default();
+    let mut start = 0;
+    let mut previous = None;
+    let mut mean_buffer = vec![0.0; vectors.dim];
+    let mean = mean_buffer.as_mut_slice();
+    let append =
+        |range: SegmentRange, mean: &mut [f64], result: &mut ContextSegments| -> VcpResult<()> {
             if !normalize_f64(mean, 1e-12, PrecisionMode::FastSimd) {
                 return Err(invalid(stage, "segment mean has no direction"));
             }
@@ -372,35 +343,34 @@ impl Operator for ContextSegmentOperator {
             mean.fill(0.0);
             Ok(())
         };
-        for (index, vector) in vectors.data.chunks_exact(vectors.dim).enumerate() {
-            ctx.check_cancelled(stage)?;
-            finite_vector(stage, vector, vectors.dim)?;
-            let norm = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
-            if norm <= 1e-12 {
-                return Err(invalid(stage, "segment vector has no direction"));
-            }
-            if let Some((prior, prior_norm)) = previous {
-                let cosine = dot_f32(vector, prior, PrecisionMode::FastSimd) / (norm * prior_norm);
-                if cosine < config.similarity_threshold {
-                    append(SegmentRange { start, end: index }, mean, &mut result)?;
-                    start = index;
-                }
-            }
-            for (out, &v) in mean.iter_mut().zip(vector) {
-                *out += f64::from(v) / norm;
-            }
-            previous = Some((vector, norm));
+    for (index, vector) in vectors.data.chunks_exact(vectors.dim).enumerate() {
+        ctx.check_cancelled(stage)?;
+        finite_vector(stage, vector, vectors.dim)?;
+        let norm = norm_sq_f32(vector, PrecisionMode::FastSimd).sqrt();
+        if norm <= 1e-12 {
+            return Err(invalid(stage, "segment vector has no direction"));
         }
-        if !vectors.is_empty() {
-            append(
-                SegmentRange {
-                    start,
-                    end: vectors.rows,
-                },
-                mean,
-                &mut result,
-            )?;
+        if let Some((prior, prior_norm)) = previous {
+            let cosine = dot_f32(vector, prior, PrecisionMode::FastSimd) / (norm * prior_norm);
+            if cosine < config.similarity_threshold {
+                append(SegmentRange { start, end: index }, mean, &mut result)?;
+                start = index;
+            }
         }
-        Ok(result)
+        for (out, &v) in mean.iter_mut().zip(vector) {
+            *out += f64::from(v) / norm;
+        }
+        previous = Some((vector, norm));
     }
+    if !vectors.is_empty() {
+        append(
+            SegmentRange {
+                start,
+                end: vectors.rows,
+            },
+            mean,
+            &mut result,
+        )?;
+    }
+    Ok(result)
 }

@@ -19,7 +19,7 @@ Candidate order is a host input to Nexus. Deduplication preserves that order whe
 
 Nexus accepts unattributed edges at full weight by default. The discount policy applies a 0.15 multiplier to unattributed edges. With provenance, either policy excludes any group with a required root belonging to the candidate and preserves the 0.15 floor. Upstream assumes complete independence for an unattributed edge and has one file identifier per candidate. The attributable River and wormhole cases compare the common scoring path. The unattributed case verifies that Nexus attenuates the bonus while preserving the semantic and path scores. Negative relations stay in the counterevidence view and the host can apply temporal edge gates.
 
-The shared behavior includes zero-target NNLS, peak-normalized River fields and the minimum observed flow for active edges. River applies field normalization at readout. The dual-field solver uses propagated source mass and exposes the actual fixed point and residuals. River chooses the path with the highest complete score, with path and graph contributions from that same path inside the shared topology budget.
+The shared behavior includes zero-target NNLS, peak-normalized River fields and the minimum observed flow for active edges. River peak-normalizes the fields when preparing path evidence. The dual-field solver uses propagated source mass and exposes the actual fixed point and residuals. River chooses the path with the highest complete score, with path and graph contributions from that same path inside the shared topology budget. The conformance test selects the upstream budget of 0.08. The ordinary readout defaults to 0.02.
 
 ## Reproduce
 
@@ -32,7 +32,7 @@ cargo test -p nexus-vcp --test upstream_golden --all-features --locked
 
 ## DTSC field and curve references
 
-The [field](../crates/nexus-math/tests/fixtures/vcp-dtsc-field.json) and [curve](../crates/nexus-math/tests/fixtures/vcp-dtsc.json) fixtures are the original numerical corpus in Nous-Wave at `412b062`. Their embedded capture revision is `e03b891d42055cdf3cab5dc961cc71dd5facd65a`. The standalone DTSC tests exercise field sampling, trusted scoring and the low-trust input-order result through the public operators. The capture records historical host baseline scores. Current scores use strict original-query cosine plus the preserved geometric bonus, and pool fallback restores candidate input order.
+The [field](../crates/nexus-math/tests/fixtures/vcp-dtsc-field.json) and [curve](../crates/nexus-math/tests/fixtures/vcp-dtsc.json) fixtures are the original numerical corpus in Nous-Wave at `412b062`. Their embedded capture revision is `e03b891d42055cdf3cab5dc961cc71dd5facd65a`. The standalone DTSC tests exercise field sampling, trusted scoring and low-trust input order with full geometric weight. Nexus starts from strict original-query cosine. The default readout applies 15% of the prepared bonus and, when geometry falls back, orders by cosine. Input-order fallback remains available for pools already ordered by a host ranker. The host sends lexically grounded and inferred seeds to DTSC as distinct evidence types. An inferred contact contributes to structure and direct reward requires a caller-supplied or lexically grounded seed.
 
 ## Warped Chunk reference
 

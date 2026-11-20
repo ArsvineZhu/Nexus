@@ -2,10 +2,7 @@
 
 use crate::observation::{finite_vector, invalid};
 use nexus_core::kernel::{dot_f32, norm_sq_f32};
-use nexus_core::{
-    CandidateId, Diagnostics, ExecutionContext, Operator, PrecisionMode, VcpResult,
-    VectorMatrixView,
-};
+use nexus_core::{CandidateId, ExecutionContext, PrecisionMode, VcpResult, VectorMatrixView};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -45,7 +42,7 @@ pub struct FoldedMapping {
 pub struct DedupResult {
     pub survivors: Vec<CandidateId>,
     pub folded: Vec<FoldedMapping>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 struct Representative<'a> {
@@ -95,86 +92,73 @@ fn bounded_cosine(
     Some(dot / denominator)
 }
 
-pub struct CosineDedupOperator;
-
-impl Operator for CosineDedupOperator {
-    type Config = CosineDedupConfig;
-    type Input<'call> = CosineDedupInput<'call>;
-    type Output = DedupResult;
-
-    fn name(&self) -> &'static str {
-        "cosine.dedup"
+pub fn cosine_dedup(
+    input: CosineDedupInput<'_>,
+    config: &CosineDedupConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<DedupResult> {
+    let stage = "cosine.dedup";
+    let mut suffix = Vec::new();
+    ctx.check_cancelled(stage)?;
+    input.candidate_vectors.validate(stage)?;
+    if !(-1.0..=1.0).contains(&config.threshold) || config.bound_block == 0 {
+        return Err(invalid(stage, "invalid cosine cutoff or block size"));
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        let mut suffix = Vec::new();
+    let mut result = DedupResult::default();
+    let mut unique = HashSet::new();
+    let mut representatives = Vec::<Representative<'_>>::new();
+    let block = config.bound_block;
+    let bounded = input.candidate_vectors.dim > block && config.bound_slow_budget > 0;
+    let mode = PrecisionMode::StrictLeftFold;
+    for &candidate in input.ranked {
         ctx.check_cancelled(stage)?;
-        input.candidate_vectors.validate(stage)?;
-        if !(-1.0..=1.0).contains(&config.threshold) || config.bound_block == 0 {
-            return Err(invalid(stage, "invalid cosine cutoff or block size"));
+        if !unique.insert(candidate) {
+            continue;
         }
-        let mut result = DedupResult::default();
-        let mut unique = HashSet::new();
-        let mut representatives = Vec::<Representative<'_>>::new();
-        let block = config.bound_block;
-        let bounded = input.candidate_vectors.dim > block && config.bound_slow_budget > 0;
-        let mode = PrecisionMode::StrictLeftFold;
-        for &candidate in input.ranked {
+        let vector = input
+            .candidate_vectors
+            .row(candidate.index())
+            .ok_or_else(|| invalid(stage, "rank contains a candidate outside the matrix"))?;
+        finite_vector(stage, vector, input.candidate_vectors.dim)?;
+        let norm = norm_sq_f32(vector, mode).sqrt();
+        if bounded {
+            fill_suffix(vector, block, &mut suffix);
+        }
+        let mut matched = None;
+        for (index, prior) in representatives.iter().enumerate() {
             ctx.check_cancelled(stage)?;
-            if !unique.insert(candidate) {
+            if norm <= 1e-12 || prior.norm <= 1e-12 {
                 continue;
             }
-            let vector = input
-                .candidate_vectors
-                .row(candidate.index())
-                .ok_or_else(|| invalid(stage, "rank contains a candidate outside the matrix"))?;
-            finite_vector(stage, vector, input.candidate_vectors.dim)?;
-            let norm = norm_sq_f32(vector, mode).sqrt();
-            if bounded {
-                fill_suffix(vector, block, &mut suffix);
-            }
-            let mut matched = None;
-            for (index, prior) in representatives.iter().enumerate() {
-                ctx.check_cancelled(stage)?;
-                if norm <= 1e-12 || prior.norm <= 1e-12 {
-                    continue;
-                }
-                let cosine = if bounded && index < config.bound_slow_budget {
-                    bounded_cosine(prior, vector, norm, &suffix, block, config.threshold)
-                } else {
-                    Some(dot_f32(vector, prior.vector, mode) / (norm * prior.norm))
-                };
-                if let Some(cosine) = cosine.filter(|cosine| *cosine >= config.threshold) {
-                    matched = Some((prior.candidate, cosine));
-                    break;
-                }
-            }
-            if let Some((representative, cosine)) = matched {
-                result.folded.push(FoldedMapping {
-                    folded: candidate,
-                    representative,
-                    cosine,
-                });
+            let cosine = if bounded && index < config.bound_slow_budget {
+                bounded_cosine(prior, vector, norm, &suffix, block, config.threshold)
             } else {
-                result.survivors.push(candidate);
-                representatives.push(Representative {
-                    candidate,
-                    vector,
-                    norm,
-                    suffix: if bounded && representatives.len() < config.bound_slow_budget {
-                        suffix.clone()
-                    } else {
-                        Vec::new()
-                    },
-                });
+                Some(dot_f32(vector, prior.vector, mode) / (norm * prior.norm))
+            };
+            if let Some(cosine) = cosine.filter(|cosine| *cosine >= config.threshold) {
+                matched = Some((prior.candidate, cosine));
+                break;
             }
         }
-        Ok(result)
+        if let Some((representative, cosine)) = matched {
+            result.folded.push(FoldedMapping {
+                folded: candidate,
+                representative,
+                cosine,
+            });
+        } else {
+            result.survivors.push(candidate);
+            representatives.push(Representative {
+                candidate,
+                vector,
+                norm,
+                suffix: if bounded && representatives.len() < config.bound_slow_budget {
+                    suffix.clone()
+                } else {
+                    Vec::new()
+                },
+            });
+        }
     }
+    Ok(result)
 }

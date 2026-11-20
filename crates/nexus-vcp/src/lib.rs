@@ -20,15 +20,15 @@ pub use river::*;
 pub use thinking::*;
 
 pub use artifact::{
-    CounterevidenceAdj, FactMatrix, FactMatrixConfig, FactMatrixInput, FactMatrixOperator,
-    FactMatrixOutput, ProvenanceBuildInput, ProvenanceBuildOperator, ProvenanceConfig,
-    ProvenanceData, TransportCalibrateInput, TransportCalibrateOperator, TransportCalibration,
-    TransportConfig,
+    CounterevidenceAdj, FactMatrix, FactMatrixConfig, FactMatrixInput, FactMatrixOutput,
+    ProvenanceBuildInput, ProvenanceConfig, ProvenanceData, TransportCalibrateInput,
+    TransportCalibration, TransportConfig, build_fact_matrix, build_provenance,
+    calibrate_transport,
 };
 pub use geometry::{
     EpaBasis, GeometryState, GlobalEpaCandidateMode, GlobalEpaConfig, GlobalEpaInput,
-    GlobalEpaOperator, GlobalEpaPriorMode, IntrinsicResidual, LocalConeAgsConfig,
-    LocalConeAgsInput, LocalConeAgsOperator,
+    GlobalEpaPriorMode, IntrinsicResidual, LocalConeAgsConfig, LocalConeAgsInput, global_epa,
+    local_cone,
 };
 
 fn parameter(

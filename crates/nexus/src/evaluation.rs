@@ -1,37 +1,35 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::dataset::invalid;
+use crate::readout::{CandidateIdentity, dtsc_readout, river_readout};
 use crate::{
-    CandidateInput, CandidateSet, DtscField, DtscReadout, FieldState, Nexus, Observation, Query,
-    RiverReadout, ScoreItem, Stage, TagMemoReadout, ThinkingPlan,
+    CandidateInput, CandidateSet, DtscField, DtscReadout, FieldState, Nexus, Observation, PathRef,
+    Query, RiverReadout, ScoreItem, Stage, TagMemoReadout, ThinkingPlan,
 };
-use nexus_core::{
-    CandidateId, ExecutionContext, Operator, QueryCosines, ThinkingStageInputView, VcpResult,
-};
+use nexus_core::{CandidateId, ExecutionContext, QueryCosines, ThinkingStageInputView, VcpResult};
 use nexus_math::{
-    DtscConfig, DtscEvidenceConfig, DtscEvidenceInput, DtscEvidenceOperator, DtscEvidenceValues,
-    DtscGeometryState, DtscReadoutConfig, DtscReadoutInput, DtscReadoutOperator, DtscScoringConfig,
+    DtscConfig, DtscEvidenceConfig, DtscEvidenceInput, DtscEvidenceValues, DtscGeometryState,
+    DtscReadoutConfig, prepare_dtsc_evidence, readout_dtsc,
 };
 use nexus_vcp::{
-    CrossFileWormholeConfig, CrossFileWormholeInput, CrossFileWormholeOperator, EvidencePolicy,
-    FieldConfig, ObservationConfig, RiverFeatures, RiverReadoutConfig, RiverReadoutInput,
-    RiverReadoutOperator, ThinkingConfig, ThinkingInput, ThinkingPlanOperator,
+    FieldConfig, ObservationConfig, PathEvidence, PropagationCompletion, RiverAnalysisConfig,
+    RiverAnalysisInput, RiverScoringConfig, ThinkingConfig, ThinkingInput, plan_thinking,
+    prepare_river_evidence,
 };
 use std::collections::HashSet;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
-pub struct RiverConfig {
-    pub scoring: RiverReadoutConfig,
-    pub wormhole: CrossFileWormholeConfig,
-    pub evidence: EvidencePolicy,
+pub struct RiverQueryConfig {
+    pub observation: ObservationConfig,
+    pub river: RiverConfig,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct RiverQueryConfig {
-    pub observation: ObservationConfig,
+pub struct RiverConfig {
     pub fields: FieldConfig,
-    pub readout: RiverConfig,
+    pub analysis: RiverAnalysisConfig,
+    pub scoring: RiverScoringConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,47 +44,29 @@ pub struct Evaluation<'obs, 'set, 'data> {
     cosines: QueryCosines<'set, 'obs>,
 }
 
-pub struct PreparedRiver<'prepared, 'obs, 'set, 'data> {
-    evaluation: &'prepared Evaluation<'obs, 'set, 'data>,
-    features: RiverFeatures<'prepared>,
+pub struct RiverEvidence {
+    ids: Vec<CandidateIdentity>,
+    path_sources: Vec<Option<u64>>,
+    values: nexus_vcp::RiverEvidence,
 }
 
-pub struct DtscEvidence<'prepared, 'obs, 'set, 'data> {
-    evaluation: &'prepared Evaluation<'obs, 'set, 'data>,
-    _field: &'prepared DtscField<'obs, 'data>,
+pub struct DtscEvidence {
+    ids: Vec<CandidateIdentity>,
+    path_sources: Vec<Option<u64>>,
     values: DtscEvidenceValues,
+    propagation: PropagationCompletion,
 }
 
 impl<'data> Observation<'data> {
     pub fn evaluate<'obs, 'set>(
         &'obs self,
         candidates: &'set CandidateSet<'data>,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<Evaluation<'obs, 'set, 'data>> {
         self.check_candidates(candidates)?;
         let values = self.values();
         let cosines = QueryCosines::prepare(
-            self.context(),
-            candidates.rows(),
-            &values.original_query,
-            &values.fused.enhanced_query,
-        )?;
-        Ok(Evaluation {
-            observation: self,
-            candidates,
-            cosines,
-        })
-    }
-
-    pub fn evaluate_reusing<'obs, 'set>(
-        &'obs self,
-        previous: &Evaluation<'_, 'set, 'data>,
-    ) -> VcpResult<Evaluation<'obs, 'set, 'data>> {
-        let candidates = previous.candidates;
-        self.check_candidates(candidates)?;
-        let values = self.values();
-        let cosines = QueryCosines::reuse_original(
-            self.context(),
-            &previous.cosines,
+            ctx,
             candidates.rows(),
             &values.original_query,
             &values.fused.enhanced_query,
@@ -111,9 +91,26 @@ impl<'data> Observation<'data> {
 }
 
 impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
-    pub fn tag_memo(&self) -> VcpResult<TagMemoReadout> {
+    /// Runs River on the same observation and candidates used by this evaluation.
+    pub fn river(
+        &self,
+        config: &RiverConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<RiverReadout> {
+        let fields = self.observation.fields(&config.fields, ctx)?;
+        self.river_evidence(&fields, &config.analysis, ctx)?
+            .readout(&config.scoring, ctx)
+    }
+
+    /// Runs DTSC on the same observation and candidates used by this evaluation.
+    pub fn dtsc(&self, config: &DtscConfig, ctx: &ExecutionContext<'_>) -> VcpResult<DtscReadout> {
+        let field = self.observation.dtsc_field(&config.field, ctx)?;
+        self.dtsc_evidence(&field, &config.scoring.evidence, ctx)?
+            .readout(&config.scoring.readout, ctx)
+    }
+
+    pub fn tag_memo(&self, ctx: &ExecutionContext<'_>) -> VcpResult<TagMemoReadout> {
         let start = Instant::now();
-        let ctx = self.observation.context();
         ctx.check_cancelled("tag_memo")?;
         let mut items = self
             .candidates
@@ -131,47 +128,52 @@ impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
         ctx.check_cancelled("tag_memo")?;
         Ok(TagMemoReadout {
             items,
-            diagnostics: nexus_core::Diagnostics {
-                elapsed_ms: elapsed_ms(start),
-                ..Default::default()
-            },
+            propagation: self.observation.values().sense.propagation,
+            elapsed_ms: elapsed_ms(start),
         })
     }
 
-    pub fn prepare_river<'prepared>(
-        &'prepared self,
-        fields: &'prepared FieldState<'obs, 'data>,
-    ) -> VcpResult<PreparedRiver<'prepared, 'obs, 'set, 'data>> {
-        if !std::ptr::eq(self.observation, fields.observation) {
+    pub fn river_evidence(
+        &self,
+        fields: &FieldState<'obs, 'data>,
+        config: &RiverAnalysisConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<RiverEvidence> {
+        let observation = self.observation;
+        if !std::ptr::eq(observation, fields.observation) {
             return Err(invalid(
                 "river.prepare",
                 "field state belongs to a different observation",
             ));
         }
-        let features =
-            RiverFeatures::prepare(self.observation.context(), &self.cosines, fields.values())?;
-        Ok(PreparedRiver {
-            evaluation: self,
-            features,
+        let assets = observation.nexus.prepared();
+        let values = prepare_river_evidence(
+            RiverAnalysisInput {
+                observation: observation.values(),
+                fields: fields.values(),
+                query: &self.cosines,
+                graph: observation.graph(),
+                provenance: assets.provenance,
+                support_groups: assets.groups,
+                root_facts: (assets.sources.root_count > 0).then_some(assets.sources),
+                tag_vectors: assets.tags,
+            },
+            config,
+            ctx,
+        )?;
+        Ok(RiverEvidence {
+            ids: self.candidates.identity_snapshot(),
+            path_sources: self.candidates.path_sources().to_vec(),
+            values,
         })
     }
 
-    pub fn river(
+    pub fn dtsc_evidence(
         &self,
-        fields: &FieldState<'obs, 'data>,
-        config: &RiverConfig,
-    ) -> VcpResult<RiverReadout> {
-        let start = Instant::now();
-        let mut result = self.prepare_river(fields)?.readout(config)?;
-        result.diagnostics.elapsed_ms = elapsed_ms(start);
-        Ok(result)
-    }
-
-    pub fn dtsc_evidence<'prepared>(
-        &'prepared self,
-        field: &'prepared DtscField<'obs, 'data>,
+        field: &DtscField<'obs, 'data>,
         config: &DtscEvidenceConfig,
-    ) -> VcpResult<DtscEvidence<'prepared, 'obs, 'set, 'data>> {
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<DtscEvidence> {
         let observation = self.observation;
         if !std::ptr::eq(observation, field.observation) {
             return Err(invalid(
@@ -181,13 +183,11 @@ impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
         }
         let state = observation.values();
         let assets = observation.nexus.prepared();
-        let values = DtscEvidenceOperator.execute(
-            observation.context(),
-            config,
+        let values = prepare_dtsc_evidence(
             DtscEvidenceInput {
                 field: field.values(),
                 query: &self.cosines,
-                graph: assets.graph,
+                graph: observation.graph(),
                 tag_vectors: assets.tags,
                 geometry: DtscGeometryState {
                     epa_spectral_concentration: state.epa.spectral_concentration,
@@ -198,36 +198,26 @@ impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
                     pyramid_depth: state.pyramid.levels.len() as f64,
                 },
             },
+            config,
+            ctx,
         )?;
         Ok(DtscEvidence {
-            evaluation: self,
-            _field: field,
+            ids: self.candidates.identity_snapshot(),
+            path_sources: self.candidates.path_sources().to_vec(),
             values,
+            propagation: state.sense.propagation,
         })
-    }
-
-    pub fn dtsc(
-        &self,
-        field: &DtscField<'obs, 'data>,
-        config: &DtscScoringConfig,
-    ) -> VcpResult<DtscReadout> {
-        let start = Instant::now();
-        let mut result = self
-            .dtsc_evidence(field, &config.evidence)?
-            .readout(&config.readout)?;
-        result.diagnostics.elapsed_ms = elapsed_ms(start);
-        Ok(result)
     }
 
     pub fn thinking(
         &self,
         stages: &[Stage<'_>],
         config: &ThinkingConfig,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<ThinkingPlan> {
         const STAGE: &str = "thinking.plan";
         let start = Instant::now();
         let observation = self.observation;
-        let ctx = observation.context();
         ctx.check_cancelled(STAGE)?;
         let trace = observation.values().sense.complete_trace()?;
         let mut seen = HashSet::new();
@@ -265,77 +255,64 @@ impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
             })
             .collect::<Vec<_>>();
         let assets = observation.nexus.prepared();
-        let result = ThinkingPlanOperator.execute(
-            ctx,
-            config,
+        let result = plan_thinking(
             ThinkingInput {
                 trace,
                 query: &self.cosines,
                 stages: &stages,
-                graph: assets.graph,
+                graph: observation.graph(),
                 provenance: assets.provenance,
                 support_groups: assets.groups,
                 tag_vectors: assets.tags,
             },
+            config,
+            ctx,
         )?;
         let mut plan = self.candidates.thinking_plan(result);
-        plan.diagnostics.elapsed_ms = elapsed_ms(start);
+        plan.elapsed_ms = elapsed_ms(start);
         Ok(plan)
     }
 }
 
-impl PreparedRiver<'_, '_, '_, '_> {
-    pub fn readout(&self, config: &RiverConfig) -> VcpResult<RiverReadout> {
-        let start = Instant::now();
-        let observation = self.evaluation.observation;
-        let assets = observation.nexus.prepared();
-        let ctx = observation.context();
-        let mut result = RiverReadoutOperator.execute(
-            ctx,
-            &config.scoring,
-            RiverReadoutInput {
-                observation: observation.values(),
-                features: &self.features,
-                evidence: config.evidence,
-                graph: assets.graph,
-                provenance: assets.provenance,
-                support_groups: assets.groups,
-                tag_vectors: assets.tags,
-            },
-        )?;
-        if assets.sources.root_count > 0 {
-            result = CrossFileWormholeOperator.execute(
-                ctx,
-                &config.wormhole,
-                CrossFileWormholeInput {
-                    observation: observation.values(),
-                    readout: &result,
-                    features: &self.features,
-                    graph: assets.graph,
-                    root_facts: assets.sources,
-                    tag_vectors: assets.tags,
-                },
-            )?;
-        }
-        let mut result = self.evaluation.candidates.river_readout(result);
-        result.diagnostics.elapsed_ms = elapsed_ms(start);
-        Ok(result)
+impl RiverEvidence {
+    pub fn readout(
+        &self,
+        config: &RiverScoringConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<RiverReadout> {
+        Ok(river_readout(
+            self.values.readout(config, ctx)?,
+            &self.ids,
+            &self.path_sources,
+        ))
+    }
+
+    pub fn candidate_paths(
+        &self,
+        id: u64,
+    ) -> Option<impl Iterator<Item = (Option<PathRef>, &PathEvidence)>> {
+        let index = self.ids.iter().position(|identity| identity.id == id)?;
+        let identity = self.ids[index];
+        Some(
+            self.values.paths()[index]
+                .iter()
+                .map(move |path| (identity.path_ref(path.path, &self.path_sources), path)),
+        )
     }
 }
 
-impl DtscEvidence<'_, '_, '_, '_> {
-    pub fn readout(&self, config: &DtscReadoutConfig) -> VcpResult<DtscReadout> {
-        let start = Instant::now();
-        let result = DtscReadoutOperator.execute(
-            self.evaluation.observation.context(),
-            config,
-            DtscReadoutInput {
-                evidence: &self.values,
-            },
-        )?;
-        let mut result = self.evaluation.candidates.dtsc_readout(result);
-        result.diagnostics.elapsed_ms = elapsed_ms(start);
-        Ok(result)
+impl DtscEvidence {
+    pub fn readout(
+        &self,
+        config: &DtscReadoutConfig,
+        ctx: &ExecutionContext<'_>,
+    ) -> VcpResult<DtscReadout> {
+        Ok(dtsc_readout(
+            readout_dtsc(&self.values, config, ctx)?,
+            &self.ids,
+            &self.path_sources,
+            self.propagation,
+        ))
     }
 }
 
@@ -345,13 +322,11 @@ impl Nexus<'_> {
         query: &Query<'_>,
         candidates: CandidateInput<'data>,
         config: &RiverQueryConfig,
-        ctx: ExecutionContext<'data>,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<RiverReadout> {
         let set = self.candidates(candidates)?;
         let observation = self.observe(query, &config.observation, ctx)?;
-        let evaluation = observation.evaluate(&set)?;
-        let fields = observation.fields(&config.fields)?;
-        evaluation.river(&fields, &config.readout)
+        observation.evaluate(&set, ctx)?.river(&config.river, ctx)
     }
 
     pub fn rank_dtsc<'data>(
@@ -359,13 +334,11 @@ impl Nexus<'_> {
         query: &Query<'_>,
         candidates: CandidateInput<'data>,
         config: &DtscQueryConfig,
-        ctx: ExecutionContext<'data>,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<DtscReadout> {
         let set = self.candidates(candidates)?;
         let observation = self.observe(query, &config.observation, ctx)?;
-        let evaluation = observation.evaluate(&set)?;
-        let field = observation.dtsc_field(&config.dtsc.field)?;
-        evaluation.dtsc(&field, &config.dtsc.scoring)
+        observation.evaluate(&set, ctx)?.dtsc(&config.dtsc, ctx)
     }
 
     pub fn rank_tag_memo<'data>(
@@ -373,11 +346,11 @@ impl Nexus<'_> {
         query: &Query<'_>,
         candidates: CandidateInput<'data>,
         config: &ObservationConfig,
-        ctx: ExecutionContext<'data>,
+        ctx: &ExecutionContext<'_>,
     ) -> VcpResult<TagMemoReadout> {
         let set = self.candidates(candidates)?;
         let observation = self.observe(query, config, ctx)?;
-        observation.evaluate(&set)?.tag_memo()
+        observation.evaluate(&set, ctx)?.tag_memo(ctx)
     }
 }
 

@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::VcpError;
-use crate::id::{CandidateId, DocumentId, GroupId, NodeId, PathId, RootId, SequenceId};
+use crate::id::{CandidateId, GroupId, NodeId, PathId, RootId, SequenceId};
 
 fn check_csr_u32_offsets(
     offsets: &[u32],
@@ -321,7 +321,7 @@ impl<'a> ProvenanceView<'a> {
     }
 }
 
-/// Root fact view for CrossFileWormhole checksum verification and 3rd-tag bridge lookup.
+/// Root facts for cross-file witness and bridge checks.
 #[derive(Clone, Copy, Debug)]
 pub struct RootFactView<'a> {
     pub root_count: usize,
@@ -500,7 +500,6 @@ impl<'a> EpaBasisView<'a> {
 pub struct SequenceSliceView<'a> {
     pub sequence_count: usize,
     pub seq_offsets: &'a [u32],
-    pub seq_documents: &'a [DocumentId],
     pub seq_source_roots: &'a [RootId],
     pub tag_ids: &'a [NodeId],
     pub positions: &'a [u32],
@@ -511,7 +510,6 @@ impl<'a> SequenceSliceView<'a> {
         Self {
             sequence_count: 0,
             seq_offsets: &[0],
-            seq_documents: &[],
             seq_source_roots: &[],
             tag_ids: &[],
             positions: &[],
@@ -519,13 +517,6 @@ impl<'a> SequenceSliceView<'a> {
     }
 
     pub fn validate(&self, node_count: usize, stage: &'static str) -> Result<(), VcpError> {
-        if self.seq_documents.len() != self.sequence_count {
-            return Err(VcpError::DimensionMismatch {
-                stage,
-                expected: self.sequence_count,
-                actual: self.seq_documents.len(),
-            });
-        }
         if self.seq_source_roots.len() != self.sequence_count {
             return Err(VcpError::DimensionMismatch {
                 stage,
@@ -828,7 +819,7 @@ impl<'a> TagLexicalMetaView<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateRowsView<'a> {
     pub candidate_count: usize,
-    pub document_ids: &'a [DocumentId],
+    pub document_ids: &'a [u64],
     pub candidate_vectors: VectorMatrixView<'a, f32>,
     pub candidate_root_offsets: &'a [u32],
     pub candidate_roots: &'a [RootId],
@@ -936,7 +927,7 @@ pub struct ThinkingStageInputView<'a> {
     pub candidates: &'a [CandidateId],
 }
 
-/// Borrowed input view for `ContextAggregateOperator`.
+/// Borrowed input view for `aggregate`.
 #[derive(Clone, Copy, Debug)]
 pub struct ContextFragmentsView<'a> {
     pub count: usize,

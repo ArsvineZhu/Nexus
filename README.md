@@ -1,26 +1,36 @@
 # Nexus
 
-Nexus is an in-memory Rust library for vector geometry, graph propagation and retrieval. Prepare assets once, then use your own recall provider or build the optional indexes. Pass business IDs and receive results with those IDs attached.
+Nexus is an in-memory Rust library for vector geometry, graph propagation and retrieval. Prepare a collection once, then use its built-in indexes or bring your own recall. Results carry the business IDs you supplied for candidates, documents, concepts and sources.
+
+The workspace uses Rust 1.100.0.
 
 ~~~rust
-use nexus::{AssetConfig, CandidateInput, Dataset, ExecutionContext, Nexus, Query, RiverQueryConfig, TagRecall};
+use nexus::{Concept, Dataset, Document, ExecutionContext, Nexus, Query, RecallRequest};
 
-fn retrieve(
-    data: Dataset,
-    vector: &[f32],
-    ids: &[u64],
-    recall: &dyn TagRecall,
-) -> nexus::core::VcpResult<nexus::RiverReadout> {
+fn main() -> nexus::core::VcpResult<()> {
     let ctx = ExecutionContext::default();
-    let nexus = Nexus::prepare(data, &AssetConfig::default(), &ctx)?;
-    let query = Query::new(vector, "query text").with_tag_recall(recall);
-    nexus.rank_river(&query, CandidateInput::Ids(ids), &RiverQueryConfig::default(), ctx)
+    let data = Dataset {
+        concepts: vec![Concept::new(10, "battery", vec![1.0, 0.0])],
+        documents: vec![Document::new(101, vec![1.0, 0.0])],
+        ..Dataset::default()
+    };
+    let nexus = Nexus::prepare(data, &Default::default(), &ctx)?;
+    let indexes = nexus.prepare_recall(&Default::default(), &ctx)?;
+
+    let query = Query::new(&[1.0, 0.0], "battery");
+    let observation = indexes.observe(&query, &Default::default(), &ctx)?;
+    let candidates = observation.recall(&indexes, &RecallRequest::top_k(10), &ctx)?;
+    let ranking = observation.evaluate(&candidates, &ctx)?.river(&Default::default(), &ctx)?;
+    for item in ranking.items {
+        println!("{} {}", item.id, item.scores.score);
+    }
+    Ok(())
 }
 ~~~
 
-For multiple readouts, build one candidate set and evaluate it against an observation. TagMemo, River, DTSC and Thinking share the query similarities. Use individual operators for custom numerical work, and use `Plan` to connect owned results when you need scheduling.
+Use one evaluation for TagMemo, River, DTSC and Thinking. Reuse River or DTSC evidence to vary scoring, or call the independent algorithms with their typed inputs.
 
-- [Host integration](docs/host-integration.md) covers asset import, borrowed candidates, recall and reuse.
+- [Host integration](docs/host-integration.md) covers host-provided recall, multiple lanes, provenance and reusable evidence.
 - [Algorithm map](INDEX.md) links each operation to its implementation and numerical contract.
 - [Live vector retrieval](docs/live-retrieval.md) runs on model-generated embeddings.
 - [Numerical sources](docs/upstream.md) identifies the upstream algorithms and their licenses.

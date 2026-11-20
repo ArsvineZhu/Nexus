@@ -3,8 +3,8 @@
 use super::{DualFields, SenseOutput, finite_vector, invalid};
 use nexus_core::kernel::normalize_f64;
 use nexus_core::{
-    Diagnostics, ExecutionContext, NodeId, Operator, PrecisionMode, TransportGraphView, VcpError,
-    VcpResult, VectorMatrixView,
+    ExecutionContext, NodeId, PrecisionMode, TransportGraphView, VcpError, VcpResult,
+    VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BasinProjectionConfig {
-    pub max_field_projection_nodes: usize,
+    pub max_field_projection_nodes: Option<usize>,
     pub reserved_outer_per_basin: usize,
     pub state_limit: usize,
     pub edge_limit: usize,
@@ -23,7 +23,7 @@ pub struct BasinProjectionConfig {
 impl Default for BasinProjectionConfig {
     fn default() -> Self {
         Self {
-            max_field_projection_nodes: 256,
+            max_field_projection_nodes: Some(256),
             reserved_outer_per_basin: 2,
             state_limit: 8192,
             edge_limit: 65_536,
@@ -51,9 +51,17 @@ pub struct BasinSupports {
     pub basins: Vec<Basin>,
     pub local_support_nodes: Vec<NodeId>,
     pub transfer_support_nodes: Vec<NodeId>,
-    pub local_vector: Vec<f32>,
-    pub transfer_vector: Vec<f32>,
-    pub diagnostics: Diagnostics,
+    pub local_direction: Option<Vec<f32>>,
+    pub transfer_direction: Option<Vec<f32>>,
+    pub limits: ProjectionLimits,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProjectionLimits {
+    pub nodes: bool,
+    pub edges: bool,
+    pub states: bool,
 }
 
 fn seed_basins(
@@ -196,221 +204,214 @@ impl<'a> Lane<'a> {
     }
 }
 
-pub struct BasinProjectionOperator;
-
-impl Operator for BasinProjectionOperator {
-    type Config = BasinProjectionConfig;
-    type Input<'call> = BasinProjectionInput<'call>;
-    type Output = BasinSupports;
-
-    fn name(&self) -> &'static str {
-        "basin.project"
+pub fn project_basins(
+    input: BasinProjectionInput<'_>,
+    config: &BasinProjectionConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<BasinSupports> {
+    let stage = "basin.project";
+    let start = std::time::Instant::now();
+    ctx.check_cancelled(stage)?;
+    let graph = input.graph;
+    input.tag_vectors.validate(stage)?;
+    let fields = [
+        input.dual_fields.local_field.as_slice(),
+        input.dual_fields.transfer_field.as_slice(),
+    ];
+    let domains = [
+        &input.dual_fields.local_domain,
+        &input.dual_fields.transfer_domain,
+    ];
+    if input.tag_vectors.rows != graph.node_count
+        || fields.iter().any(|field| {
+            field.len() != graph.node_count || field.iter().any(|v| !v.is_finite() || *v < 0.0)
+        })
+        || domains
+            .iter()
+            .any(|domain| domain.iter().any(|node| node.index() >= graph.node_count))
+    {
+        return Err(invalid(
+            stage,
+            "fields, domains and tag matrix must match the graph",
+        ));
+    }
+    if config.max_field_projection_nodes == Some(0)
+        || config.state_limit == 0
+        || config.edge_limit == 0
+    {
+        return Err(invalid(stage, "projection budgets must be positive"));
+    }
+    let basins = seed_basins(ctx, graph, input.sense, stage)?;
+    let mut core: Vec<_> = basins
+        .iter()
+        .flat_map(|basin| basin.inner.iter().copied())
+        .collect();
+    core.sort_unstable();
+    let limit = config
+        .max_field_projection_nodes
+        .unwrap_or(graph.node_count);
+    if core.len() > limit {
+        return Err(VcpError::ResourceLimitExceeded {
+            stage,
+            limit_name: "max_field_projection_nodes",
+            actual: core.len(),
+            limit,
+        });
     }
 
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
+    let mut ids = [core.clone(), core.clone()];
+    let mut selected: [HashSet<_>; 2] = std::array::from_fn(|_| core.iter().copied().collect());
+    let mut union = selected[0].clone();
+    let target: [f64; 2] = std::array::from_fn(|field| {
+        domains[field]
+            .iter()
+            .map(|node| fields[field][node.index()])
+            .sum()
+    });
+    let mut mass: [f64; 2] =
+        std::array::from_fn(|field| core.iter().map(|node| fields[field][node.index()]).sum());
+    let total = fields.map(|field| field.iter().sum::<f64>());
+    let cutoffs = fields.map(|field| field.iter().copied().fold(0.0, f64::max) * 1e-12);
+    let mut lanes: Vec<_> = basins
+        .iter()
+        .flat_map(|basin| [Lane::new(0, basin), Lane::new(1, basin)])
+        .collect();
+    let mut discovered = core.len().saturating_mul(2);
+    let mut settled = 0;
+    let mut scanned = 0;
+    let mut cursor = 0;
+    let mut limits = ProjectionLimits::default();
+    let edge_limit = config.edge_limit;
+
+    while (0..2).any(|field| mass[field] < target[field]) {
         ctx.check_cancelled(stage)?;
-        let graph = input.graph;
-        input.tag_vectors.validate(stage)?;
-        let fields = [
-            input.dual_fields.local_field.as_slice(),
-            input.dual_fields.transfer_field.as_slice(),
-        ];
-        let domains = [
-            &input.dual_fields.local_domain,
-            &input.dual_fields.transfer_domain,
-        ];
-        if input.tag_vectors.rows != graph.node_count
-            || fields.iter().any(|field| {
-                field.len() != graph.node_count || field.iter().any(|v| !v.is_finite() || *v < 0.0)
-            })
-            || domains
-                .iter()
-                .any(|domain| domain.iter().any(|node| node.index() >= graph.node_count))
-        {
-            return Err(invalid(
-                stage,
-                "fields, domains and tag matrix must match the graph",
-            ));
-        }
-        let basins = seed_basins(ctx, graph, input.sense, stage)?;
-        let mut core: Vec<_> = basins
-            .iter()
-            .flat_map(|basin| basin.inner.iter().copied())
-            .collect();
-        core.sort_unstable();
-        let limit = if config.max_field_projection_nodes == 0 {
-            graph.node_count
-        } else {
-            config.max_field_projection_nodes
-        };
-        if core.len() > limit {
-            return Err(VcpError::ResourceLimitExceeded {
-                stage,
-                limit_name: "max_field_projection_nodes",
-                actual: core.len(),
-                limit,
+        let active =
+            |lane: &Lane<'_>| mass[lane.field] < target[lane.field] && !lane.frontier.is_empty();
+        let reserved = (0..lanes.len())
+            .map(|offset| (cursor + offset) % lanes.len())
+            .find(|&index| {
+                active(&lanes[index]) && lanes[index].outer < config.reserved_outer_per_basin
             });
-        }
-
-        let mut ids = [core.clone(), core.clone()];
-        let mut selected: [HashSet<_>; 2] = std::array::from_fn(|_| core.iter().copied().collect());
-        let mut union = selected[0].clone();
-        let target: [f64; 2] = std::array::from_fn(|field| {
-            domains[field]
+        let choice = reserved.or_else(|| {
+            lanes
                 .iter()
-                .map(|node| fields[field][node.index()])
-                .sum()
+                .enumerate()
+                .filter(|(_, lane)| active(lane))
+                .max_by(|(ai, a), (bi, b)| {
+                    a.priority(config.reserved_outer_per_basin)
+                        .total_cmp(&b.priority(config.reserved_outer_per_basin))
+                        .then(bi.cmp(ai))
+                })
+                .map(|(index, _)| index)
         });
-        let mut mass: [f64; 2] =
-            std::array::from_fn(|field| core.iter().map(|node| fields[field][node.index()]).sum());
-        let total = fields.map(|field| field.iter().sum::<f64>());
-        let cutoffs = fields.map(|field| field.iter().copied().fold(0.0, f64::max) * 1e-12);
-        let mut lanes: Vec<_> = basins
-            .iter()
-            .flat_map(|basin| [Lane::new(0, basin), Lane::new(1, basin)])
-            .collect();
-        let mut discovered = core.len().saturating_mul(2);
-        let mut settled = 0;
-        let mut scanned = 0;
-        let mut cursor = 0;
-        let mut diagnostics = Diagnostics::default();
-        let edge_limit = config.edge_limit.min(ctx.limits.pair_work_limit);
-
-        while (0..2).any(|field| mass[field] < target[field]) {
+        let Some(index) = choice else { break };
+        if settled >= config.state_limit || scanned >= edge_limit {
+            limits.states |= settled >= config.state_limit;
+            limits.edges |= scanned >= edge_limit;
+            break;
+        }
+        cursor = (index + 1) % lanes.len();
+        let lane = &mut lanes[index];
+        let field = lane.field;
+        let mut outer = 0;
+        let mut gain = 0.0;
+        while outer < if reserved.is_some() { 1 } else { 8 }
+            && settled < config.state_limit
+            && scanned < edge_limit
+        {
             ctx.check_cancelled(stage)?;
-            let active = |lane: &Lane<'_>| {
-                mass[lane.field] < target[lane.field] && !lane.frontier.is_empty()
+            let Some(arrival) = lane.frontier.pop() else {
+                break;
             };
-            let reserved = (0..lanes.len())
-                .map(|offset| (cursor + offset) % lanes.len())
-                .find(|&index| {
-                    active(&lanes[index]) && lanes[index].outer < config.reserved_outer_per_basin
-                });
-            let choice = reserved.or_else(|| {
-                lanes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, lane)| active(lane))
-                    .max_by(|(ai, a), (bi, b)| {
-                        a.priority(config.reserved_outer_per_basin)
-                            .total_cmp(&b.priority(config.reserved_outer_per_basin))
-                            .then(bi.cmp(ai))
-                    })
-                    .map(|(index, _)| index)
-            });
-            let Some(index) = choice else { break };
-            if settled >= config.state_limit || scanned >= edge_limit {
-                diagnostics.mark_truncated("basin projection work limit");
+            if arrival.distance > lane.best[&arrival.node] {
+                continue;
+            }
+            settled += 1;
+            if !union.contains(&arrival.node) && union.len() == limit {
+                limits.nodes = true;
+                continue;
+            }
+            union.insert(arrival.node);
+            if lane.basin.inner.binary_search(&arrival.node).is_err() {
+                outer += 1;
+                lane.outer += 1;
+            }
+            let row = arrival.node.index();
+            if selected[field].insert(arrival.node) {
+                ids[field].push(arrival.node);
+                let amount = fields[field][row];
+                mass[field] += amount;
+                gain += amount / total[field].max(1e-30);
+            }
+            if mass[field] >= target[field] {
                 break;
             }
-            cursor = (index + 1) % lanes.len();
-            let lane = &mut lanes[index];
-            let field = lane.field;
-            let mut outer = 0;
-            let mut gain = 0.0;
-            while outer < if reserved.is_some() { 1 } else { 8 }
-                && settled < config.state_limit
-                && scanned < edge_limit
-            {
-                ctx.check_cancelled(stage)?;
-                let Some(arrival) = lane.frontier.pop() else {
-                    break;
-                };
-                if arrival.distance > lane.best[&arrival.node] {
-                    continue;
-                }
-                settled += 1;
-                if !union.contains(&arrival.node) && union.len() == limit {
-                    diagnostics.mark_truncated("basin projection node limit");
-                    continue;
-                }
-                union.insert(arrival.node);
-                if lane.basin.inner.binary_search(&arrival.node).is_err() {
-                    outer += 1;
-                    lane.outer += 1;
-                }
-                let row = arrival.node.index();
-                if selected[field].insert(arrival.node) {
-                    ids[field].push(arrival.node);
-                    let amount = fields[field][row];
-                    mass[field] += amount;
-                    gain += amount / total[field].max(1e-30);
-                }
-                if mass[field] >= target[field] {
+            for edge in graph.row_offsets[row]..graph.row_offsets[row + 1] {
+                if scanned == edge_limit {
+                    limits.edges = true;
                     break;
                 }
-                for edge in graph.row_offsets[row]..graph.row_offsets[row + 1] {
-                    if scanned == edge_limit {
-                        diagnostics.mark_truncated("basin projection edge limit");
-                        break;
-                    }
-                    scanned += 1;
-                    let weight = graph.effective_weight(edge);
-                    let node = graph.targets[edge];
-                    let value = fields[field][node.index()];
-                    if !(0.0..=1.0).contains(&weight)
-                        || weight == 0.0
-                        || value <= 0.0
-                        || value < cutoffs[field]
-                    {
+                scanned += 1;
+                let weight = graph.effective_weight(edge);
+                let node = graph.targets[edge];
+                let value = fields[field][node.index()];
+                if !(0.0..=1.0).contains(&weight)
+                    || weight == 0.0
+                    || value <= 0.0
+                    || value < cutoffs[field]
+                {
+                    continue;
+                }
+                let distance = arrival.distance - weight.ln();
+                match lane.best.get_mut(&node) {
+                    Some(best) if distance < *best => *best = distance,
+                    Some(_) => continue,
+                    None if discovered >= config.state_limit => {
+                        limits.states = true;
                         continue;
                     }
-                    let distance = arrival.distance - weight.ln();
-                    match lane.best.get_mut(&node) {
-                        Some(best) if distance < *best => *best = distance,
-                        Some(_) => continue,
-                        None if discovered >= config.state_limit => {
-                            diagnostics.mark_truncated("basin projection state limit");
-                            continue;
-                        }
-                        None => {
-                            discovered += 1;
-                            lane.best.insert(node, distance);
-                        }
+                    None => {
+                        discovered += 1;
+                        lane.best.insert(node, distance);
                     }
-                    lane.frontier.push(Arrival { node, distance });
                 }
-            }
-            if outer > 0 {
-                lane.gain = 0.5 * lane.gain + 0.5 * gain / outer as f64;
+                lane.frontier.push(Arrival { node, distance });
             }
         }
-        let project = |field: usize| -> VcpResult<Vec<f32>> {
-            let dim = input.tag_vectors.dim;
-            let mut vector_buffer = vec![0.0; dim];
-            let vector = vector_buffer.as_mut_slice();
-            for &node in &ids[field] {
-                let values = input.tag_vectors.row(node.index()).unwrap();
-                finite_vector(stage, values, dim)?;
-                let hub = if graph.max_inbound > 0.0 && core.binary_search(&node).is_err() {
-                    (graph.inbound[node.index()] / graph.max_inbound).sqrt()
-                } else {
-                    0.0
-                };
-                let weight = fields[field][node.index()] / (1.0 + hub);
-                for (out, &value) in vector.iter_mut().zip(values) {
-                    *out += f64::from(value) * weight;
-                }
-            }
-            normalize_f64(vector, 1e-12, PrecisionMode::FastSimd);
-            Ok(vector.iter().map(|&v| v as f32).collect())
-        };
-        let local_vector = project(0)?;
-        let transfer_vector = project(1)?;
-        let [local_support_nodes, transfer_support_nodes] = ids;
-        Ok(BasinSupports {
-            basins,
-            local_support_nodes,
-            transfer_support_nodes,
-            local_vector,
-            transfer_vector,
-            diagnostics,
-        })
+        if outer > 0 {
+            lane.gain = 0.5 * lane.gain + 0.5 * gain / outer as f64;
+        }
     }
+    let project = |field: usize| -> VcpResult<Option<Vec<f32>>> {
+        let dim = input.tag_vectors.dim;
+        let mut vector_buffer = vec![0.0; dim];
+        let vector = vector_buffer.as_mut_slice();
+        for &node in &ids[field] {
+            let values = input.tag_vectors.row(node.index()).unwrap();
+            finite_vector(stage, values, dim)?;
+            let hub = if graph.max_inbound > 0.0 && core.binary_search(&node).is_err() {
+                (graph.inbound[node.index()] / graph.max_inbound).sqrt()
+            } else {
+                0.0
+            };
+            let weight = fields[field][node.index()] / (1.0 + hub);
+            for (out, &value) in vector.iter_mut().zip(values) {
+                *out += f64::from(value) * weight;
+            }
+        }
+        Ok(normalize_f64(vector, 1e-12, PrecisionMode::FastSimd)
+            .then(|| vector.iter().map(|&v| v as f32).collect()))
+    };
+    let local_direction = project(0)?;
+    let transfer_direction = project(1)?;
+    let [local_support_nodes, transfer_support_nodes] = ids;
+    Ok(BasinSupports {
+        basins,
+        local_support_nodes,
+        transfer_support_nodes,
+        local_direction,
+        transfer_direction,
+        limits,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+    })
 }

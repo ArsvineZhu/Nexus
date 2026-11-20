@@ -4,24 +4,20 @@
 pub mod csr;
 mod epoch;
 pub mod error;
+pub mod execution;
 pub mod id;
 pub mod kernel;
 pub mod nnls;
-pub mod operator;
-pub mod plan;
 mod query_cosines;
 pub mod view;
 
 pub use csr::{CsrGraph, CsrGraphView, CsrParts, CsrStorage, TransportGraph, TransportGraphView};
 pub use epoch::EpochTable;
-pub use error::{Diagnostics, VcpError, VcpResult};
-pub use id::{CandidateId, DocumentId, GroupId, NodeId, PathId, RootId, SequenceId};
+pub use error::{VcpError, VcpResult};
+pub use execution::{CancellationToken, ExecutionContext, ParallelPolicy, PrecisionMode};
+pub use id::{CandidateId, GroupId, NodeId, PathId, RootId, SequenceId};
 pub use nnls::NnlsWorkspace;
 pub use nnls::{CHECK_TOL, DUAL_TOL, NnlsSolution, RANK_TOL};
-pub use operator::{
-    CancellationToken, ExecutionContext, Operator, ParallelPolicy, PrecisionMode, ResourceLimits,
-};
-pub use plan::{Handle, Plan};
 pub use query_cosines::QueryCosines;
 pub use view::{
     CandidateRowsView, ContextFragmentsView, CounterevidenceAdjView, EpaBasisView,

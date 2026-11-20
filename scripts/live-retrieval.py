@@ -46,7 +46,7 @@ QUERIES = [
 ]
 
 
-def gateway(endpoint, model, strings):
+def gateway(endpoint, model, strings, dimensions):
     key = os.environ.get("NEXUS_EMBEDDING_KEY")
     if not key:
         raise SystemExit("Set NEXUS_EMBEDDING_KEY for the requested gateway.")
@@ -55,7 +55,10 @@ def gateway(endpoint, model, strings):
     served_model = None
     for start in range(0, len(strings), 8):
         batch = strings[start:start + 8]
-        body = json.dumps({"model": model, "input": batch}, ensure_ascii=False).encode("utf-8")
+        payload = {"model": model, "input": batch}
+        if dimensions is not None:
+            payload["dimensions"] = dimensions
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             endpoint.rstrip("/") + "/embeddings",
             body,
@@ -79,14 +82,19 @@ def main():
     cli.add_argument("destination", type=Path)
     cli.add_argument("--endpoint", required=True, help="OpenAI-compatible /v1 root")
     cli.add_argument("--model", required=True)
+    cli.add_argument("--dimensions", type=int, help="request a dimension supported by the model")
     args = cli.parse_args()
+    if args.dimensions is not None and args.dimensions < 1:
+        cli.error("--dimensions must be positive")
     passages = TAGS + [document[2] for document in DOCUMENTS]
     queries = [query[0] for query in QUERIES]
-    vectors, model = gateway(args.endpoint, args.model, passages + queries)
+    vectors, model = gateway(args.endpoint, args.model, passages + queries, args.dimensions)
     expected = len(passages) + len(queries)
     if len(vectors) != expected or not vectors or not vectors[0]:
         raise ValueError("embedding provider returned an incomplete matrix")
     dimension = len(vectors[0])
+    if args.dimensions is not None and dimension != args.dimensions:
+        raise ValueError(f"requested {args.dimensions} dimensions, received {dimension}")
     if any(len(row) != dimension or not all(math.isfinite(value) for value in row)
            or not any(row) for row in vectors):
         raise ValueError("embedding provider returned a malformed vector")

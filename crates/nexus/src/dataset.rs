@@ -21,11 +21,34 @@ pub struct Concept {
     pub vector: Vec<f32>,
 }
 
+impl Concept {
+    pub fn new(id: u64, name: impl Into<String>, vector: Vec<f32>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            aliases: Vec::new(),
+            vector,
+        }
+    }
+}
+
+/// A retrievable row. Rows from the same logical document share a document ID.
 pub struct Document {
     pub id: u64,
     pub document_id: Option<u64>,
     pub vector: Vec<f32>,
     pub paths: Vec<Sequence>,
+}
+
+impl Document {
+    pub fn new(id: u64, vector: Vec<f32>) -> Self {
+        Self {
+            id,
+            document_id: None,
+            vector,
+            paths: Vec::new(),
+        }
+    }
 }
 
 pub struct Sequence {
@@ -84,6 +107,8 @@ pub struct Catalog<'a> {
     pub root_offsets: &'a [u32],
     pub roots: &'a [RootId],
     pub path_offsets: &'a [u32],
+    /// Source root for each path, when the catalog records that attribution.
+    pub path_sources: Option<&'a [RootId]>,
     pub tag_offsets: &'a [u32],
     pub tags: &'a [NodeId],
     pub positions: &'a [u32],
@@ -99,6 +124,8 @@ pub struct PreparedDataset<'a> {
     pub lexical: TagLexicalMetaView<'a>,
     pub graph: TransportGraphView<'a>,
     pub basis: Option<EpaBasisView<'a>>,
+    /// Per-concept residuals in vector row order, required by the optional concept index.
+    pub tag_residuals: Option<&'a [IntrinsicResidual]>,
     pub provenance: ProvenanceView<'a>,
     pub groups: SupportGroupView<'a>,
     pub sources: RootFactView<'a>,
@@ -149,6 +176,7 @@ struct OwnedCatalog {
     root_offsets: Vec<u32>,
     roots: Vec<RootId>,
     path_offsets: Vec<u32>,
+    path_sources: Vec<RootId>,
     tag_offsets: Vec<u32>,
     tags: Vec<NodeId>,
     positions: Vec<u32>,
@@ -274,14 +302,12 @@ impl Nexus<'static> {
         let mut doc_roots = Vec::new();
         let mut path_offsets = vec![0];
         let mut tag_offsets = vec![0];
-        let mut seq_docs = Vec::new();
         let mut seq_roots = Vec::new();
         let mut seq_tags = Vec::new();
         let mut positions = Vec::new();
         for doc in data.documents {
             ctx.check_cancelled(STAGE)?;
 
-            let document = DocumentId::from_index(doc_ids.len(), STAGE)?;
             doc_ids.push(doc.id);
             doc_document_ids.push(doc.document_id.unwrap_or(doc.id));
             doc_vectors.extend(normalize_direction(&doc.vector, dim, STAGE)?);
@@ -290,7 +316,6 @@ impl Nexus<'static> {
                 let source = root(path.source)?;
                 roots.insert(source);
                 roots.extend(required[source.index()].iter().copied());
-                seq_docs.push(document);
                 seq_roots.push(source);
                 for (position, tag) in path_steps(&concept_slots, &path)? {
                     seq_tags.push(tag);
@@ -301,12 +326,11 @@ impl Nexus<'static> {
             }
             doc_roots.extend(roots);
             push_offset(&mut root_offsets, doc_roots.len())?;
-            push_offset(&mut path_offsets, seq_docs.len())?;
+            push_offset(&mut path_offsets, seq_roots.len())?;
         }
         let sequences = SequenceSliceView {
-            sequence_count: seq_docs.len(),
+            sequence_count: seq_roots.len(),
             seq_offsets: &tag_offsets,
-            seq_documents: &seq_docs,
             seq_source_roots: &seq_roots,
             tag_ids: &seq_tags,
             positions: &positions,
@@ -374,26 +398,24 @@ impl Nexus<'static> {
             .zip(pos.masses)
             .map(|((&source, &target), &mass)| (source, target, mass))
             .collect();
-        let geometry = LocalConeAgsOperator.execute(
-            ctx,
-            &config.local,
+        let geometry = local_cone(
             LocalConeAgsInput {
                 tag_vectors: tag_view,
                 sequences,
                 explicit_edges: Some(&explicit_edges),
             },
-        )?;
-        let basis = GlobalEpaOperator.execute(
+            &config.local,
             ctx,
-            &config.global,
+        )?;
+        let basis = global_epa(
             GlobalEpaInput {
                 tag_vectors: tag_view,
                 geometry: &geometry,
             },
-        )?;
-        let facts = FactMatrixOperator.execute(
+            &config.global,
             ctx,
-            &config.facts,
+        )?;
+        let facts = build_fact_matrix(
             FactMatrixInput {
                 tag_vectors: tag_view,
                 sequences,
@@ -401,19 +423,18 @@ impl Nexus<'static> {
                 positive_relations: Some(pos),
                 negative_relations: Some(neg),
             },
-        )?;
-        let graph = TransportCalibrateOperator.execute(
+            &config.facts,
             ctx,
-            &config.transport,
+        )?;
+        let graph = calibrate_transport(
             TransportCalibrateInput {
                 fact_matrix: &facts.fact_matrix,
                 anchor_gains: &geometry.anchor_gains,
-                edge_gates: None,
             },
-        )?;
-        let provenance = ProvenanceBuildOperator.execute(
+            &config.transport,
             ctx,
-            &config.provenance,
+        )?;
+        let provenance = build_provenance(
             ProvenanceBuildInput {
                 transport_row_offsets: &graph.graph.row_offsets,
                 transport_targets: &graph.graph.targets,
@@ -421,13 +442,10 @@ impl Nexus<'static> {
                 positive_relations: Some(pos),
                 support_groups: Some(group_view),
             },
+            &config.provenance,
+            ctx,
         )?;
-        let tag_residuals = geometry
-            .intrinsics
-            .into_iter()
-            .zip(&geometry.computed_nodes)
-            .filter_map(|(residual, computed)| computed.then_some(residual))
-            .collect();
+        let tag_residuals = geometry.intrinsics;
         let mut all_tags = Vec::new();
         let mut source_tag_offsets = vec![0];
         let mut source_requirements = Vec::new();
@@ -448,6 +466,7 @@ impl Nexus<'static> {
                 root_offsets,
                 roots: doc_roots,
                 path_offsets,
+                path_sources: seq_roots,
                 tag_offsets,
                 tags: seq_tags,
                 positions,
@@ -508,6 +527,23 @@ impl PositiveRows {
 impl<'a> Nexus<'a> {
     pub fn from_prepared(data: PreparedDataset<'a>) -> VcpResult<Self> {
         validate_unit_matrix(data.tags, STAGE)?;
+        if data.graph.edge_gates.is_some() {
+            return Err(invalid(
+                STAGE,
+                "prepared assets require an ungated transport graph",
+            ));
+        }
+        if let Some(residuals) = data.tag_residuals
+            && (residuals.len() != data.tags.rows
+                || residuals.iter().enumerate().any(|(i, residual)| {
+                    residual.node.index() != i || !(0.0..=1.0).contains(&residual.residual_ratio)
+                }))
+        {
+            return Err(invalid(
+                STAGE,
+                "tag residuals must align with concept rows and lie in [0, 1]",
+            ));
+        }
         data.lexical.validate(STAGE)?;
         data.provenance.validate(data.graph.nnz(), STAGE)?;
         data.groups.validate(STAGE)?;
@@ -569,13 +605,6 @@ impl<'a> Nexus<'a> {
         })
     }
 
-    pub(crate) fn tag_residuals(&self) -> &[IntrinsicResidual] {
-        match &self.assets {
-            Assets::Owned(data) => &data.tag_residuals,
-            Assets::Borrowed(_) => &[],
-        }
-    }
-
     /// Borrows the same assets that are used for queries.
     pub fn prepared(&self) -> PreparedDataset<'_> {
         match &self.assets {
@@ -593,6 +622,7 @@ impl<'a> Nexus<'a> {
                 },
                 graph: data.graph.view(),
                 basis: Some(data.basis.as_view()),
+                tag_residuals: Some(&data.tag_residuals),
                 provenance: data.provenance.as_view(),
                 groups: SupportGroupView {
                     group_count: data.group_kinds.len(),
@@ -617,6 +647,7 @@ impl<'a> Nexus<'a> {
                     root_offsets: &catalog.root_offsets,
                     roots: &catalog.roots,
                     path_offsets: &catalog.path_offsets,
+                    path_sources: Some(&catalog.path_sources),
                     tag_offsets: &catalog.tag_offsets,
                     tags: &catalog.tags,
                     positions: &catalog.positions,
@@ -630,6 +661,7 @@ impl Catalog<'_> {
     fn validate(self, dim: usize, tags: usize, roots: usize) -> VcpResult<()> {
         validate_unit_matrix(self.vectors, STAGE)?;
         let n = self.ids.len();
+        let path_count = self.tag_offsets.len().saturating_sub(1);
         let offsets_match = |offsets: &[u32], rows: usize, len: usize| {
             offsets.len() == rows + 1
                 && offsets.first() == Some(&0)
@@ -643,21 +675,33 @@ impl Catalog<'_> {
             || self.tags.len() != self.positions.len()
             || self.tags.iter().any(|tag| tag.index() >= tags)
             || !offsets_match(self.root_offsets, n, self.roots.len())
-            || !offsets_match(
-                self.path_offsets,
-                n,
-                self.tag_offsets.len().saturating_sub(1),
-            )
-            || !offsets_match(
-                self.tag_offsets,
-                self.tag_offsets.len().saturating_sub(1),
-                self.tags.len(),
-            )
+            || !offsets_match(self.path_offsets, n, path_count)
+            || !offsets_match(self.tag_offsets, path_count, self.tags.len())
         {
             return Err(invalid(
                 STAGE,
                 "prepared document catalog columns do not align",
             ));
+        }
+        if let Some(sources) = self.path_sources {
+            if sources.len() != path_count {
+                return Err(invalid(
+                    STAGE,
+                    "prepared path sources must align with paths",
+                ));
+            }
+            for row in 0..n {
+                let row_roots = &self.roots
+                    [self.root_offsets[row] as usize..self.root_offsets[row + 1] as usize];
+                let row_sources =
+                    &sources[self.path_offsets[row] as usize..self.path_offsets[row + 1] as usize];
+                if row_sources.iter().any(|root| !row_roots.contains(root)) {
+                    return Err(invalid(
+                        STAGE,
+                        "prepared path source must be a root of its candidate",
+                    ));
+                }
+            }
         }
         Ok(())
     }

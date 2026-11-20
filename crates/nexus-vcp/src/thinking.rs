@@ -4,9 +4,9 @@ use crate::observation::invalid;
 use crate::{ObservationTransition, SenseOutput};
 use nexus_core::kernel::cosine_f32;
 use nexus_core::{
-    CandidateId, Diagnostics, ExecutionContext, Operator, PathId, PrecisionMode, ProvenanceView,
-    QueryCosines, SupportGroupView, ThinkingStageInputView, TransportGraphView, VcpError,
-    VcpResult, VectorMatrixView,
+    CandidateId, ExecutionContext, PathId, PrecisionMode, ProvenanceView, QueryCosines,
+    SupportGroupView, ThinkingStageInputView, TransportGraphView, VcpError, VcpResult,
+    VectorMatrixView,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -42,14 +42,17 @@ pub struct CompleteTrace<'a> {
 
 impl SenseOutput {
     pub fn complete_trace(&self) -> VcpResult<CompleteTrace<'_>> {
-        if !self.transitions_recorded || self.transitions_truncated || self.state_truncations > 0 {
+        let crate::Trace::Complete(transitions) = &self.trace else {
+            return Err(VcpError::ThinkingUnavailable {
+                reason: "a complete recorded trace is required",
+            });
+        };
+        if self.propagation != crate::PropagationCompletion::Complete {
             return Err(VcpError::ThinkingUnavailable {
                 reason: "propagation trace unavailable or incomplete",
             });
         }
-        Ok(CompleteTrace {
-            transitions: &self.transitions,
-        })
+        Ok(CompleteTrace { transitions })
     }
 }
 
@@ -92,7 +95,7 @@ pub struct ThinkingStageOutput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThinkingPlan {
     pub stages: Vec<ThinkingStageOutput>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -200,177 +203,160 @@ fn build_module(
     })
 }
 
-pub struct ThinkingPlanOperator;
-
-impl Operator for ThinkingPlanOperator {
-    type Config = ThinkingConfig;
-    type Input<'call> = ThinkingInput<'call>;
-    type Output = ThinkingPlan;
-
-    fn name(&self) -> &'static str {
-        "thinking.plan"
+pub fn plan_thinking(
+    input: ThinkingInput<'_>,
+    config: &ThinkingConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<ThinkingPlan> {
+    let stage = "thinking.plan";
+    ctx.check_cancelled(stage)?;
+    let start = std::time::Instant::now();
+    input.provenance.validate(input.graph.nnz(), stage)?;
+    input.support_groups.validate(stage)?;
+    input.tag_vectors.validate(stage)?;
+    let rows = input.query.rows();
+    if input.graph.node_count != input.tag_vectors.rows
+        || input.tag_vectors.dim != rows.candidate_vectors.dim
+        || ![
+            config.min_closure,
+            config.relevance_weight,
+            config.route_weight,
+            config.novelty_repeat_factor,
+            config.root_no_parent_penalty,
+        ]
+        .into_iter()
+        .all(|v| (0.0..=1.0).contains(&v))
+        || input.stages.is_empty()
+        || input.stages.len() > 32
+        || input.stages.iter().any(|stage| {
+            stage.k > 32 || stage.candidates.len() > 256 || stage.stage_label.trim().is_empty()
+        })
+    {
+        return Err(invalid(stage, "invalid Thinking inputs or configuration"));
     }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        ctx.check_cancelled(stage)?;
-        let start = std::time::Instant::now();
-        input.provenance.validate(input.graph.nnz(), stage)?;
-        input.support_groups.validate(stage)?;
-        input.tag_vectors.validate(stage)?;
-        let rows = input.query.rows();
-        if input.graph.node_count != input.tag_vectors.rows
-            || input.tag_vectors.dim != rows.candidate_vectors.dim
-            || ![
-                config.min_closure,
-                config.relevance_weight,
-                config.route_weight,
-                config.novelty_repeat_factor,
-                config.root_no_parent_penalty,
-            ]
-            .into_iter()
-            .all(|v| (0.0..=1.0).contains(&v))
-            || input.stages.is_empty()
-            || input.stages.len() > 32
-            || input.stages.iter().any(|stage| {
-                stage.k > 32 || stage.candidates.len() > 256 || stage.stage_label.trim().is_empty()
-            })
+    let maximum = input
+        .trace
+        .transitions
+        .iter()
+        .map(|edge| edge.flow)
+        .fold(1e-12, f64::max);
+    let mut edges = HashMap::<_, Vec<_>>::new();
+    for (order, &edge) in input.trace.transitions.iter().enumerate() {
+        if !edge.immediate_return
+            && edge.flow > 0.0
+            && edge.source != edge.target
+            && let Some(index) = input.graph.find_edge(edge.source, edge.target)
+            && input.graph.effective_weight(index) > 0.0
         {
-            return Err(invalid(stage, "invalid Thinking inputs or configuration"));
+            edges
+                .entry(edge.source)
+                .or_default()
+                .push((order, edge, index));
         }
-        let maximum = input
-            .trace
-            .transitions
-            .iter()
-            .map(|edge| edge.flow)
-            .fold(1e-12, f64::max);
-        let mut edges = HashMap::<_, Vec<_>>::new();
-        for (order, &edge) in input.trace.transitions.iter().enumerate() {
-            if !edge.immediate_return
-                && edge.flow > 0.0
-                && edge.source != edge.target
-                && let Some(index) = input.graph.find_edge(edge.source, edge.target)
-                && input.graph.effective_weight(index) > 0.0
+    }
+    let mut chosen = Vec::<ThinkingSelection>::new();
+    let mut used_documents = HashSet::new();
+    let mut used_edges = HashSet::new();
+    let mut stages = Vec::new();
+    let mut modules = HashMap::new();
+    for request in input.stages {
+        let mut candidates = HashSet::new();
+        for &candidate in request.candidates {
+            if candidates.insert(candidate)
+                && let std::collections::hash_map::Entry::Vacant(entry) = modules.entry(candidate)
             {
-                edges
-                    .entry(edge.source)
-                    .or_default()
-                    .push((order, edge, index));
+                entry.insert(build_module(
+                    ctx, input, config, candidate, maximum, &edges,
+                )?);
             }
         }
-        let mut chosen = Vec::<ThinkingSelection>::new();
-        let mut used_documents = HashSet::new();
-        let mut used_edges = HashSet::new();
-        let mut stages = Vec::new();
-        let mut modules = HashMap::new();
-        for request in input.stages {
-            let mut candidates = HashSet::new();
-            for &candidate in request.candidates {
-                if candidates.insert(candidate)
-                    && let std::collections::hash_map::Entry::Vacant(entry) =
-                        modules.entry(candidate)
-                {
-                    entry.insert(build_module(
-                        ctx, input, config, candidate, maximum, &edges,
-                    )?);
-                }
-            }
 
-            let mut results = Vec::new();
-            for _ in 0..request.k {
-                ctx.check_cancelled(stage)?;
-                let mut best = None::<ThinkingSelection>;
-                for &candidate in &candidates {
-                    if used_documents.contains(&rows.document_ids[candidate.index()]) {
+        let mut results = Vec::new();
+        for _ in 0..request.k {
+            ctx.check_cancelled(stage)?;
+            let mut best = None::<ThinkingSelection>;
+            for &candidate in &candidates {
+                if used_documents.contains(&rows.document_ids[candidate.index()]) {
+                    continue;
+                }
+                let module = &modules[&candidate];
+                let mut parents = Vec::new();
+                let mut best_route = None;
+                let mut route_score = 0.0;
+                for route in &module.routes {
+                    let potential_parents = || {
+                        chosen
+                            .iter()
+                            .filter(|prior| {
+                                prior.route.is_some_and(|edge| follows(edge, route.edge))
+                            })
+                            .map(|prior| prior.candidate)
+                    };
+                    let has_parent = potential_parents().next().is_some();
+                    if route.edge.hop != 1 && !has_parent {
                         continue;
                     }
-                    let module = &modules[&candidate];
-                    let mut parents = Vec::new();
-                    let mut best_route = None;
-                    let mut route_score = 0.0;
-                    for route in &module.routes {
-                        let potential_parents = || {
-                            chosen
-                                .iter()
-                                .filter(|prior| {
-                                    prior.route.is_some_and(|edge| follows(edge, route.edge))
-                                })
-                                .map(|prior| prior.candidate)
-                        };
-                        let has_parent = potential_parents().next().is_some();
-                        if route.edge.hop != 1 && !has_parent {
-                            continue;
-                        }
-                        let novelty = if used_edges.contains(&route_key(route.edge)) {
-                            config.novelty_repeat_factor
-                        } else {
-                            1.0
-                        };
-                        let parent_gain = if !has_parent {
-                            config.root_no_parent_penalty
-                        } else {
-                            1.0
-                        };
-                        let score = route.strength * novelty * parent_gain;
-                        if score > route_score {
-                            best_route = Some(*route);
-                            route_score = score;
-                            parents.clear();
-                            parents.extend(potential_parents());
-                        }
-                    }
-                    let relation = match best_route {
-                        Some(route) if route.edge.wormhole => ThinkingRelation::Analogy,
-                        Some(_) if !parents.is_empty() => ThinkingRelation::Continuation,
-                        Some(_) => ThinkingRelation::Root,
-                        None => ThinkingRelation::Supplement,
+                    let novelty = if used_edges.contains(&route_key(route.edge)) {
+                        config.novelty_repeat_factor
+                    } else {
+                        1.0
                     };
-                    let offer = ThinkingSelection {
-                        candidate: module.candidate,
-                        chosen_path: best_route.map(|route| route.path),
-                        score: config.relevance_weight * module.relevance
-                            + config.route_weight * route_score,
-                        parents,
-                        relation,
-                        route: best_route.map(|route| route.edge),
+                    let parent_gain = if !has_parent {
+                        config.root_no_parent_penalty
+                    } else {
+                        1.0
                     };
-                    if best.as_ref().is_none_or(|prior| {
-                        offer
-                            .route
-                            .is_some()
-                            .cmp(&prior.route.is_some())
-                            .then(offer.score.total_cmp(&prior.score))
-                            .then(prior.candidate.cmp(&offer.candidate))
-                            .is_gt()
-                    }) {
-                        best = Some(offer);
+                    let score = route.strength * novelty * parent_gain;
+                    if score > route_score {
+                        best_route = Some(*route);
+                        route_score = score;
+                        parents.clear();
+                        parents.extend(potential_parents());
                     }
                 }
-                let Some(choice) = best else { break };
-                used_documents.insert(rows.document_ids[choice.candidate.index()]);
-                if let Some(edge) = choice.route {
-                    used_edges.insert(route_key(edge));
+                let relation = match best_route {
+                    Some(route) if route.edge.wormhole => ThinkingRelation::Analogy,
+                    Some(_) if !parents.is_empty() => ThinkingRelation::Continuation,
+                    Some(_) => ThinkingRelation::Root,
+                    None => ThinkingRelation::Supplement,
+                };
+                let offer = ThinkingSelection {
+                    candidate: module.candidate,
+                    chosen_path: best_route.map(|route| route.path),
+                    score: config.relevance_weight * module.relevance
+                        + config.route_weight * route_score,
+                    parents,
+                    relation,
+                    route: best_route.map(|route| route.edge),
+                };
+                if best.as_ref().is_none_or(|prior| {
+                    offer
+                        .route
+                        .is_some()
+                        .cmp(&prior.route.is_some())
+                        .then(offer.score.total_cmp(&prior.score))
+                        .then(prior.candidate.cmp(&offer.candidate))
+                        .is_gt()
+                }) {
+                    best = Some(offer);
                 }
-                chosen.push(choice.clone());
-                results.push(choice);
             }
-            stages.push(ThinkingStageOutput {
-                stage_label: request.stage_label.into(),
-                k: request.k,
-                results,
-            });
+            let Some(choice) = best else { break };
+            used_documents.insert(rows.document_ids[choice.candidate.index()]);
+            if let Some(edge) = choice.route {
+                used_edges.insert(route_key(edge));
+            }
+            chosen.push(choice.clone());
+            results.push(choice);
         }
-        Ok(ThinkingPlan {
-            stages,
-            diagnostics: Diagnostics {
-                elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
-                ..Diagnostics::default()
-            },
-        })
+        stages.push(ThinkingStageOutput {
+            stage_label: request.stage_label.into(),
+            k: request.k,
+            results,
+        });
     }
+    Ok(ThinkingPlan {
+        stages,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1_000.0,
+    })
 }

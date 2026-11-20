@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 publish = false
-description = "Apache-2.0 core views, dense IDs, SIMD/scalar kernels, QR-NNLS, and Operator trait for Nexus"
+description = "Apache-2.0 core views, dense IDs, SIMD/scalar kernels, QR-NNLS, and execution controls for Nexus"
 
 [features]
 default = []

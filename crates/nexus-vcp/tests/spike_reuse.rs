@@ -12,9 +12,12 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
     let config = SenseConfig {
         max_safe_hops: 2,
         max_neighbors_per_node: 1,
-        max_transition_records: 1,
+        max_transition_records: Some(1),
         minimum_injected_current: 0.001,
-        dynamic_wormhole_slots: 1,
+        dynamic_wormholes: Some(DynamicWormholeConfig {
+            slots: 1,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let graph = TransportGraphView::new(
@@ -52,10 +55,11 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         residuals: Some(&residuals),
     };
     let ctx = ExecutionContext::default();
-    let mut expected = SpikeSenseOperator.execute(&ctx, &config, input).unwrap();
-    assert!(expected.diagnostics.elapsed_ms > 0.0);
-    expected.diagnostics.elapsed_ms = 0.0;
-    assert!(expected.transitions_truncated);
+    let mut expected = sense(input, &config, &ctx).unwrap();
+    assert!(expected.elapsed_ms > 0.0);
+    expected.elapsed_ms = 0.0;
+    assert!(matches!(expected.trace, Trace::Limited(_)));
+    assert_eq!(expected.propagation, PropagationCompletion::Complete);
     assert!(
         expected
             .edges
@@ -66,21 +70,17 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
 
     let mut work = SenseWorkspace::default();
     let mut output = SenseOutput::default();
-    SpikeSenseOperator
-        .execute_into(&ctx, &config, input, &mut work, &mut output)
-        .unwrap();
+    sense_into(input, &config, &ctx, &mut work, &mut output).unwrap();
     let profile = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get();
     for _ in 0..32 {
-        SpikeSenseOperator
-            .execute_into(&ctx, &config, input, &mut work, &mut output)
-            .unwrap();
+        sense_into(input, &config, &ctx, &mut work, &mut output).unwrap();
     }
     let after = dhat::HeapStats::get();
     drop(profile);
     assert_eq!(before.total_blocks, after.total_blocks);
-    assert!(output.diagnostics.elapsed_ms > 0.0);
-    output.diagnostics.elapsed_ms = 0.0;
+    assert!(output.elapsed_ms > 0.0);
+    output.elapsed_ms = 0.0;
     assert_eq!(output, expected);
 
     let count = AtomicUsize::new(0);
@@ -89,14 +89,12 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         cancel: CancellationToken::from_fn(&cancel),
         ..ctx
     };
-    let result = SpikeSenseOperator.execute_into(&stop, &config, input, &mut work, &mut output);
+    let result = sense_into(input, &config, &stop, &mut work, &mut output);
     assert!(matches!(result, Err(VcpError::Cancelled { .. })));
     assert_eq!(output, SenseOutput::default());
-    SpikeSenseOperator
-        .execute_into(&ctx, &config, input, &mut work, &mut output)
-        .unwrap();
-    assert!(output.diagnostics.elapsed_ms > 0.0);
-    output.diagnostics.elapsed_ms = 0.0;
+    sense_into(input, &config, &ctx, &mut work, &mut output).unwrap();
+    assert!(output.elapsed_ms > 0.0);
+    output.elapsed_ms = 0.0;
     assert_eq!(output, expected);
 
     let gates = [1.0, 0.0, 1.0];
@@ -104,9 +102,7 @@ fn warmed_propagation_reuses_allocation_and_recovers_from_cancel() {
         graph: graph.with_edge_gates(&gates).unwrap(),
         ..input
     };
-    SpikeSenseOperator
-        .execute_into(&ctx, &config, input, &mut work, &mut output)
-        .unwrap();
+    sense_into(input, &config, &ctx, &mut work, &mut output).unwrap();
     assert!(output.edges.iter().any(|edge| edge.target == NodeId(1)));
     assert!(output.edges.iter().all(|edge| edge.target != NodeId(2)));
 }

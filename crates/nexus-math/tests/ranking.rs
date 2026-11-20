@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nexus_math::nexus_core::{ExecutionContext, Operator, VcpError};
-use nexus_math::{RrfConfig, RrfInput, RrfOperator, WeightedRanking};
+use nexus_math::nexus_core::{ExecutionContext, VcpError};
+use nexus_math::{RrfConfig, WeightedRanking, rrf};
 
 #[test]
 fn rrf_sums_reciprocal_ranks_over_the_id_union() {
@@ -23,15 +23,12 @@ fn rrf_sums_reciprocal_ranks_over_the_id_union() {
             weight: 0.5,
         },
     ];
-    let result = RrfOperator
-        .execute(
-            &ExecutionContext::default(),
-            &RrfConfig::default(),
-            RrfInput {
-                rankings: &rankings,
-            },
-        )
-        .unwrap();
+    let result = rrf(
+        &rankings,
+        &RrfConfig::default(),
+        &ExecutionContext::default(),
+    )
+    .unwrap();
     let first = 1.0 / 61.0;
     let second = 1.0 / 62.0;
     let expected = [
@@ -52,7 +49,7 @@ fn rrf_sums_reciprocal_ranks_over_the_id_union() {
 fn rrf_distinguishes_empty_input_from_invalid_rankings() {
     let ctx = ExecutionContext::default();
     let config = RrfConfig::default();
-    let empty = RrfOperator.execute(&ctx, &config, RrfInput { rankings: &[] });
+    let empty = rrf(&[], &config, &ctx);
     assert!(empty.unwrap().items.is_empty());
 
     for rankings in [
@@ -74,13 +71,7 @@ fn rrf_distinguishes_empty_input_from_invalid_rankings() {
         }],
     ] {
         assert!(matches!(
-            RrfOperator.execute(
-                &ctx,
-                &config,
-                RrfInput {
-                    rankings: &rankings
-                }
-            ),
+            rrf(&rankings, &config, &ctx),
             Err(VcpError::InvalidInput { .. })
         ));
     }
@@ -89,13 +80,7 @@ fn rrf_distinguishes_empty_input_from_invalid_rankings() {
         weight: 1.0,
     }];
     assert!(matches!(
-        RrfOperator.execute(
-            &ctx,
-            &RrfConfig { k: 0.0 },
-            RrfInput {
-                rankings: &rankings
-            }
-        ),
+        rrf(&rankings, &RrfConfig { k: 0.0 }, &ctx),
         Err(VcpError::InvalidInput { .. })
     ));
 }
@@ -112,15 +97,12 @@ fn rrf_keeps_first_appearance_on_equal_positive_scores() {
             weight: 1.0,
         },
     ];
-    let result = RrfOperator
-        .execute(
-            &ExecutionContext::default(),
-            &RrfConfig::default(),
-            RrfInput {
-                rankings: &rankings,
-            },
-        )
-        .unwrap();
+    let result = rrf(
+        &rankings,
+        &RrfConfig::default(),
+        &ExecutionContext::default(),
+    )
+    .unwrap();
     assert_eq!(result.items[0].score, result.items[1].score);
     assert_eq!(
         result.items.iter().map(|item| item.id).collect::<Vec<_>>(),

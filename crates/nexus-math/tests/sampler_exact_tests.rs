@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nexus_math::nexus_core::{ExecutionContext, NodeId, Operator, VectorMatrixView};
+use nexus_math::nexus_core::{ExecutionContext, NodeId, VectorMatrixView};
 use nexus_math::{
-    DtscFieldBuildInput, DtscFieldBuildOperator, DtscFieldConfig, DtscFieldSampleInput,
-    DtscFieldSampleOperator, DtscFieldSampler, DtscFieldValues, DtscNodeInput, DtscSample,
-    DtscSourceType, dtsc_cosine,
+    DtscFieldBuildInput, DtscFieldConfig, DtscFieldSampleInput, DtscFieldSampler, DtscFieldValues,
+    DtscNodeInput, DtscSample, DtscSourceType, build_dtsc_field, dtsc_cosine, sample_dtsc_field,
 };
 
 fn unit(v: f64) -> f64 {
@@ -176,8 +175,8 @@ fn sampler_matches_reference_bits_and_order() {
     let nodes: Vec<_> = (0..field_rows.len())
         .map(|i| DtscNodeInput {
             node: NodeId(i as u32),
-            energy: (i + 1) as f64,
-            normalized_energy: 0.0,
+            mass: (i + 1) as f64,
+
             source_type: [
                 DtscSourceType::Core,
                 DtscSourceType::Seed,
@@ -203,16 +202,15 @@ fn sampler_matches_reference_bits_and_order() {
                     max_field_neighbors: neighbors,
                     ..Default::default()
                 };
-                let field = DtscFieldBuildOperator
-                    .execute(
-                        &ctx,
-                        &config,
-                        DtscFieldBuildInput {
-                            nodes: &nodes,
-                            tag_vectors: tags,
-                        },
-                    )
-                    .unwrap();
+                let field = build_dtsc_field(
+                    DtscFieldBuildInput {
+                        nodes: &nodes,
+                        tag_vectors: tags,
+                    },
+                    &config,
+                    &ctx,
+                )
+                .unwrap();
                 let sampler = DtscFieldSampler::new(&field, inbound);
                 for (i, vector) in vectors.iter().enumerate() {
                     let node = NodeId((i % 17) as u32);
@@ -233,7 +231,7 @@ fn sampler_matches_reference_bits_and_order() {
 }
 
 #[test]
-fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
+fn field_build_rejects_duplicate_ids_and_samples_unique_nodes_bit_exactly() {
     let vectors = vectors();
     let dim = 128;
     let dim128_vecs: Vec<&Vec<f32>> = vectors.iter().filter(|v| v.len() == dim).collect();
@@ -245,79 +243,105 @@ fn field_build_retains_node_zero_and_sample_operator_matches_bits() {
     }
     let tag_matrix = VectorMatrixView::new(&flat_tags, dim128_vecs.len(), dim).unwrap();
 
-    // Include NodeId(0) and duplicate NodeId(3) with different provenance.
-    let nodes = vec![
+    let mut nodes = vec![
         DtscNodeInput {
             node: NodeId(0),
-            energy: 1.0,
-            normalized_energy: 0.0,
+            mass: 1.0,
+
             source_type: DtscSourceType::Seed,
         },
         DtscNodeInput {
             node: NodeId(3),
-            energy: 0.4,
-            normalized_energy: 0.0,
+            mass: 0.4,
+
             source_type: DtscSourceType::Core,
         },
         DtscNodeInput {
             node: NodeId(3),
-            energy: 0.9,
-            normalized_energy: 0.0,
+            mass: 0.9,
+
             source_type: DtscSourceType::Emergent,
         },
         DtscNodeInput {
             node: NodeId(1),
-            energy: 0.8,
-            normalized_energy: 0.0,
+            mass: 0.8,
+
             source_type: DtscSourceType::Core,
         },
         DtscNodeInput {
             node: NodeId(2),
-            energy: 0.6,
-            normalized_energy: 0.0,
+            mass: 0.6,
+
             source_type: DtscSourceType::Seed,
         },
     ];
 
     let ctx = ExecutionContext::default();
 
-    let cfg = DtscFieldConfig::default();
+    let cfg = DtscFieldConfig {
+        field_energy_mass_ratio: 0.70,
+        ..Default::default()
+    };
 
-    let field = DtscFieldBuildOperator
-        .execute(
-            &ctx,
-            &cfg,
+    let build = |nodes| {
+        build_dtsc_field(
             DtscFieldBuildInput {
-                nodes: &nodes,
+                nodes,
                 tag_vectors: tag_matrix,
             },
+            &cfg,
+            &ctx,
         )
-        .unwrap();
+    };
+    assert!(matches!(
+        build(&nodes),
+        Err(nexus_core::VcpError::InvalidInput { .. })
+    ));
+    nodes[2].node = NodeId(4);
+    let tiny: Vec<_> = nodes
+        .iter()
+        .cloned()
+        .map(|mut node| {
+            node.mass *= 1e-30;
+            node
+        })
+        .collect();
+    let field = build_dtsc_field(
+        DtscFieldBuildInput {
+            nodes: &nodes,
+            tag_vectors: tag_matrix,
+        },
+        &cfg,
+        &ctx,
+    )
+    .unwrap();
 
     assert!(field.exact_field().iter().any(|s| s.node == NodeId(0)));
     assert!(field.field_nodes().iter().any(|n| n.node == NodeId(0)));
-    // First-duplicate-wins preserved in exact_field order.
-    let first_3 = field
-        .exact_field()
-        .iter()
-        .find(|s| s.node == NodeId(3))
-        .unwrap();
-    assert_eq!(first_3.source_type, DtscSourceType::Core);
+    let scaled = build_dtsc_field(
+        DtscFieldBuildInput {
+            nodes: &tiny,
+            tag_vectors: tag_matrix,
+        },
+        &cfg,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(scaled.retained_node_count(), field.retained_node_count());
+    assert!((scaled.field_entropy() - field.field_entropy()).abs() < 1e-14);
 
     let query_ids: Vec<NodeId> = (0..dim128_vecs.len()).map(|i| NodeId(i as u32)).collect();
     let inbound = vec![0.2, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
-    let samples = DtscFieldSampleOperator
-        .execute(
-            &ctx,
-            &(),
-            DtscFieldSampleInput {
-                field: &field,
-                query_ids: &query_ids,
-                query_vectors: tag_matrix,
-                inbound: &inbound,
-            },
-        )
-        .unwrap();
+    let samples = sample_dtsc_field(
+        DtscFieldSampleInput {
+            field: &field,
+            query_ids: &query_ids,
+            query_vectors: tag_matrix,
+            inbound: &inbound,
+        },
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(samples.len(), query_ids.len());
     let sampler = DtscFieldSampler::new(&field, &inbound);

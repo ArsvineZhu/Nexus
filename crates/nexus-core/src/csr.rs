@@ -358,6 +358,18 @@ impl<'a> TransportGraphView<'a> {
         Self::new(self.0.with_edge_gates(gates)?)
     }
 
+    /// Materializes request weights once while retaining the original edge slots.
+    pub fn attenuate(self, gates: &[f64]) -> crate::VcpResult<EffectiveTransport<'a>> {
+        let gated = self.0.with_edge_gates(gates)?;
+        let weights = (0..gated.nnz())
+            .map(|edge| self.effective_weight(edge) * gates[edge])
+            .collect();
+        Ok(EffectiveTransport {
+            base: self,
+            weights,
+        })
+    }
+
     pub fn as_csr(self) -> CsrGraphView<'a> {
         self.0
     }
@@ -367,6 +379,21 @@ impl<'a> std::ops::Deref for TransportGraphView<'a> {
     type Target = CsrGraphView<'a>;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// A request's effective weights and borrowed static transport columns.
+pub struct EffectiveTransport<'a> {
+    base: TransportGraphView<'a>,
+    weights: Vec<f64>,
+}
+
+impl EffectiveTransport<'_> {
+    pub fn view(&self) -> TransportGraphView<'_> {
+        let mut parts = *self.base.as_csr();
+        parts.weights = &self.weights;
+        parts.edge_gates = None;
+        TransportGraphView(CsrGraphView(parts))
     }
 }
 

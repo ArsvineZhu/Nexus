@@ -7,7 +7,6 @@ use nexus_core::{VcpError, VcpResult};
 #[serde(default, deny_unknown_fields)]
 pub struct DtscFieldConfig {
     pub min_field_tags: usize,
-    pub min_field_entropy: f64,
     pub field_energy_mass_ratio: f64,
     pub max_field_nodes: usize,
     pub field_similarity_threshold: f64,
@@ -20,7 +19,6 @@ impl Default for DtscFieldConfig {
     fn default() -> Self {
         Self {
             min_field_tags: 3,
-            min_field_entropy: 0.12,
             field_energy_mass_ratio: 0.95,
             max_field_nodes: 48,
             field_similarity_threshold: 0.5,
@@ -126,6 +124,7 @@ impl Default for DtscRewardConfig {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DtscTrustConfig {
+    pub min_field_entropy: f64,
     pub min_candidate_coverage: f64,
     pub min_geo_score: f64,
     pub min_geo_spread: f64,
@@ -135,6 +134,7 @@ pub struct DtscTrustConfig {
 impl Default for DtscTrustConfig {
     fn default() -> Self {
         Self {
+            min_field_entropy: 0.12,
             min_candidate_coverage: 0.2,
             min_geo_score: 0.01,
             min_geo_spread: 0.03,
@@ -226,12 +226,27 @@ pub struct DtscEvidenceConfig {
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DtscFallbackOrder {
+    #[default]
+    OriginalCosine,
+    /// The caller already ordered the candidate pool by its baseline rank.
+    InputOrder,
+}
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DtscReadoutConfig {
     pub trust: DtscTrustConfig,
     pub top_k: usize,
     pub fallback_on_low_trust: bool,
+    /// Baseline ordering when geometric evidence is insufficient.
+    pub fallback_order: DtscFallbackOrder,
+    /// Fraction of the prepared geometric reward applied to the original cosine.
+    /// Set to 1.0 to use the full reward or 0.0 to rank by cosine.
+    pub geometry_weight: f64,
 }
 
 impl Default for DtscReadoutConfig {
@@ -240,6 +255,8 @@ impl Default for DtscReadoutConfig {
             trust: DtscTrustConfig::default(),
             top_k: 0,
             fallback_on_low_trust: true,
+            fallback_order: DtscFallbackOrder::default(),
+            geometry_weight: 0.15,
         }
     }
 }
@@ -275,7 +292,6 @@ impl DtscFieldConfig {
             "max_field_neighbors",
             "be positive",
         )?;
-        range("min_field_entropy", self.min_field_entropy, 0.0, 1.0)?;
         range(
             "field_energy_mass_ratio",
             self.field_energy_mass_ratio,
@@ -427,7 +443,9 @@ impl DtscEvidenceConfig {
 
 impl DtscReadoutConfig {
     pub fn validate(&self) -> VcpResult<()> {
+        range("geometry_weight", self.geometry_weight, 0.0, 1.0)?;
         let trust = &self.trust;
+        range("trust.min_field_entropy", trust.min_field_entropy, 0.0, 1.0)?;
         range(
             "trust.min_candidate_coverage",
             trust.min_candidate_coverage,

@@ -2,7 +2,7 @@
 
 use super::{invalid, numeric_failure};
 use nexus_core::kernel::{csr_spmv_dual, relax_field};
-use nexus_core::{ExecutionContext, NodeId, Operator, TransportGraphView, VcpResult};
+use nexus_core::{ExecutionContext, NodeId, TransportGraphView, VcpResult};
 use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -73,123 +73,110 @@ fn domain(field: &[f64], ratio: f64, stage: &'static str) -> VcpResult<Vec<NodeI
     Ok(result)
 }
 
-pub struct DualFieldSolveOperator;
-
-impl Operator for DualFieldSolveOperator {
-    type Config = DualFieldConfig;
-    type Input<'call> = DualFieldSolveInput<'call>;
-    type Output = DualFields;
-
-    fn name(&self) -> &'static str {
-        "field.dual_solve"
-    }
-
-    fn execute(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        config: &Self::Config,
-        input: Self::Input<'_>,
-    ) -> VcpResult<Self::Output> {
-        let stage = self.name();
-        ctx.check_cancelled(stage)?;
-        if ![config.local_alpha, config.transfer_alpha]
+pub fn solve_dual_fields(
+    input: DualFieldSolveInput<'_>,
+    config: &DualFieldConfig,
+    ctx: &ExecutionContext<'_>,
+) -> VcpResult<DualFields> {
+    let stage = "field.dual_solve";
+    ctx.check_cancelled(stage)?;
+    if ![config.local_alpha, config.transfer_alpha]
+        .into_iter()
+        .all(|v| (0.0..1.0).contains(&v))
+        || ![config.local_mass_ratio, config.transfer_mass_ratio]
             .into_iter()
-            .all(|v| (0.0..1.0).contains(&v))
-            || ![config.local_mass_ratio, config.transfer_mass_ratio]
-                .into_iter()
-                .all(|v| (0.0..=1.0).contains(&v))
-            || ![config.local_tolerance, config.transfer_tolerance]
-                .into_iter()
-                .all(|v| v.is_finite() && v > 0.0)
-            || config.max_iterations == 0
-        {
-            return Err(invalid(stage, "invalid dual-field solve configuration"));
-        }
-
-        let n = input.graph.node_count;
-        let mut source_buffer = vec![0.0; n];
-        let source = source_buffer.as_mut_slice();
-        for &(node, mass) in input.source_field {
-            if node.index() >= n || !mass.is_finite() || mass < 0.0 {
-                return Err(invalid(stage, "source field node or mass is invalid"));
-            }
-            source[node.index()] += mass;
-        }
-        let sum = source.iter().sum::<f64>();
-        if !sum.is_finite() {
-            return Err(numeric_failure(stage, "source mass overflowed"));
-        }
-        if sum == 0.0 {
-            return Ok(DualFields {
-                local_field: vec![0.0; n],
-                transfer_field: vec![0.0; n],
-                local_converged: true,
-                transfer_converged: true,
-                ..DualFields::default()
-            });
-        }
-
-        for value in source.iter_mut() {
-            *value /= sum;
-        }
-        let mut local = source.to_vec();
-        let mut transfer = source.to_vec();
-        let mut next_local_buffer = vec![0.0; n];
-        let next_local = next_local_buffer.as_mut_slice();
-        let mut next_transfer_buffer = vec![0.0; n];
-        let next_transfer = next_transfer_buffer.as_mut_slice();
-        let mut propagated_local_buffer = vec![0.0; n];
-        let propagated_local = propagated_local_buffer.as_mut_slice();
-        let mut propagated_transfer_buffer = vec![0.0; n];
-        let propagated_transfer = propagated_transfer_buffer.as_mut_slice();
-        let mut report = DualFields::default();
-        // Also evaluate the residual of the final returned iterate when the work limit is hit.
-        for iteration in 0..=config.max_iterations {
-            ctx.check_cancelled(stage)?;
-            csr_spmv_dual(
-                &input.graph.as_csr(),
-                &local,
-                &transfer,
-                propagated_local,
-                propagated_transfer,
-                ctx.parallel,
-            )?;
-            report.iterations = iteration;
-            report.local_residual = relax_field(
-                source,
-                propagated_local,
-                config.local_alpha,
-                &local,
-                next_local,
-            );
-            report.transfer_residual = relax_field(
-                source,
-                propagated_transfer,
-                config.transfer_alpha,
-                &transfer,
-                next_transfer,
-            );
-            if !report.local_residual.is_finite() || !report.transfer_residual.is_finite() {
-                return Err(numeric_failure(stage, "dual-field iteration diverged"));
-            }
-            report.local_converged = report.local_residual < config.local_tolerance;
-            report.transfer_converged = report.transfer_residual < config.transfer_tolerance;
-            if (report.local_converged && report.transfer_converged)
-                || iteration == config.max_iterations
-            {
-                break;
-            }
-            if !report.local_converged {
-                local.copy_from_slice(next_local);
-            }
-            if !report.transfer_converged {
-                transfer.copy_from_slice(next_transfer);
-            }
-        }
-        report.local_domain = domain(&local, config.local_mass_ratio, stage)?;
-        report.transfer_domain = domain(&transfer, config.transfer_mass_ratio, stage)?;
-        report.local_field = local;
-        report.transfer_field = transfer;
-        Ok(report)
+            .all(|v| (0.0..=1.0).contains(&v))
+        || ![config.local_tolerance, config.transfer_tolerance]
+            .into_iter()
+            .all(|v| v.is_finite() && v > 0.0)
+        || config.max_iterations == 0
+    {
+        return Err(invalid(stage, "invalid dual-field solve configuration"));
     }
+
+    let n = input.graph.node_count;
+    let mut source_buffer = vec![0.0; n];
+    let source = source_buffer.as_mut_slice();
+    for &(node, mass) in input.source_field {
+        if node.index() >= n || !mass.is_finite() || mass < 0.0 {
+            return Err(invalid(stage, "source field node or mass is invalid"));
+        }
+        source[node.index()] += mass;
+    }
+    let sum = source.iter().sum::<f64>();
+    if !sum.is_finite() {
+        return Err(numeric_failure(stage, "source mass overflowed"));
+    }
+    if sum == 0.0 {
+        return Ok(DualFields {
+            local_field: vec![0.0; n],
+            transfer_field: vec![0.0; n],
+            local_converged: true,
+            transfer_converged: true,
+            ..DualFields::default()
+        });
+    }
+
+    for value in source.iter_mut() {
+        *value /= sum;
+    }
+    let mut local = source.to_vec();
+    let mut transfer = source.to_vec();
+    let mut next_local_buffer = vec![0.0; n];
+    let next_local = next_local_buffer.as_mut_slice();
+    let mut next_transfer_buffer = vec![0.0; n];
+    let next_transfer = next_transfer_buffer.as_mut_slice();
+    let mut propagated_local_buffer = vec![0.0; n];
+    let propagated_local = propagated_local_buffer.as_mut_slice();
+    let mut propagated_transfer_buffer = vec![0.0; n];
+    let propagated_transfer = propagated_transfer_buffer.as_mut_slice();
+    let mut report = DualFields::default();
+    // Also evaluate the residual of the final returned iterate when the work limit is hit.
+    for iteration in 0..=config.max_iterations {
+        ctx.check_cancelled(stage)?;
+        csr_spmv_dual(
+            &input.graph.as_csr(),
+            &local,
+            &transfer,
+            propagated_local,
+            propagated_transfer,
+            ctx.parallel,
+        )?;
+        report.iterations = iteration;
+        report.local_residual = relax_field(
+            source,
+            propagated_local,
+            config.local_alpha,
+            &local,
+            next_local,
+        );
+        report.transfer_residual = relax_field(
+            source,
+            propagated_transfer,
+            config.transfer_alpha,
+            &transfer,
+            next_transfer,
+        );
+        if !report.local_residual.is_finite() || !report.transfer_residual.is_finite() {
+            return Err(numeric_failure(stage, "dual-field iteration diverged"));
+        }
+        report.local_converged = report.local_residual < config.local_tolerance;
+        report.transfer_converged = report.transfer_residual < config.transfer_tolerance;
+        if (report.local_converged && report.transfer_converged)
+            || iteration == config.max_iterations
+        {
+            break;
+        }
+        if !report.local_converged {
+            local.copy_from_slice(next_local);
+        }
+        if !report.transfer_converged {
+            transfer.copy_from_slice(next_transfer);
+        }
+    }
+    report.local_domain = domain(&local, config.local_mass_ratio, stage)?;
+    report.transfer_domain = domain(&transfer, config.transfer_mass_ratio, stage)?;
+    report.local_field = local;
+    report.transfer_field = transfer;
+    Ok(report)
 }

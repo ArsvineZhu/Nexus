@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
 use crate::CandidateSet;
-use nexus_core::{CandidateId, Diagnostics, PathId};
-use nexus_math::{AuxiliaryEvidence, DtscOrder};
-use nexus_vcp::{OmegaOutput, QueryMorphology, ThinkingRelation};
+use nexus_core::{CandidateId, PathId};
+use nexus_math::{DtscDecision, DtscFieldStats, DtscScores};
+use nexus_vcp::{
+    OmegaOutput, ProjectionLimits, PropagationCompletion, QueryMorphology, RiverScores,
+    ThinkingRelation,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScoreItem {
@@ -15,7 +18,10 @@ pub struct ScoreItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathRef {
     pub candidate_id: u64,
+    /// Zero-based path index within the candidate, in host input order.
     pub path_index: usize,
+    /// Business ID of the source when path attribution was supplied.
+    pub source_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,7 +44,8 @@ pub struct Stage<'a> {
 #[derive(Clone, Debug)]
 pub struct TagMemoReadout {
     pub items: Vec<ScoreItem>,
-    pub diagnostics: Diagnostics,
+    pub propagation: PropagationCompletion,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -46,8 +53,9 @@ pub struct RiverReadout {
     pub items: Vec<RiverItem>,
     pub omega: OmegaOutput,
     pub morphology: QueryMorphology,
-    pub path_evidence: Vec<CandidatePathEvidence>,
-    pub diagnostics: Diagnostics,
+    pub propagation: PropagationCompletion,
+    pub projection: ProjectionLimits,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,46 +63,17 @@ pub struct RiverItem {
     pub id: u64,
     pub document_id: u64,
     pub chosen_path: Option<PathRef>,
-    pub score: f64,
-    pub base_score: f64,
-    pub path_bonus: f64,
-    pub graph_bonus: f64,
-    pub topology_bonus: f64,
-    pub genus_gate: f64,
-    pub direct_anchor_contacts: u8,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct CandidatePathEvidence {
-    pub id: u64,
-    pub paths: Vec<RiverPathEvidence>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RiverPathEvidence {
-    pub path: Option<PathRef>,
-    pub base: f64,
-    pub path_bonus: f64,
-    pub graph_bonus: f64,
-    pub path_quality: f64,
-    pub field_support: f64,
-    pub node_alignment: f64,
-    pub edge_coverage: f64,
-    pub ordinary_transport: f64,
-    pub genus_gate: f64,
-    pub anchor_contacts: u8,
+    pub scores: RiverScores,
 }
 
 #[derive(Clone, Debug)]
 pub struct DtscReadout {
     pub items: Vec<DtscItem>,
-    pub field_trusted: bool,
-    pub field_entropy: f64,
-    pub order: DtscOrder,
+    pub field: DtscFieldStats,
+    pub decision: DtscDecision,
     pub available: usize,
-    pub fallback_used: bool,
-    pub fallback_reason: Option<&'static str>,
-    pub diagnostics: Diagnostics,
+    pub propagation: PropagationCompletion,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -102,29 +81,13 @@ pub struct DtscItem {
     pub id: u64,
     pub document_id: u64,
     pub chosen_path: Option<PathRef>,
-    pub score: f64,
-    pub original_cosine: f64,
-    pub geo_score: f64,
-    pub normalized_geo: f64,
-    pub geo_bonus: f64,
-    pub geo_base_bonus: f64,
-    pub geo_aux_bonus: f64,
-    pub auxiliary_evidence: Option<AuxiliaryEvidence>,
-    pub geo_effect: &'static str,
-    pub geo_evidence_class: &'static str,
-    pub geo_reward_eligible: bool,
-    pub geo_confidence: f64,
-    pub geo_exact_hits: usize,
-    pub geo_strong_hits: usize,
-    pub geo_hit_count: usize,
-    pub geo_continuity: f64,
-    pub geo_isolated_ratio: f64,
+    pub scores: DtscScores,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThinkingPlan {
     pub stages: Vec<ThinkingStage>,
-    pub diagnostics: Diagnostics,
+    pub elapsed_ms: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -145,105 +108,101 @@ pub struct ThinkingItem {
     pub route: Option<ConceptTransition>,
 }
 
-impl CandidateSet<'_> {
-    fn path_ref(&self, candidate: CandidateId, path: Option<PathId>) -> Option<PathRef> {
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateIdentity {
+    pub(crate) id: u64,
+    document_id: u64,
+    path_start: usize,
+}
+
+impl CandidateIdentity {
+    pub(crate) fn path_ref(
+        self,
+        path: Option<PathId>,
+        path_sources: &[Option<u64>],
+    ) -> Option<PathRef> {
         path.map(|path| PathRef {
-            candidate_id: self.ids()[candidate.index()],
-            path_index: path.index() - self.rows().candidate_paths(candidate).start,
+            candidate_id: self.id,
+            path_index: path.index() - self.path_start,
+            source_id: path_sources[path.index()],
         })
     }
+}
 
-    pub(crate) fn river_readout(&self, result: nexus_vcp::RiverReadoutOutput) -> RiverReadout {
-        let items = result
-            .items
-            .into_iter()
-            .map(|item| RiverItem {
-                id: self.ids()[item.candidate.index()],
-                document_id: self.document_ids()[item.candidate.index()],
-                chosen_path: self.path_ref(item.candidate, item.chosen_path),
-                score: item.score,
-                base_score: item.base_score,
-                path_bonus: item.path_bonus,
-                graph_bonus: item.graph_bonus,
-                topology_bonus: item.topology_bonus,
-                genus_gate: item.genus_gate,
-                direct_anchor_contacts: item.direct_anchor_contacts,
-            })
-            .collect();
-        let path_evidence = result
-            .path_evidence
-            .into_iter()
-            .enumerate()
-            .map(|(index, paths)| {
-                let candidate = CandidateId::from_index(index, "river.readout")
-                    .expect("validated candidate slot");
-                CandidatePathEvidence {
-                    id: self.ids()[index],
-                    paths: paths
-                        .into_iter()
-                        .map(|path| RiverPathEvidence {
-                            path: self.path_ref(candidate, path.path),
-                            base: path.base,
-                            path_bonus: path.path_bonus,
-                            graph_bonus: path.graph_bonus,
-                            path_quality: path.path_quality,
-                            field_support: path.field_support,
-                            node_alignment: path.node_alignment,
-                            edge_coverage: path.edge_coverage,
-                            ordinary_transport: path.ordinary_transport,
-                            genus_gate: path.genus_gate,
-                            anchor_contacts: path.anchor_contacts,
-                        })
-                        .collect(),
-                }
-            })
-            .collect();
-        RiverReadout {
-            items,
-            path_evidence,
-            omega: result.omega,
-            morphology: result.morphology,
-            diagnostics: result.diagnostics,
+pub(crate) fn river_readout(
+    result: nexus_vcp::RiverReadoutOutput,
+    ids: &[CandidateIdentity],
+    path_sources: &[Option<u64>],
+) -> RiverReadout {
+    let items = result
+        .items
+        .into_iter()
+        .map(|item| {
+            let id = ids[item.candidate.index()];
+            RiverItem {
+                id: id.id,
+                document_id: id.document_id,
+                chosen_path: id.path_ref(item.chosen_path, path_sources),
+                scores: item.scores,
+            }
+        })
+        .collect();
+    RiverReadout {
+        items,
+        omega: result.omega,
+        morphology: result.morphology,
+        propagation: result.propagation,
+        projection: result.projection,
+        elapsed_ms: result.elapsed_ms,
+    }
+}
+
+pub(crate) fn dtsc_readout(
+    result: nexus_math::DtscOutput,
+    ids: &[CandidateIdentity],
+    path_sources: &[Option<u64>],
+    propagation: PropagationCompletion,
+) -> DtscReadout {
+    let items = result
+        .results
+        .into_iter()
+        .map(|item| {
+            let id = ids[item.candidate.index()];
+            DtscItem {
+                id: id.id,
+                document_id: id.document_id,
+                chosen_path: id.path_ref(item.chosen_path, path_sources),
+                scores: item.scores,
+            }
+        })
+        .collect();
+    DtscReadout {
+        items,
+        field: result.field,
+        decision: result.decision,
+        available: result.available,
+        propagation,
+        elapsed_ms: result.elapsed_ms,
+    }
+}
+
+impl CandidateSet<'_> {
+    fn identity(&self, candidate: CandidateId) -> CandidateIdentity {
+        CandidateIdentity {
+            id: self.ids()[candidate.index()],
+            document_id: self.document_ids()[candidate.index()],
+            path_start: self.rows().candidate_paths(candidate).start,
         }
     }
 
-    pub(crate) fn dtsc_readout(&self, result: nexus_math::DtscOutput) -> DtscReadout {
-        let items = result
-            .results
-            .into_iter()
-            .map(|item| DtscItem {
-                id: self.ids()[item.candidate.index()],
-                document_id: self.document_ids()[item.candidate.index()],
-                chosen_path: self.path_ref(item.candidate, item.chosen_path),
-                score: item.score,
-                original_cosine: item.original_cosine,
-                geo_score: item.geo_score,
-                normalized_geo: item.normalized_geo,
-                geo_bonus: item.geo_bonus,
-                geo_base_bonus: item.geo_base_bonus,
-                geo_aux_bonus: item.geo_aux_bonus,
-                auxiliary_evidence: item.auxiliary_evidence,
-                geo_effect: item.geo_effect,
-                geo_evidence_class: item.geo_evidence_class,
-                geo_reward_eligible: item.geo_reward_eligible,
-                geo_confidence: item.geo_confidence,
-                geo_exact_hits: item.geo_exact_hits,
-                geo_strong_hits: item.geo_strong_hits,
-                geo_hit_count: item.geo_hit_count,
-                geo_continuity: item.geo_continuity,
-                geo_isolated_ratio: item.geo_isolated_ratio,
+    pub(crate) fn identity_snapshot(&self) -> Vec<CandidateIdentity> {
+        (0..self.ids().len())
+            .map(|index| {
+                self.identity(
+                    CandidateId::from_index(index, "readout").expect("validated candidate slot"),
+                )
             })
-            .collect();
-        DtscReadout {
-            items,
-            field_trusted: result.field_trusted,
-            field_entropy: result.field_entropy,
-            order: result.order,
-            available: result.available,
-            fallback_used: result.fallback_used,
-            fallback_reason: result.fallback_reason,
-            diagnostics: result.diagnostics,
-        }
+            .collect()
     }
 
     pub(crate) fn thinking_plan(&self, result: nexus_vcp::ThinkingPlan) -> ThinkingPlan {
@@ -260,7 +219,9 @@ impl CandidateSet<'_> {
                     .map(|item| ThinkingItem {
                         id: self.ids()[item.candidate.index()],
                         document_id: self.document_ids()[item.candidate.index()],
-                        chosen_path: self.path_ref(item.candidate, item.chosen_path),
+                        chosen_path: self
+                            .identity(item.candidate)
+                            .path_ref(item.chosen_path, self.path_sources()),
                         score: item.score,
                         parents: item
                             .parents
@@ -283,7 +244,7 @@ impl CandidateSet<'_> {
             .collect();
         ThinkingPlan {
             stages,
-            diagnostics: result.diagnostics,
+            elapsed_ms: result.elapsed_ms,
         }
     }
 }

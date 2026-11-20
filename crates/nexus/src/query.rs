@@ -8,6 +8,7 @@ use std::collections::HashSet;
 
 pub struct TagRecallRequest<'call> {
     pub layer: usize,
+    /// Current residual, including its remaining magnitude.
     pub residual: &'call [f32],
     pub limit: usize,
     pub epa: Option<&'call EpaAnalysis>,
@@ -15,6 +16,9 @@ pub struct TagRecallRequest<'call> {
 }
 
 pub trait TagRecall {
+    /// Appends ordered, distinct concept IDs to the empty output buffer.
+    /// Returning no IDs ends the pyramid. The provider must skip excluded IDs
+    /// and may return up to the requested limit.
     fn recall(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -44,6 +48,7 @@ pub struct Query<'a> {
     pub core_concepts: &'a [u64],
     pub ghost_vectors: Option<VectorMatrixView<'a>>,
     pub ghost_is_core: &'a [bool],
+    pub edge_gates: Option<&'a [f64]>,
     pub tag_recall: Option<&'a dyn TagRecall>,
 }
 
@@ -55,10 +60,23 @@ impl<'a> Query<'a> {
             core_concepts: &[],
             ghost_vectors: None,
             ghost_is_core: &[],
+            edge_gates: None,
             tag_recall: None,
         }
     }
 
+    pub fn with_edge_gates(mut self, gates: &'a [f64]) -> Self {
+        self.edge_gates = Some(gates);
+        self
+    }
+
+    /// Supplies existing business concept IDs as core query anchors.
+    pub fn with_core_concepts(mut self, concepts: &'a [u64]) -> Self {
+        self.core_concepts = concepts;
+        self
+    }
+
+    /// Selects the host's residual concept provider for this query.
     pub fn with_tag_recall(mut self, recall: &'a dyn TagRecall) -> Self {
         self.tag_recall = Some(recall);
         self
@@ -74,7 +92,7 @@ struct RecallBuffers {
 
 pub(crate) struct PyramidRecall<'a, 'data> {
     nexus: &'a crate::Nexus<'data>,
-    ctx: &'a ExecutionContext<'data>,
+    ctx: &'a ExecutionContext<'a>,
     recall: &'a dyn TagRecall,
     buffers: RefCell<RecallBuffers>,
 }
@@ -82,7 +100,7 @@ pub(crate) struct PyramidRecall<'a, 'data> {
 impl<'a, 'data> PyramidRecall<'a, 'data> {
     pub(crate) fn new(
         nexus: &'a crate::Nexus<'data>,
-        ctx: &'a ExecutionContext<'data>,
+        ctx: &'a ExecutionContext<'a>,
         recall: &'a dyn TagRecall,
     ) -> Self {
         Self {

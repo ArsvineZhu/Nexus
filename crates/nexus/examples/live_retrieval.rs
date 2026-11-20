@@ -102,14 +102,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut grounded = 0;
     let dtsc_config = DtscConfig::default();
     for probe in &data.queries {
-        let query = Query::new(&probe.vector, &probe.text).with_tag_recall(&indexes);
-        let observation = nexus.observe(&query, &ObservationConfig::default(), ctx)?;
-        let candidates = observation.recall(&indexes, &RecallRequest::top_k(ids.len()))?;
-        let evaluation = observation.evaluate(&candidates)?;
-        let fields = observation.fields(&Default::default())?;
-        let result = evaluation.river(&fields, &RiverConfig::default())?;
-        let dtsc_field = observation.dtsc_field(&dtsc_config.field)?;
-        let dtsc = evaluation.dtsc(&dtsc_field, &dtsc_config.scoring)?;
+        let query = Query::new(&probe.vector, &probe.text);
+        let observation = indexes.observe(&query, &ObservationConfig::default(), &ctx)?;
+        let candidates = observation.recall(&indexes, &RecallRequest::top_k(ids.len()), &ctx)?;
+        let evaluation = observation.evaluate(&candidates, &ctx)?;
+        let result = evaluation.river(&Default::default(), &ctx)?;
+        let dtsc = evaluation.dtsc(&dtsc_config, &ctx)?;
         let thinking = evaluation.thinking(
             &[Stage {
                 name: "Explore",
@@ -117,6 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 candidates: candidates.ids(),
             }],
             &ThinkingConfig::default(),
+            &ctx,
         )?;
         let top = result.items.first().ok_or("River returned no candidates")?;
         let expected_rank = result
@@ -136,7 +135,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "{} | River: {} ({:.4}) | expected rank: {expected_rank} | DTSC: {} | Thinking routes: {routes}",
             probe.text,
             titles[top.id as usize],
-            top.score,
+            top.scores.score,
             dtsc.items.len(),
         );
     }

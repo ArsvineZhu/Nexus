@@ -9,22 +9,20 @@ use std::cell::RefCell;
 fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     let ctx = ExecutionContext::default();
 
-    let graph = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &FactMatrix {
-                    node_count: 4,
-                    row_offsets: vec![0, 0, 1, 1, 1],
-                    targets: vec![NodeId(3)],
-                    raw_weights: vec![1.0],
-                },
-                anchor_gains: &[1.0; 4],
-                edge_gates: None,
+    let graph = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &FactMatrix {
+                node_count: 4,
+                row_offsets: vec![0, 0, 1, 1, 1],
+                targets: vec![NodeId(3)],
+                raw_weights: vec![1.0],
             },
-        )
-        .unwrap();
+            anchor_gains: &[1.0; 4],
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     let graph = graph.graph.view();
     let matrix =
         VectorMatrixView::new(&[1., 0., 0., 0.8, 0.6, 0., 0., 0., 1., 0., 1., 0.], 4, 3).unwrap();
@@ -49,7 +47,7 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     let input = ObservationInput {
         query: &query,
         query_text: "car engine",
-        candidates: &search,
+        candidates: Some(&search),
         graph,
         tag_vectors: matrix,
         lexical_meta: TagLexicalMetaView {
@@ -65,12 +63,12 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     };
     let cfg = ObservationConfig {
         sense: SenseConfig {
-            max_transition_records: 128,
+            max_transition_records: Some(128),
             ..Default::default()
         },
         ..Default::default()
     };
-    let observed = Observe.execute(&ctx, &cfg, input).unwrap();
+    let observed = observe(input, &cfg, &ctx).unwrap();
     assert!(!observed.epa.cache_available);
     assert!(observed.epa.in_domain_gate.is_finite());
     assert_eq!(seen.borrow().len(), 2);
@@ -86,32 +84,30 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             .any(|edge| edge.target == NodeId(3))
     );
     let cfg_fields = FieldConfig::default();
-    let fields = ComputeFields
-        .execute(
-            &ctx,
-            &cfg_fields,
-            FieldInput {
-                graph,
-                tag_vectors: matrix,
-                observation: &observed,
-            },
-        )
-        .unwrap();
+    let fields = compute_fields(
+        FieldInput {
+            graph,
+            tag_vectors: matrix,
+            observation: &observed,
+        },
+        &cfg_fields,
+        &ctx,
+    )
+    .unwrap();
     assert!(fields.dual_fields.transfer_field[3] > 0.0);
     assert!(fields.basins.transfer_support_nodes.contains(&NodeId(3)));
 
     seen.borrow_mut().clear();
-    let explicit = Observe
-        .execute(
-            &ctx,
-            &cfg,
-            ObservationInput {
-                core_tags: &[NodeId(0)],
-                graph: graph.with_edge_gates(&[0.0]).unwrap(),
-                ..input
-            },
-        )
-        .unwrap();
+    let explicit = observe(
+        ObservationInput {
+            core_tags: &[NodeId(0)],
+            graph: graph.with_edge_gates(&[0.0]).unwrap(),
+            ..input
+        },
+        &cfg,
+        &ctx,
+    )
+    .unwrap();
     assert!(explicit.disambiguated.pruned_hypernyms.is_empty());
     assert!(
         explicit
@@ -121,17 +117,16 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
             .any(|seed| seed.node == NodeId(0) && seed.is_core)
     );
     assert!(explicit.sense.edges.is_empty());
-    let explicit_fields = ComputeFields
-        .execute(
-            &ctx,
-            &cfg_fields,
-            FieldInput {
-                graph: graph.with_edge_gates(&[0.0]).unwrap(),
-                tag_vectors: matrix,
-                observation: &explicit,
-            },
-        )
-        .unwrap();
+    let explicit_fields = compute_fields(
+        FieldInput {
+            graph: graph.with_edge_gates(&[0.0]).unwrap(),
+            tag_vectors: matrix,
+            observation: &explicit,
+        },
+        &cfg_fields,
+        &ctx,
+    )
+    .unwrap();
     assert_eq!(explicit_fields.dual_fields.transfer_field[3], 0.0);
 
     let fields = &fields.dual_fields;
@@ -147,8 +142,9 @@ fn observes_m2_transport_with_residual_search_and_temporal_gates() {
     )
     .unwrap();
     let mut source = [0.0; 4];
-    for &(node, mass) in &observed.sense.source_field {
-        source[node.index()] += mass;
+    let total: f64 = observed.sense.nodes.iter().map(|node| node.energy).sum();
+    for node in &observed.sense.nodes {
+        source[node.node.index()] = node.energy / total;
     }
     for (alpha, field, propagated) in [
         (cfg_fields.solve.local_alpha, &fields.local_field, local),
@@ -173,15 +169,15 @@ fn pyramid_propagates_host_failure() {
     let host = |_, _: &[f32], _, _: &mut Vec<_>, _: Option<&EpaAnalysis>, _: &[NodeId]| {
         Err(VcpError::Cancelled { stage: "host" })
     };
-    let result = PyramidAnalyzeOperator.execute(
-        &ExecutionContext::default(),
-        &PyramidConfig::default(),
+    let result = analyze_pyramid(
         PyramidAnalyzeInput {
             query: &[1.],
             tag_vectors: VectorMatrixView::new(&[1.], 1, 1).unwrap(),
-            candidates: &host,
+            candidates: Some(&host),
             epa: None,
         },
+        &PyramidConfig::default(),
+        &ExecutionContext::default(),
     );
     assert!(matches!(result, Err(VcpError::Cancelled { stage: "host" })));
 }
@@ -190,10 +186,10 @@ fn pyramid_propagates_host_failure() {
 fn prepared_query_contract_rejects_non_unit_inputs_and_fusion_rejects_cancellation() {
     let ctx = ExecutionContext::default();
     for query in [&[2.0_f32, 0.0], &[0.0, 0.0], &[f32::NAN, 0.0]] {
-        let result = EpaAnalyzeOperator.execute(
-            &ctx,
-            &EpaConfig::default(),
+        let result = analyze_epa(
             EpaAnalyzeInput { query, basis: None },
+            &EpaConfig::default(),
+            &ctx,
         );
         assert!(matches!(result, Err(VcpError::InvalidInput { .. })));
     }
@@ -205,9 +201,7 @@ fn prepared_query_contract_rejects_non_unit_inputs_and_fusion_rejects_cancellati
     let tags = VectorMatrixView::new(&[-1.0, 0.0], 1, 2).unwrap();
     let sense = SenseOutput::default();
     let fuse = |gated: &GatedSeeds| {
-        ObservationFuseOperator.execute(
-            &ctx,
-            &ObservationFuseConfig::default(),
+        fuse_observation(
             ObservationFuseInput {
                 query: &[1.0, 0.0],
                 tag_vectors: tags,
@@ -217,6 +211,8 @@ fn prepared_query_contract_rejects_non_unit_inputs_and_fusion_rejects_cancellati
                 ghost_vectors: None,
                 ghost_is_core: &[],
             },
+            &ObservationFuseConfig::default(),
+            &ctx,
         )
     };
     assert_eq!(fuse(&gated).unwrap().enhanced_query, [1.0, 0.0]);
@@ -257,13 +253,13 @@ fn fixed_point_reports_the_returned_iterate_and_fields_require_convergence() {
     .unwrap();
     let source_field = [(NodeId(0), 0.25), (NodeId(0), 0.75)];
     let solve = |config: &DualFieldConfig| {
-        DualFieldSolveOperator.execute(
-            &ctx,
-            config,
+        solve_dual_fields(
             DualFieldSolveInput {
                 graph,
                 source_field: &source_field,
             },
+            config,
+            &ctx,
         )
     };
     let solution = solve(&DualFieldConfig::default()).unwrap();
@@ -292,22 +288,28 @@ fn fixed_point_reports_the_returned_iterate_and_fields_require_convergence() {
         disambiguated: DisambiguatedTags::default(),
         gated_seeds: GatedSeeds::default(),
         sense: SenseOutput {
-            source_field: source_field.to_vec(),
+            nodes: vec![ObservationNode {
+                node: NodeId(0),
+                energy: 1.,
+                source_kind: SeedSourceKind::Core,
+                hop: 0,
+                seed_node: None,
+            }],
             ..Default::default()
         },
         fused: FusedObservation::default(),
     };
-    let result = ComputeFields.execute(
-        &ctx,
-        &FieldConfig {
-            solve: limited.clone(),
-            ..Default::default()
-        },
+    let result = compute_fields(
         FieldInput {
             graph,
             tag_vectors: VectorMatrixView::new(&[1.0, 0.0, 0.0, 1.0], 2, 2).unwrap(),
             observation: &observation,
         },
+        &FieldConfig {
+            solve: limited.clone(),
+            ..Default::default()
+        },
+        &ctx,
     );
     assert!(matches!(
         result,
@@ -340,31 +342,25 @@ fn composes_epa_and_pyramid_with_borrowed_query_and_host_recall() -> VcpResult<(
             }
             Ok(())
         };
-    let mut plan = Plan::new();
-    let epa = plan.add((), |ctx, _| {
-        EpaAnalyzeOperator.execute(
-            ctx,
-            &EpaConfig::default(),
-            EpaAnalyzeInput {
-                query: &query,
-                basis: None,
-            },
-        )
-    })?;
-    let pyramid = plan.add(epa, |ctx, inputs| {
-        PyramidAnalyzeOperator.execute(
-            ctx,
-            &PyramidConfig::default(),
-            PyramidAnalyzeInput {
-                query: &query,
-                candidates: &recall,
-                epa: Some(inputs.get()),
-                tag_vectors,
-            },
-        )
-    })?;
-    let result = plan.run(pyramid, &ExecutionContext::default())?;
-    let pyramid = result.get(pyramid)?;
+    let ctx = ExecutionContext::default();
+    let epa = analyze_epa(
+        EpaAnalyzeInput {
+            query: &query,
+            basis: None,
+        },
+        &EpaConfig::default(),
+        &ctx,
+    )?;
+    let pyramid = analyze_pyramid(
+        PyramidAnalyzeInput {
+            query: &query,
+            candidates: Some(&recall),
+            epa: Some(&epa),
+            tag_vectors,
+        },
+        &PyramidConfig::default(),
+        &ctx,
+    )?;
     assert_eq!(pyramid.levels[0].tags[0].node, NodeId(0));
     assert!((pyramid.coverage - 1.0).abs() < 1e-12);
     Ok(())

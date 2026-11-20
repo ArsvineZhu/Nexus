@@ -10,7 +10,7 @@ use nexus_core::nnls::{
 };
 use nexus_core::{
     CancellationToken, CsrGraphView, CsrParts, GroupId, NnlsWorkspace, NodeId, ParallelPolicy,
-    PrecisionMode, ProvenanceView, ResourceLimits, RootId, SupportGroupView, SupportKind, VcpError,
+    PrecisionMode, ProvenanceView, RootId, SupportGroupView, SupportKind, VcpError,
     VectorMatrixView,
 };
 use std::sync::atomic::AtomicBool;
@@ -63,42 +63,39 @@ fn scalar_ref_dtsc_cosine(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn nnls_opposite_and_secondary_directions() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
     let a = [1.0, 0.0];
     let b = [0.94, -0.342];
     let q = [0.94, 0.342];
-    let sol = solve_nnls_f64(&q, &[&a, &b], &limits, &cancel, &mut scratch).unwrap();
-    assert_eq!(sol.weights[1], 0.0);
+    let sol = solve_nnls_f64(&q, &[&a, &b], 256, &cancel, &mut scratch).unwrap();
+    assert_eq!(sol.direction_weights[1], 0.0);
     assert!(sol.residual[1] > 0.34);
     assert!(sol.max_kkt_violation <= CHECK_TOL);
 
     let q_neg = [-1.0, 0.0];
-    let sol_neg = solve_nnls_f64(&q_neg, &[&a], &limits, &cancel, &mut scratch).unwrap();
+    let sol_neg = solve_nnls_f64(&q_neg, &[&a], 256, &cancel, &mut scratch).unwrap();
     assert_eq!(sol_neg.projection, vec![0.0, 0.0]);
     assert!((sol_neg.residual_ratio - 1.0).abs() < 1e-12);
 }
 
 #[test]
 fn nnls_joint_fit_negative_initial_correlation() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
     let a = [1.0, 1.0];
     let b = [0.0, -1.0];
     let q = [1.0, 0.1];
-    let sol = solve_nnls_f64(&q, &[&a, &b], &limits, &cancel, &mut scratch).unwrap();
-    assert!(sol.weights[1] > 0.8);
+    let sol = solve_nnls_f64(&q, &[&a, &b], 256, &cancel, &mut scratch).unwrap();
+    assert!(sol.direction_weights[1] > 0.8);
     assert!(sol.residual.iter().all(|r| r.abs() < 1e-6));
     assert!(sol.max_kkt_violation <= CHECK_TOL);
 }
 
 #[test]
 fn nnls_dependent_rays_r2() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -109,18 +106,17 @@ fn nnls_dependent_rays_r2() {
     let sol = solve_nnls_with_ids_f64(
         &q,
         &[(1, &c1), (2, &c2), (3, &c3)],
-        &limits,
+        256,
         &cancel,
         &mut scratch,
     )
     .unwrap();
     assert!(sol.residual.iter().all(|r| r.abs() < 1e-8));
-    assert!(sol.weights[2] > 0.9);
+    assert!(sol.direction_weights[2] > 0.9);
 }
 
 #[test]
 fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -133,7 +129,7 @@ fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
         let first = solve_nnls_with_ids_f64(
             &q,
             &[(30, &a), (10, &a), (20, &b), (40, &z)],
-            &limits,
+            256,
             &cancel,
             &mut scratch,
         )
@@ -141,16 +137,16 @@ fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
         let second = solve_nnls_with_ids_f64(
             &q,
             &[(40, &z), (20, &b), (10, &a), (30, &a)],
-            &limits,
+            256,
             &cancel,
             &mut scratch,
         )
         .unwrap();
 
-        assert_eq!(first.weights[0], 0.0); // id=30 loses to id=10
-        assert_eq!(first.weights[3], 0.0); // zero column
-        assert!((first.weights[1] - second.weights[2]).abs() < 1e-12);
-        assert!((first.weights[2] - second.weights[1]).abs() < 1e-12);
+        assert_eq!(first.direction_weights[0], 0.0); // id=30 loses to id=10
+        assert_eq!(first.direction_weights[3], 0.0); // zero column
+        assert!((first.direction_weights[1] - second.direction_weights[2]).abs() < 1e-12);
+        assert!((first.direction_weights[2] - second.direction_weights[1]).abs() < 1e-12);
         for (p1, p2) in first.projection.iter().zip(&second.projection) {
             assert!((p1 - p2).abs() <= 1e-10 * scale);
         }
@@ -162,7 +158,7 @@ fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
     let sol = solve_nnls_with_ids_f64(
         &q_ratio,
         &[(3, &c1), (1, &c1), (2, &c0)],
-        &limits,
+        256,
         &cancel,
         &mut scratch,
     )
@@ -172,7 +168,6 @@ fn nnls_scale_duplicate_ids_zero_column_and_permutations() {
 
 #[test]
 fn nnls_near_collinear_cancellation() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -180,16 +175,15 @@ fn nnls_near_collinear_cancellation() {
         let a = [0.6, 0.8, 0.0];
         let b = [0.6, 0.8, eps];
         let q = [0.0, 0.0, 1.0];
-        let sol = solve_nnls_f64(&q, &[&a, &b], &limits, &cancel, &mut scratch).unwrap();
+        let sol = solve_nnls_f64(&q, &[&a, &b], 256, &cancel, &mut scratch).unwrap();
         assert!(sol.residual[2] > 0.99);
-        assert!(sol.weights.iter().all(|&w| w < 0.001));
+        assert!(sol.direction_weights.iter().all(|&w| w < 0.001));
         assert!(sol.max_kkt_violation <= CHECK_TOL);
     }
 }
 
 #[test]
 fn nnls_3072d_128_cols_stress() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -207,7 +201,7 @@ fn nnls_3072d_128_cols_stress() {
     q[3000] = 0.2;
 
     let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-    let sol = solve_nnls_f64(&q, &refs, &limits, &cancel, &mut scratch).unwrap();
+    let sol = solve_nnls_f64(&q, &refs, 256, &cancel, &mut scratch).unwrap();
     assert_eq!(sol.active_columns, 128);
     assert_eq!(sol.iterations, 128);
     assert!((sol.residual[3000] - 0.2).abs() < 1e-6);
@@ -217,7 +211,6 @@ fn nnls_3072d_128_cols_stress() {
 
 #[test]
 fn nnls_256_cols_rank_deficient_d2048_qr_compression() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -248,12 +241,16 @@ fn nnls_256_cols_rank_deficient_d2048_qr_compression() {
         &cols_flat,
         num_cols,
         dim,
-        &limits,
+        256,
         &cancel,
         &mut scratch,
     )
     .unwrap();
-    assert!(sol.weights.iter().all(|&w| w >= 0.0 && w.is_finite()));
+    assert!(
+        sol.direction_weights
+            .iter()
+            .all(|&w| w >= 0.0 && w.is_finite())
+    );
     assert!(sol.max_kkt_violation <= CHECK_TOL);
     assert!((sol.residual[1500] - 0.35).abs() < 1e-6);
 
@@ -268,49 +265,42 @@ fn nnls_256_cols_rank_deficient_d2048_qr_compression() {
         .collect();
     let refs_f32: Vec<&[f32]> = cols_f32.iter().map(|c| c.as_slice()).collect();
     let target_f32: Vec<f32> = target.iter().map(|&v| v as f32).collect();
-    let sol_f32 = solve_nnls_f32(&target_f32, &refs_f32, &limits, &cancel, &mut scratch).unwrap();
+    let sol_f32 = solve_nnls_f32(&target_f32, &refs_f32, 256, &cancel, &mut scratch).unwrap();
     assert!(sol_f32.max_kkt_violation <= CHECK_TOL);
 }
 
 #[test]
 fn nnls_rejects_invalid_limits_and_cancellation() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
     let col = [1.0, 0.0];
 
     // Empty query
     assert!(matches!(
-        solve_nnls_f64(&[], &[&col], &limits, &cancel, &mut scratch),
+        solve_nnls_f64(&[], &[&col], 256, &cancel, &mut scratch),
         Err(VcpError::InvalidInput { .. })
     ));
     // Non-finite query
     assert!(matches!(
-        solve_nnls_f64(&[f64::NAN, 1.0], &[&col], &limits, &cancel, &mut scratch),
+        solve_nnls_f64(&[f64::NAN, 1.0], &[&col], 256, &cancel, &mut scratch),
         Err(VcpError::InvalidInput { .. })
     ));
     assert!(matches!(
-        solve_nnls_f64(
-            &[f64::INFINITY, 1.0],
-            &[&col],
-            &limits,
-            &cancel,
-            &mut scratch
-        ),
+        solve_nnls_f64(&[f64::INFINITY, 1.0], &[&col], 256, &cancel, &mut scratch),
         Err(VcpError::InvalidInput { .. })
     ));
     // Non-finite column
     let bad_col = [f64::NAN, 1.0];
     assert!(matches!(
-        solve_nnls_f64(&[1.0, 0.0], &[&bad_col], &limits, &cancel, &mut scratch),
+        solve_nnls_f64(&[1.0, 0.0], &[&bad_col], 256, &cancel, &mut scratch),
         Err(VcpError::InvalidInput { .. })
     ));
     // Column limit exceeded
     let many_cols = vec![col.as_slice(); 257];
     assert!(matches!(
-        solve_nnls_f64(&[1.0, 0.0], &many_cols, &limits, &cancel, &mut scratch),
+        solve_nnls_f64(&[1.0, 0.0], &many_cols, 256, &cancel, &mut scratch),
         Err(VcpError::ResourceLimitExceeded {
-            limit_name: "nnls_max_columns",
+            limit_name: "max_columns",
             actual: 257,
             limit: 256,
             ..
@@ -320,7 +310,7 @@ fn nnls_rejects_invalid_limits_and_cancellation() {
     let flag = AtomicBool::new(true);
     let cancelled = CancellationToken::from_atomic(&flag);
     assert!(matches!(
-        solve_nnls_f64(&[1.0, 0.0], &[&col], &limits, &cancelled, &mut scratch),
+        solve_nnls_f64(&[1.0, 0.0], &[&col], 256, &cancelled, &mut scratch),
         Err(VcpError::Cancelled { .. })
     ));
 }
@@ -508,6 +498,17 @@ fn kernel_batch_cosines_1way_and_4way_parallel_and_seq() {
         ParallelPolicy::GlobalRayon,
     )
     .unwrap();
+    let mut strict_pair = [(); 2].map(|_| vec![0.0; rows]);
+    let mut pair_columns = strict_pair.each_mut().map(Vec::as_mut_slice);
+    batch_cosines_f32(
+        &view,
+        &[&q0, &q1],
+        &mut pair_columns,
+        PrecisionMode::StrictLeftFold,
+        1e-12,
+        ParallelPolicy::GlobalRayon,
+    )
+    .unwrap();
     for r in 0..rows {
         let row = view.row(r).unwrap();
         assert!((out1[r] - out4_seq[0][r]).abs() <= 1e-12);
@@ -523,6 +524,9 @@ fn kernel_batch_cosines_1way_and_4way_parallel_and_seq() {
             );
             assert!((out4_seq[k][r] - exact).abs() <= 2.61e-7);
             assert_eq!(strict[k][r].to_bits(), exact.to_bits());
+        }
+        for k in 0..2 {
+            assert_eq!(strict_pair[k][r].to_bits(), strict[k][r].to_bits());
         }
     }
 }
@@ -669,7 +673,7 @@ fn kernel_csr_spmv_dual_edge_gates_and_parallel() {
 }
 
 // =========================================================================
-// 3. CSR, Provenance, EpochTable, Views & Operator Trait Tests
+// 3. CSR, Provenance, EpochTable, Views
 // =========================================================================
 
 #[test]
@@ -817,14 +821,8 @@ fn provenance_multi_root_and_support_group_joint_exclusion() {
 #[test]
 fn schemars_generation_for_core_types() {
     let id_schema = schemars::schema_for!(NodeId);
-    let diag_schema = schemars::schema_for!(nexus_core::Diagnostics);
     let json = serde_json::to_string(&id_schema).unwrap();
     assert!(json.contains("integer"));
-    assert!(
-        serde_json::to_string(&diag_schema)
-            .unwrap()
-            .contains("truncated")
-    );
 }
 
 // =========================================================================
@@ -1077,7 +1075,6 @@ fn csr_spmv_dual_zero_bit_parity_across_policies_n2500_nnz25000() {
 
 #[test]
 fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
-    let limits = ResourceLimits::default();
     let cancel = CancellationToken::none();
     let mut scratch = NnlsWorkspace::default();
 
@@ -1106,15 +1103,15 @@ fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
         cols_diff.push((10, &base));
 
         let sol_diff =
-            solve_nnls_with_ids_f64(&target, &cols_diff, &limits, &cancel, &mut scratch).unwrap();
+            solve_nnls_with_ids_f64(&target, &cols_diff, 256, &cancel, &mut scratch).unwrap();
         assert_eq!(
-            sol_diff.weights[0], 0.0,
+            sol_diff.direction_weights[0], 0.0,
             "diff-id seed {seed}: higher id=100 at slot 0 stole weight"
         );
         assert!(
-            sol_diff.weights[17] > 0.5,
+            sol_diff.direction_weights[17] > 0.5,
             "diff-id seed {seed}: lower id=10 at slot 17 got {}",
-            sol_diff.weights[17]
+            sol_diff.direction_weights[17]
         );
         assert!(sol_diff.max_kkt_violation <= CHECK_TOL);
 
@@ -1122,14 +1119,14 @@ fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
         let mut cols_same = cols_diff;
         cols_same[0].0 = 10;
         let sol_same =
-            solve_nnls_with_ids_f64(&target, &cols_same, &limits, &cancel, &mut scratch).unwrap();
+            solve_nnls_with_ids_f64(&target, &cols_same, 256, &cancel, &mut scratch).unwrap();
         assert!(
-            sol_same.weights[0] > 0.5,
+            sol_same.direction_weights[0] > 0.5,
             "same-id seed {seed}: earlier slot 0 got {}",
-            sol_same.weights[0]
+            sol_same.direction_weights[0]
         );
         assert_eq!(
-            sol_same.weights[17], 0.0,
+            sol_same.direction_weights[17], 0.0,
             "same-id seed {seed}: later slot 17 stole weight"
         );
         assert!(sol_same.max_kkt_violation <= CHECK_TOL);
@@ -1138,16 +1135,16 @@ fn nnls_qr_tie_breaking_and_1e160_scaled_norm() {
     // 2. Finite 1e160 scaled norm fallback (without overflowing f64 norm_sq)
     let a = [1e160_f64, 0.0];
     let q = [1e160_f64, 1e160_f64];
-    let sol = solve_nnls_f64(&q, &[&a], &limits, &cancel, &mut scratch).unwrap();
-    assert!((sol.weights[0] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+    let sol = solve_nnls_f64(&q, &[&a], 256, &cancel, &mut scratch).unwrap();
+    assert!((sol.direction_weights[0] - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
     assert!(sol.target_norm.is_finite());
     assert!(sol.residual_norm.is_finite());
     assert!((sol.residual_norm - 1e160).abs() / 1e160 < 1e-12);
     assert!(sol.max_kkt_violation <= CHECK_TOL);
 
     let b = [1e160_f64, 1e160_f64];
-    let sol_exact = solve_nnls_f64(&q, &[&b], &limits, &cancel, &mut scratch).unwrap();
-    assert!((sol_exact.weights[0] - 1.0).abs() < 1e-12);
+    let sol_exact = solve_nnls_f64(&q, &[&b], 256, &cancel, &mut scratch).unwrap();
+    assert!((sol_exact.direction_weights[0] - 1.0).abs() < 1e-12);
     assert!(sol_exact.residual_norm.is_finite());
     assert!(sol_exact.max_kkt_violation <= CHECK_TOL);
 }
@@ -1202,13 +1199,35 @@ fn transport_checks_the_actual_gated_row_mass() {
 }
 
 #[test]
-fn shared_cosines_use_actual_row_sources_and_strict_norms() -> nexus_core::VcpResult<()> {
-    use nexus_core::{CandidateRowsView, DocumentId, ExecutionContext, QueryCosines};
-    let matrix = [2.0, 0.0, 0.0, 3.0];
+fn nnls_preserves_both_coordinate_systems() -> nexus_core::VcpResult<()> {
+    let solution = nexus_core::nnls::solve_nnls_f64(
+        &[4., 6.],
+        &[&[2., 0.], &[0., 3.]],
+        2,
+        &CancellationToken::none(),
+        &mut NnlsWorkspace::default(),
+    )?;
+    for (&direction, expected) in solution.direction_weights.iter().zip([4., 6.]) {
+        assert!((direction - expected / 52_f64.sqrt()).abs() < 1e-12);
+    }
+    assert!(
+        solution
+            .coefficients()?
+            .iter()
+            .all(|x| (x - 2.).abs() < 1e-12)
+    );
+    assert!((solution.projection[0] - 4.).abs() < 1e-12);
+    assert!((solution.projection[1] - 6.).abs() < 1e-12);
+    Ok(())
+}
+#[test]
+fn shared_cosines_compute_both_columns_from_the_candidate_matrix() -> nexus_core::VcpResult<()> {
+    use nexus_core::{CandidateRowsView, ExecutionContext, QueryCosines};
     let rows = CandidateRowsView {
         candidate_count: 2,
-        candidate_vectors: VectorMatrixView::new(&matrix, 2, 2)?.with_sq_norms(&[9., 4.])?,
-        document_ids: &[DocumentId(0), DocumentId(1)],
+        candidate_vectors: VectorMatrixView::new(&[2., 0., 0., 3.], 2, 2)?
+            .with_sq_norms(&[9., 4.])?,
+        document_ids: &[100, 200],
         candidate_root_offsets: &[0, 0, 0],
         candidate_roots: &[],
         candidate_path_offsets: &[0, 0, 0],
@@ -1217,79 +1236,12 @@ fn shared_cosines_use_actual_row_sources_and_strict_norms() -> nexus_core::VcpRe
         path_positions: &[],
     };
     let ctx = ExecutionContext::default();
-    let original = [1.0, 0.0];
-    let prior = QueryCosines::prepare(&ctx, rows, &original, &[1., 0.])?;
-    let reused = QueryCosines::reuse_original(&ctx, &prior, rows, &original, &[0., 1.])?;
-    assert!(std::ptr::eq(
-        prior.original_cosines(),
-        reused.original_cosines()
-    ));
-    assert!(std::ptr::eq(
-        prior.rows().candidate_vectors.sq_norms_f64.unwrap(),
-        reused.rows().candidate_vectors.sq_norms_f64.unwrap()
-    ));
-    assert_eq!(reused.original_cosines(), &[1., 0.]);
-    assert_eq!(reused.enhanced_cosines(), &[0., 1.]);
+    let cosines = QueryCosines::prepare(&ctx, rows, &[1., 0.], &[0., 1.])?;
+    assert_eq!(cosines.original_cosines(), &[1., 0.]);
+    assert_eq!(cosines.enhanced_cosines(), &[0., 1.]);
     assert_eq!(
-        reused.rows().candidate_vectors.sq_norms_f64,
+        cosines.rows().candidate_vectors.sq_norms_f64,
         Some(&[4., 9.][..])
     );
-    let reordered = [0., 3., 2., 0.];
-    let reordered = CandidateRowsView {
-        candidate_vectors: VectorMatrixView::new(&reordered, 2, 2)?,
-        ..rows
-    };
-    assert!(QueryCosines::reuse_original(&ctx, &prior, reordered, &original, &[0., 1.]).is_err());
-    Ok(())
-}
-
-#[test]
-fn plan_prunes_steps_shares_results_and_releases_after_last_use() -> nexus_core::VcpResult<()> {
-    use nexus_core::{ExecutionContext, Plan};
-    use std::sync::atomic::Ordering;
-    let dropped = std::sync::Arc::new(AtomicBool::new(false));
-    struct OwnedTracked(std::sync::Arc<AtomicBool>);
-    impl Drop for OwnedTracked {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
-    }
-    let ctx = ExecutionContext::default();
-    let mut plan = Plan::new();
-    let shared = plan.add((), |_, _| Ok(OwnedTracked(dropped.clone())))?;
-    let never = plan.add((), |_, _| -> nexus_core::VcpResult<()> {
-        panic!("unused branch ran")
-    })?;
-    let first = plan.add(shared, |_, input| {
-        assert!(!input.get().0.load(Ordering::Relaxed));
-        Ok(4)
-    })?;
-    let second = plan.add(shared, |_, input| {
-        assert!(!input.get().0.load(Ordering::Relaxed));
-        Ok(5)
-    })?;
-    let end = plan.add((first, second), |_, input| {
-        assert!(dropped.load(Ordering::Relaxed));
-        let (a, b) = input.get();
-        Ok(a + b)
-    })?;
-    let result = plan.run(end, &ctx)?;
-    assert_eq!(*result.get(end)?, 9);
-    assert!(result.get(never).is_err());
-    let mut unrelated = Plan::new();
-    assert!(unrelated.add(shared, |_, _| Ok(())).is_err());
-
-    let stop = AtomicBool::new(true);
-    let stopped = ExecutionContext {
-        cancel: CancellationToken::from_atomic(&stop),
-        ..ctx
-    };
-    let output = unrelated.add((), |_, _| -> nexus_core::VcpResult<()> {
-        panic!("cancelled branch ran")
-    })?;
-    assert!(matches!(
-        unrelated.run(output, &stopped),
-        Err(VcpError::Cancelled { stage: "plan" })
-    ));
     Ok(())
 }

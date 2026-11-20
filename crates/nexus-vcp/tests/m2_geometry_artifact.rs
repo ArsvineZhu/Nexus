@@ -5,15 +5,13 @@ use nexus_vcp::*;
 
 fn make_seq_view<'a>(
     seq_offsets: &'a [u32],
-    seq_documents: &'a [DocumentId],
     seq_source_roots: &'a [RootId],
     tag_ids: &'a [NodeId],
     positions: &'a [u32],
 ) -> SequenceSliceView<'a> {
     SequenceSliceView {
-        sequence_count: seq_documents.len(),
+        sequence_count: seq_source_roots.len(),
         seq_offsets,
-        seq_documents,
         seq_source_roots,
         tag_ids,
         positions,
@@ -44,45 +42,41 @@ fn provenance_contract_1_multi_root_exclusion_and_dedup_floor() {
         masses: &masses,
     };
 
-    let fm_out = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: seqs,
-                anchor_gains: &anchor_gains,
-                positive_relations: Some(pos_rel),
-                negative_relations: None,
-            },
-        )
-        .unwrap();
+    let fm_out = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: seqs,
+            anchor_gains: &anchor_gains,
+            positive_relations: Some(pos_rel),
+            negative_relations: None,
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
-    let transport = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &fm_out.fact_matrix,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
+    let transport = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &fm_out.fact_matrix,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
-    let prov = ProvenanceBuildOperator
-        .execute(
-            &ctx,
-            &ProvenanceConfig::default(),
-            ProvenanceBuildInput {
-                transport_row_offsets: transport.graph.view().row_offsets,
-                transport_targets: transport.graph.view().targets,
-                sequences: seqs,
-                positive_relations: Some(pos_rel),
-                support_groups: None,
-            },
-        )
-        .unwrap();
+    let prov = build_provenance(
+        ProvenanceBuildInput {
+            transport_row_offsets: transport.graph.view().row_offsets,
+            transport_targets: transport.graph.view().targets,
+            sequences: seqs,
+            positive_relations: Some(pos_rel),
+            support_groups: None,
+        },
+        &ProvenanceConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     let csr = transport.graph.view().as_csr();
     let edge_idx = csr.find_edge(NodeId(0), NodeId(1)).unwrap();
@@ -151,46 +145,42 @@ fn provenance_contract_2_joint_support_group_and_max_dedup() {
         masses: &masses,
     };
 
-    let fm_out = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: SequenceSliceView::empty(),
-                anchor_gains: &anchor_gains,
-                positive_relations: Some(pos_rel),
-                negative_relations: None,
-            },
-        )
-        .unwrap();
+    let fm_out = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: SequenceSliceView::empty(),
+            anchor_gains: &anchor_gains,
+            positive_relations: Some(pos_rel),
+            negative_relations: None,
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     assert_eq!(fm_out.fact_matrix.raw_weights, vec![5.0]);
 
-    let transport = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &fm_out.fact_matrix,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
+    let transport = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &fm_out.fact_matrix,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
-    let prov = ProvenanceBuildOperator
-        .execute(
-            &ctx,
-            &ProvenanceConfig::default(),
-            ProvenanceBuildInput {
-                transport_row_offsets: transport.graph.view().row_offsets,
-                transport_targets: transport.graph.view().targets,
-                sequences: SequenceSliceView::empty(),
-                positive_relations: Some(pos_rel),
-                support_groups: Some(sg),
-            },
-        )
-        .unwrap();
+    let prov = build_provenance(
+        ProvenanceBuildInput {
+            transport_row_offsets: transport.graph.view().row_offsets,
+            transport_targets: transport.graph.view().targets,
+            sequences: SequenceSliceView::empty(),
+            positive_relations: Some(pos_rel),
+            support_groups: Some(sg),
+        },
+        &ProvenanceConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     let csr = transport.graph.view().as_csr();
     let edge_idx = csr.find_edge(NodeId(0), NodeId(1)).unwrap();
@@ -234,21 +224,19 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
         positions.push(i + 1);
     }
     let seq_offsets = [0_u32, 101];
-    let seq_docs = [DocumentId(0)];
     let seq_roots = [RootId(500)];
-    let seqs = make_seq_view(&seq_offsets, &seq_docs, &seq_roots, &tag_ids, &positions);
+    let seqs = make_seq_view(&seq_offsets, &seq_roots, &tag_ids, &positions);
 
-    let geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: seqs,
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
+    let geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: seqs,
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(geom.node_count, 5);
     assert_eq!(geom.computed_nodes.iter().filter(|&&c| c).count(), 5);
@@ -256,36 +244,37 @@ fn provenance_contract_3_long_101_occurrence_sequence_no_truncation() {
 
     // Also verify FactMatrix + ProvenanceBuild process all 101 occurrences without truncation,
     // and pair_work_limit triggers explicit ResourceLimitExceeded when set below 101*100/2 = 5050.
-    let mut limited_ctx = ExecutionContext::default();
-    limited_ctx.limits.pair_work_limit = 100;
-    let err = LocalConeAgsOperator
-        .execute(
-            &limited_ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: seqs,
-                explicit_edges: None,
-            },
-        )
-        .unwrap_err();
+    let err = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: seqs,
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig {
+            pair_work_limit: Some(100),
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .unwrap_err();
     assert!(matches!(err, VcpError::ResourceLimitExceeded { .. }));
 
-    let mut unlimited_ctx = ExecutionContext::default();
-    unlimited_ctx.limits.pair_work_limit = 0;
-    let fm_out = FactMatrixOperator
-        .execute(
-            &unlimited_ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: seqs,
-                anchor_gains: &geom.anchor_gains,
-                positive_relations: None,
-                negative_relations: None,
-            },
-        )
-        .unwrap();
+    let unlimited_ctx = ExecutionContext::default();
+    let fm_out = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: seqs,
+            anchor_gains: &geom.anchor_gains,
+            positive_relations: None,
+            negative_relations: None,
+        },
+        &FactMatrixConfig {
+            pair_work_limit: None,
+            ..Default::default()
+        },
+        &unlimited_ctx,
+    )
+    .unwrap();
     assert_eq!(fm_out.fact_matrix.targets.len(), 20);
 }
 
@@ -301,11 +290,10 @@ fn counterevidence_zero_bit_isolation() {
     ];
     let tag_vectors = VectorMatrixView::new(&vecs, 4, 4).unwrap();
     let seq_offsets = [0_u32, 4];
-    let seq_docs = [DocumentId(0)];
     let seq_roots = [RootId(10)];
     let tag_ids = [NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
     let positions = [1_u32, 2, 3, 4];
-    let seqs = make_seq_view(&seq_offsets, &seq_docs, &seq_roots, &tag_ids, &positions);
+    let seqs = make_seq_view(&seq_offsets, &seq_roots, &tag_ids, &positions);
     let anchor_gains = [1.2, 0.9, 1.5, 1.0];
 
     let neg_sources = [NodeId(0), NodeId(2)];
@@ -323,34 +311,32 @@ fn counterevidence_zero_bit_isolation() {
         confidences: &neg_confidences,
     };
 
-    let out_clean = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: seqs,
-                anchor_gains: &anchor_gains,
-                positive_relations: None,
-                negative_relations: None,
-            },
-        )
-        .unwrap();
+    let out_clean = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: seqs,
+            anchor_gains: &anchor_gains,
+            positive_relations: None,
+            negative_relations: None,
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     assert_eq!(out_clean.counterevidence.sources.len(), 0);
 
-    let out_with_neg = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: seqs,
-                anchor_gains: &anchor_gains,
-                positive_relations: None,
-                negative_relations: Some(neg_view),
-            },
-        )
-        .unwrap();
+    let out_with_neg = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: seqs,
+            anchor_gains: &anchor_gains,
+            positive_relations: None,
+            negative_relations: Some(neg_view),
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     // 0-bit identical FactMatrix!
     assert_eq!(
@@ -383,28 +369,24 @@ fn counterevidence_zero_bit_isolation() {
         .validate(4, "test")
         .unwrap();
 
-    let tr_clean = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &out_clean.fact_matrix,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
-    let tr_neg = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &out_with_neg.fact_matrix,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
+    let tr_clean = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &out_clean.fact_matrix,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
+    let tr_neg = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &out_with_neg.fact_matrix,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(
         tr_clean.graph.view().row_offsets,
@@ -470,17 +452,16 @@ fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
         }
     }
 
-    let geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: SequenceSliceView::empty(),
-                explicit_edges: Some(&explicit_edges),
-            },
-        )
-        .unwrap();
+    let geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: SequenceSliceView::empty(),
+            explicit_edges: Some(&explicit_edges),
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(geom.intrinsics[0].basis_used, 24);
     assert!(geom.local_residuals[0] >= 0.0 && geom.local_residuals[0] <= 1.0);
@@ -488,23 +469,22 @@ fn local_cone_ags_24_basis_and_global_epa_orthogonality_and_monotonic_energy() {
     assert!((geom.anchor_gains[0] - expected_gain).abs() < 1e-12);
 
     // GlobalEpa with k_max = 24, epsilon = 0.0, knee_delta = 0.0 forces 24 orthonormal basis axes.
-    let epa = GlobalEpaOperator
-        .execute(
-            &ctx,
-            &GlobalEpaConfig {
-                k_max: 24,
-                k_sem: 24,
-                min_gain: 0.001,
-                epsilon: 0.0,
-                knee_delta: 0.0,
-                ..Default::default()
-            },
-            GlobalEpaInput {
-                tag_vectors,
-                geometry: &geom,
-            },
-        )
-        .unwrap();
+    let epa = global_epa(
+        GlobalEpaInput {
+            tag_vectors,
+            geometry: &geom,
+        },
+        &GlobalEpaConfig {
+            k_max: 24,
+            k_sem: 24,
+            min_gain: 0.001,
+            epsilon: 0.0,
+            knee_delta: 0.0,
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(epa.basis_count, 24);
     epa.as_view().validate("test").unwrap();
@@ -560,20 +540,19 @@ fn local_cone_ags_mgs2_fallback_and_zero_norm_insufficient_neighbors() {
         (NodeId(5), NodeId(0), 2.0),
     ];
 
-    let geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig {
-                semantic_gate_enabled: false,
-                ..Default::default()
-            },
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: SequenceSliceView::empty(),
-                explicit_edges: Some(&explicit_edges),
-            },
-        )
-        .unwrap();
+    let geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: SequenceSliceView::empty(),
+            explicit_edges: Some(&explicit_edges),
+        },
+        &LocalConeAgsConfig {
+            semantic_gate_enabled: false,
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .unwrap();
 
     assert!(geom.intrinsics[0].mgs2_fallback);
     assert!(geom.intrinsics[0].basis_used >= 2);
@@ -618,21 +597,20 @@ fn local_cone_ags_5adb12b_explain_mode_conditional_gain_recovery() {
         (NodeId(0), NodeId(3), 3.0),
     ];
 
-    let geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig {
-                semantic_gate_enabled: false,
-                min_gain: 0.015,
-                ..Default::default()
-            },
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: SequenceSliceView::empty(),
-                explicit_edges: Some(&explicit_edges),
-            },
-        )
-        .unwrap();
+    let geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: SequenceSliceView::empty(),
+            explicit_edges: Some(&explicit_edges),
+        },
+        &LocalConeAgsConfig {
+            semantic_gate_enabled: false,
+            min_gain: 0.015,
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .unwrap();
 
     // Both Node 2 and recovered Node 1 should be picked (2 basis vectors).
     assert_eq!(geom.intrinsics[0].basis_used, 2);
@@ -644,27 +622,25 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
 
     // Completely empty corpus.
     let empty_vecs = VectorMatrixView::<f32>::empty(8);
-    let empty_geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors: empty_vecs,
-                sequences: SequenceSliceView::empty(),
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
-    let epa_empty = GlobalEpaOperator
-        .execute(
-            &ctx,
-            &GlobalEpaConfig::default(),
-            GlobalEpaInput {
-                tag_vectors: empty_vecs,
-                geometry: &empty_geom,
-            },
-        )
-        .unwrap();
+    let empty_geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors: empty_vecs,
+            sequences: SequenceSliceView::empty(),
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
+    let epa_empty = global_epa(
+        GlobalEpaInput {
+            tag_vectors: empty_vecs,
+            geometry: &empty_geom,
+        },
+        &GlobalEpaConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     assert_eq!(epa_empty.dim, 8);
     assert_eq!(epa_empty.basis_count, 0);
     assert_eq!(epa_empty.mean, vec![0.0; 8]);
@@ -675,27 +651,25 @@ fn global_epa_empty_and_zero_norm_safe_degradation() {
     // All-zero-norm corpus.
     let zeros = [0.0_f32; 12];
     let zero_vecs = VectorMatrixView::new(&zeros, 3, 4).unwrap();
-    let zero_geom = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors: zero_vecs,
-                sequences: SequenceSliceView::empty(),
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
-    let epa_zero = GlobalEpaOperator
-        .execute(
-            &ctx,
-            &GlobalEpaConfig::default(),
-            GlobalEpaInput {
-                tag_vectors: zero_vecs,
-                geometry: &zero_geom,
-            },
-        )
-        .unwrap();
+    let zero_geom = local_cone(
+        LocalConeAgsInput {
+            tag_vectors: zero_vecs,
+            sequences: SequenceSliceView::empty(),
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
+    let epa_zero = global_epa(
+        GlobalEpaInput {
+            tag_vectors: zero_vecs,
+            geometry: &zero_geom,
+        },
+        &GlobalEpaConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     assert_eq!(epa_zero.basis_count, 0);
     assert_eq!(epa_zero.mean, vec![0.0; 4]);
 }
@@ -725,17 +699,15 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     };
     let anchor_gains = [1.0, 1.0, 1.5, 1.0];
 
-    let transport = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &fm,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
+    let transport = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &fm,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig::default(),
+        &ctx,
+    )
+    .unwrap();
     let view_sorted = transport.graph.view().as_csr();
     let view_linear = CsrGraphView::new(CsrParts {
         target_sorted_indices: None,
@@ -767,20 +739,18 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
     }
 
     // Hub exponent sign safety: -0.3 and +0.3 produce 0-bit identical hub penalty.
-    let tr_pos_exp = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig {
-                hub_penalty_exponent: 0.3,
-                ..Default::default()
-            },
-            TransportCalibrateInput {
-                fact_matrix: &fm,
-                anchor_gains: &anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
+    let tr_pos_exp = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &fm,
+            anchor_gains: &anchor_gains,
+        },
+        &TransportConfig {
+            hub_penalty_exponent: 0.3,
+            ..Default::default()
+        },
+        &ctx,
+    )
+    .unwrap();
     for (a, b) in transport
         .graph
         .view()
@@ -791,22 +761,13 @@ fn transport_calibrate_binary_search_edge_gates_mass_conservation_and_hub_sign()
         assert_eq!(a.to_bits(), b.to_bits());
     }
 
-    // Post-normalization edge_gates without redistribution:
-    // Gate edge 0 (0 -> 1) by 0.25, leave all others at 1.0.
-    let gates = [0.25, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-    let tr_gated = TransportCalibrateOperator
-        .execute(
-            &ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &fm,
-                anchor_gains: &anchor_gains,
-                edge_gates: Some(&gates),
-            },
-        )
-        .unwrap();
-    let view_gated = tr_gated.graph.view().as_csr();
-    view_gated.validate("test_gated").unwrap();
+    let edge = view_sorted.find_edge(NodeId(0), NodeId(1)).unwrap();
+    let mut gates = vec![1.0; view_sorted.nnz()];
+    gates[edge] = 0.25;
+    let gated = transport.graph.view().attenuate(&gates).unwrap();
+    let view_gated = gated.view();
+    assert_eq!(view_gated.targets, view_sorted.targets);
+    assert_eq!(view_gated.inbound, view_sorted.inbound);
 
     let w01_base = view_sorted.edge_weight(NodeId(0), NodeId(1));
     let w01_gated = view_gated.edge_weight(NodeId(0), NodeId(1));
@@ -835,7 +796,6 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
     ];
     let tag_vectors = VectorMatrixView::new(&vecs, 4, 4).unwrap();
     let seq_offsets = [0_u32, 4];
-    let seq_docs = [DocumentId(0)];
     let seq_roots = [RootId(9)];
 
     let sorted_tags = [NodeId(0), NodeId(1), NodeId(2), NodeId(3)];
@@ -844,83 +804,55 @@ fn unsorted_sequence_positions_match_sorted_bit_for_bit() {
     let unsorted_tags = [NodeId(3), NodeId(1), NodeId(0), NodeId(2)];
     let unsorted_pos = [7_u32, 2, 1, 4];
 
-    let g_sorted = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: make_seq_view(
-                    &seq_offsets,
-                    &seq_docs,
-                    &seq_roots,
-                    &sorted_tags,
-                    &sorted_pos,
-                ),
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
-    let g_unsorted = LocalConeAgsOperator
-        .execute(
-            &ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: make_seq_view(
-                    &seq_offsets,
-                    &seq_docs,
-                    &seq_roots,
-                    &unsorted_tags,
-                    &unsorted_pos,
-                ),
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
+    let g_sorted = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: make_seq_view(&seq_offsets, &seq_roots, &sorted_tags, &sorted_pos),
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
+    let g_unsorted = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: make_seq_view(&seq_offsets, &seq_roots, &unsorted_tags, &unsorted_pos),
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     for (a, b) in g_sorted.anchor_gains.iter().zip(&g_unsorted.anchor_gains) {
         assert_eq!(a.to_bits(), b.to_bits());
     }
 
-    let fm_sorted = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: make_seq_view(
-                    &seq_offsets,
-                    &seq_docs,
-                    &seq_roots,
-                    &sorted_tags,
-                    &sorted_pos,
-                ),
-                anchor_gains: &g_sorted.anchor_gains,
-                positive_relations: None,
-                negative_relations: None,
-            },
-        )
-        .unwrap();
-    let fm_unsorted = FactMatrixOperator
-        .execute(
-            &ctx,
-            &FactMatrixConfig::default(),
-            FactMatrixInput {
-                tag_vectors,
-                sequences: make_seq_view(
-                    &seq_offsets,
-                    &seq_docs,
-                    &seq_roots,
-                    &unsorted_tags,
-                    &unsorted_pos,
-                ),
-                anchor_gains: &g_unsorted.anchor_gains,
-                positive_relations: None,
-                negative_relations: None,
-            },
-        )
-        .unwrap();
+    let fm_sorted = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: make_seq_view(&seq_offsets, &seq_roots, &sorted_tags, &sorted_pos),
+            anchor_gains: &g_sorted.anchor_gains,
+            positive_relations: None,
+            negative_relations: None,
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
+    let fm_unsorted = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: make_seq_view(&seq_offsets, &seq_roots, &unsorted_tags, &unsorted_pos),
+            anchor_gains: &g_unsorted.anchor_gains,
+            positive_relations: None,
+            negative_relations: None,
+        },
+        &FactMatrixConfig::default(),
+        &ctx,
+    )
+    .unwrap();
 
     assert_eq!(
         fm_sorted.fact_matrix.targets,
@@ -984,34 +916,31 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
     ];
     let tag_vectors = VectorMatrixView::new(&vecs, 5, 4).unwrap();
     let seq_offsets = [0_u32, 5];
-    let seq_docs = [DocumentId(0)];
     let seq_roots = [RootId(50)];
     let tag_ids = [NodeId(0), NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
     let positions = [1_u32, 2, 3, 4, 5];
-    let seqs = make_seq_view(&seq_offsets, &seq_docs, &seq_roots, &tag_ids, &positions);
+    let seqs = make_seq_view(&seq_offsets, &seq_roots, &tag_ids, &positions);
 
-    let g_seq = LocalConeAgsOperator
-        .execute(
-            &seq_ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: seqs,
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
-    let g_par = LocalConeAgsOperator
-        .execute(
-            &par_ctx,
-            &LocalConeAgsConfig::default(),
-            LocalConeAgsInput {
-                tag_vectors,
-                sequences: seqs,
-                explicit_edges: None,
-            },
-        )
-        .unwrap();
+    let g_seq = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: seqs,
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &seq_ctx,
+    )
+    .unwrap();
+    let g_par = local_cone(
+        LocalConeAgsInput {
+            tag_vectors,
+            sequences: seqs,
+            explicit_edges: None,
+        },
+        &LocalConeAgsConfig::default(),
+        &par_ctx,
+    )
+    .unwrap();
 
     for (a, b) in g_seq.anchor_gains.iter().zip(&g_par.anchor_gains) {
         assert_eq!(a.to_bits(), b.to_bits());
@@ -1023,26 +952,24 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
         min_support: 1.0,
         ..Default::default()
     };
-    let epa_seq = GlobalEpaOperator
-        .execute(
-            &seq_ctx,
-            &epa_cfg,
-            GlobalEpaInput {
-                tag_vectors,
-                geometry: &g_seq,
-            },
-        )
-        .unwrap();
-    let epa_par = GlobalEpaOperator
-        .execute(
-            &par_ctx,
-            &epa_cfg,
-            GlobalEpaInput {
-                tag_vectors,
-                geometry: &g_par,
-            },
-        )
-        .unwrap();
+    let epa_seq = global_epa(
+        GlobalEpaInput {
+            tag_vectors,
+            geometry: &g_seq,
+        },
+        &epa_cfg,
+        &seq_ctx,
+    )
+    .unwrap();
+    let epa_par = global_epa(
+        GlobalEpaInput {
+            tag_vectors,
+            geometry: &g_par,
+        },
+        &epa_cfg,
+        &par_ctx,
+    )
+    .unwrap();
     assert_eq!(epa_seq.basis_count, epa_par.basis_count);
     for (a, b) in epa_seq.basis.iter().zip(&epa_par.basis) {
         assert_eq!(a.to_bits(), b.to_bits());
@@ -1052,48 +979,44 @@ fn parallel_policy_matches_sequential_bit_for_bit_and_semantic_fact_matrix() {
     }
 
     // Exercise semantic_gain_enabled + reverse_anchor_boost + sequence provenance.
-    let fm_out = FactMatrixOperator
-        .execute(
-            &seq_ctx,
-            &FactMatrixConfig {
-                semantic_gain_enabled: true,
-                reverse_anchor_boost: true,
-                distance_decay: 0.1,
-                ..Default::default()
-            },
-            FactMatrixInput {
-                tag_vectors,
-                sequences: seqs,
-                anchor_gains: &g_seq.anchor_gains,
-                positive_relations: None,
-                negative_relations: None,
-            },
-        )
-        .unwrap();
-    let tr = TransportCalibrateOperator
-        .execute(
-            &seq_ctx,
-            &TransportConfig::default(),
-            TransportCalibrateInput {
-                fact_matrix: &fm_out.fact_matrix,
-                anchor_gains: &g_seq.anchor_gains,
-                edge_gates: None,
-            },
-        )
-        .unwrap();
-    let prov = ProvenanceBuildOperator
-        .execute(
-            &seq_ctx,
-            &ProvenanceConfig::default(),
-            ProvenanceBuildInput {
-                transport_row_offsets: tr.graph.view().row_offsets,
-                transport_targets: tr.graph.view().targets,
-                sequences: seqs,
-                positive_relations: None,
-                support_groups: None,
-            },
-        )
-        .unwrap();
+    let fm_out = build_fact_matrix(
+        FactMatrixInput {
+            tag_vectors,
+            sequences: seqs,
+            anchor_gains: &g_seq.anchor_gains,
+            positive_relations: None,
+            negative_relations: None,
+        },
+        &FactMatrixConfig {
+            semantic_gain_enabled: true,
+            reverse_anchor_boost: true,
+            distance_decay: 0.1,
+            ..Default::default()
+        },
+        &seq_ctx,
+    )
+    .unwrap();
+    let tr = calibrate_transport(
+        TransportCalibrateInput {
+            fact_matrix: &fm_out.fact_matrix,
+            anchor_gains: &g_seq.anchor_gains,
+        },
+        &TransportConfig::default(),
+        &seq_ctx,
+    )
+    .unwrap();
+    let prov = build_provenance(
+        ProvenanceBuildInput {
+            transport_row_offsets: tr.graph.view().row_offsets,
+            transport_targets: tr.graph.view().targets,
+            sequences: seqs,
+            positive_relations: None,
+            support_groups: None,
+        },
+        &ProvenanceConfig::default(),
+        &seq_ctx,
+    )
+    .unwrap();
     assert_eq!(prov.edge_count, tr.graph.view().targets.len());
     assert_eq!(
         prov.as_view()

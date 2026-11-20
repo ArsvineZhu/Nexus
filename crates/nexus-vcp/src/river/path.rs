@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
 
-use super::{PathEvidence, QueryMode, QueryMorphology, RiverReadoutConfig, RiverReadoutInput};
+use super::{PathEvidence, QueryMode, QueryMorphology, RiverAnalysisConfig, RiverAnalysisInput};
 use nexus_core::kernel::{cosine_f32, cosine_f32_with_norms, norm_sq_f32};
 use nexus_core::{
     CandidateId, ExecutionContext, NodeId, PathId, PrecisionMode, VcpError, VcpResult,
@@ -42,8 +42,8 @@ struct GraphEvidence {
 
 #[derive(Clone)]
 pub(super) struct ReadoutWorkspace<'r, 'call, 'ctx> {
-    pub(super) input: RiverReadoutInput<'call>,
-    pub(super) config: &'r RiverReadoutConfig,
+    pub(super) input: RiverAnalysisInput<'call>,
+    pub(super) config: &'r RiverAnalysisConfig,
     pub(super) active: &'r HashMap<(NodeId, NodeId), f64>,
     pub(super) topology_edges: &'r [(crate::ObservationEdge, usize, f64)],
     pub(super) ordinary: &'r HashMap<NodeId, f64>,
@@ -52,7 +52,8 @@ pub(super) struct ReadoutWorkspace<'r, 'call, 'ctx> {
     pub(super) hops: &'r HashMap<NodeId, usize>,
     pub(super) focus_targets: &'r HashSet<NodeId>,
     pub(super) morphology: &'r QueryMorphology,
-    pub(super) path_gate: f64,
+    pub(super) features: &'r super::RiverFeatures,
+    pub(super) peak_energy: f64,
     pub(super) field_mix: [bool; 2],
     pub(super) fields: [&'r [f64]; 2],
     pub(super) tag_norms: HashMap<NodeId, f64>,
@@ -88,11 +89,10 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
             return Ok(cosine);
         }
         let count = self.pair_cosines.len();
-        let limit = self.ctx.limits.pair_work_limit;
-        if count >= limit {
+        if let Some(limit) = self.config.max_pair_cosines.filter(|&limit| count >= limit) {
             return Err(VcpError::ResourceLimitExceeded {
                 stage: STAGE,
-                limit_name: "pair_work_limit",
+                limit_name: "max_pair_cosines",
                 actual: count.saturating_add(1),
                 limit,
             });
@@ -111,8 +111,8 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let state = self.input.observation;
         let fields = self.fields;
         let domains = [
-            &self.input.features.fields().dual_fields.local_domain,
-            &self.input.features.fields().dual_fields.transfer_domain,
+            &self.input.fields.dual_fields.local_domain,
+            &self.input.fields.dual_fields.transfer_domain,
         ];
         let mut result = FieldContact {
             potential: fields.map(|field| field[tag.index()]),
@@ -149,8 +149,8 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let graph = self.input.graph;
         let fields = self.fields;
         let domains = [
-            &self.input.features.fields().dual_fields.local_domain,
-            &self.input.features.fields().dual_fields.transfer_domain,
+            &self.input.fields.dual_fields.local_domain,
+            &self.input.fields.dual_fields.transfer_domain,
         ];
         let mut used = HashSet::new();
         let mut quality = 0.0;
@@ -224,7 +224,7 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let threshold = self.config.tag_align_min_cos;
         for node in &state.sense.nodes {
             self.ctx.check_cancelled("river.readout")?;
-            let weight = node.normalized_energy.max(1e-9);
+            let weight = (node.energy / self.peak_energy).max(1e-9);
             total_node += weight;
             for (index, &step) in steps.iter().enumerate() {
                 let exact = node.node == step.node;
@@ -291,12 +291,7 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
             .first()
             .zip(steps.last())
             .map_or(1, |(a, b)| a.position.abs_diff(b.position).max(1)) as f64;
-        let roots = self
-            .input
-            .features
-            .query()
-            .rows()
-            .candidate_roots(candidate);
+        let roots = self.input.query.rows().candidate_roots(candidate);
         let [
             mut total_edge,
             mut matched_edge,
@@ -319,7 +314,7 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
             } else {
                 0.25
             };
-            let independent = if self.input.evidence
+            let independent = if self.config.evidence
                 == super::EvidencePolicy::FullWeightWhenUnattributed
                 && self.input.provenance.edge_prov_offsets[index]
                     == self.input.provenance.edge_prov_offsets[index + 1]
@@ -414,23 +409,24 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let input = self.input;
         let cfg = self.config;
         let state = input.observation;
-        let candidates = input.features.query().rows();
+        let candidates = input.query.rows();
         let vector = candidates.candidate_vectors.row(candidate.index()).unwrap();
         let precision = PrecisionMode::FastSimd;
         let (tags, positions) = path.map_or((&[][..], &[][..]), |path| candidates.path_steps(path));
         let differentia = &state.disambiguated.differentia_q_perp;
-        let raw = input.features.query().original_cosines()[candidate.index()].clamp(0.0, 1.0);
+        let raw = input.query.original_cosines()[candidate.index()].clamp(0.0, 1.0);
         if tags.is_empty() && differentia.is_none() {
             return Ok(PathEvidence {
                 path,
-                base: raw,
-                path_bonus: 0.0,
-                graph_bonus: 0.0,
+                base_score: raw,
+                path_topology_factor: 0.0,
+                graph_request_factor: 0.0,
                 path_quality: 0.0,
                 field_support: 0.0,
                 node_alignment: 0.0,
                 edge_coverage: 0.0,
-                ordinary_transport: 0.0,
+                ordinary_transport_factor: 0.0,
+                cross_file_transport_factor: 0.0,
                 genus_gate: 1.0,
                 anchor_contacts: 0,
             });
@@ -519,9 +515,9 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let transfer_weight = if self.field_mix[1] { 0.1 } else { 0.0 };
         let mass: f64 = local_weight + transfer_weight;
         let resonance = if mass > 0.0 {
-            (local_weight * input.features.local_cosines()[candidate.index()].clamp(0.0, 1.0)
+            (local_weight * self.features.local_cosines()[candidate.index()].clamp(0.0, 1.0)
                 + transfer_weight
-                    * input.features.transfer_cosines()[candidate.index()].clamp(0.0, 1.0))
+                    * self.features.transfer_cosines()[candidate.index()].clamp(0.0, 1.0))
                 / mass
         } else {
             query
@@ -535,10 +531,7 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
                     + 0.25 * local
                     + 0.15 * transfer))
             .clamp(0.0, 1.0);
-        let path_bonus = cfg.unified_budget_ct
-            * topology_raw
-            * ((geometry / 0.15).min(1.0) * raw).sqrt()
-            * self.path_gate;
+        let path_topology_factor = topology_raw * ((geometry / 0.15).min(1.0) * raw).sqrt();
 
         let evidence = self.topology(candidate, &steps)?;
         let node_branch = (evidence.node_coverage / 0.35).min(1.0);
@@ -562,13 +555,12 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
         let node_weight = 0.75 * self.morphology.atomic_weight
             + 0.25 * self.morphology.propositional_weight
             + 0.15 * self.morphology.narrative_weight;
-        let graph_bonus = cfg.unified_budget_ct
-            * (node_weight * evidence.node_score + (1.0 - node_weight) * evidence.edge_score)
+        let graph_request_factor = (node_weight * evidence.node_score
+            + (1.0 - node_weight) * evidence.edge_score)
             * confidence
             * direction
-            * grounding
-            * self.path_gate;
-        let ordinary_transport = if self.ordinary.is_empty() {
+            * grounding;
+        let ordinary_transport_factor = if self.ordinary.is_empty() {
             0.0
         } else {
             steps
@@ -576,20 +568,21 @@ impl<'call> ReadoutWorkspace<'_, 'call, '_> {
                 .filter_map(|step| {
                     self.ordinary
                         .get(&step.node)
-                        .map(|conductance| conductance * step.closure * self.path_gate)
+                        .map(|conductance| conductance * step.closure)
                 })
                 .fold(0.0_f64, f64::max)
         };
         Ok(PathEvidence {
             path,
-            base,
-            path_bonus,
-            graph_bonus,
+            base_score: base,
+            path_topology_factor,
+            graph_request_factor,
             path_quality: geometry,
             field_support: support,
             node_alignment: evidence.node_alignment,
             edge_coverage: evidence.edge_coverage,
-            ordinary_transport,
+            ordinary_transport_factor,
+            cross_file_transport_factor: 0.0,
             genus_gate: genus,
             anchor_contacts: anchors,
         })

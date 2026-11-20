@@ -53,7 +53,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
         let fit = nexus_core::nnls::solve_nnls_with_ids_f64(
             &query,
             &columns,
-            &ctx.limits,
+            columns.len(),
             &ctx.cancel,
             &mut NnlsWorkspace::default(),
         )
@@ -75,7 +75,7 @@ fn upstream_nnls_projection_and_cone_geometry() {
         matching_values(
             case,
             "unit coefficients",
-            &fit.weights,
+            &fit.direction_weights,
             &decode::<Vec<_>>(&case["weights"]),
             1e-10,
         );
@@ -98,21 +98,20 @@ fn upstream_nnls_projection_and_cone_geometry() {
             .enumerate()
             .map(|(index, weight)| (NodeId(0), NodeId(index as u32 + 1), weight))
             .collect();
-        let geometry = LocalConeAgsOperator
-            .execute(
-                &ctx,
-                &LocalConeAgsConfig {
-                    min_neighbors: 1,
-                    semantic_gate_enabled: false,
-                    ..LocalConeAgsConfig::default()
-                },
-                LocalConeAgsInput {
-                    tag_vectors: VectorMatrixView::new(&flat, vectors.len(), dim).unwrap(),
-                    sequences: SequenceSliceView::empty(),
-                    explicit_edges: Some(&edges),
-                },
-            )
-            .unwrap();
+        let geometry = local_cone(
+            LocalConeAgsInput {
+                tag_vectors: VectorMatrixView::new(&flat, vectors.len(), dim).unwrap(),
+                sequences: SequenceSliceView::empty(),
+                explicit_edges: Some(&edges),
+            },
+            &LocalConeAgsConfig {
+                min_neighbors: 1,
+                semantic_gate_enabled: false,
+                ..LocalConeAgsConfig::default()
+            },
+            &ctx,
+        )
+        .unwrap();
         let target = &geometry.intrinsics[0];
         assert_eq!(
             target.basis_used,
@@ -175,26 +174,29 @@ fn upstream_hypernym_and_dedup_contracts() {
             &[]
         };
         let config = HypernymConfig::default();
-        let result = HypernymPruneOperator
-            .execute(
-                &ctx,
-                &config,
-                HypernymPruneInput {
-                    query: &query,
-                    pyramid: &pyramid,
-                    tag_vectors: VectorMatrixView::new(&flat, vectors.len(), dim).unwrap(),
-                    lexical_meta: TagLexicalMetaView {
-                        node_count: vectors.len(),
-                        names: TextRows::Borrowed(&names),
-                        alias_offsets: &[0, 0, 0],
-                        aliases: TextRows::Borrowed(&[]),
-                    },
-                    core_tags: cores,
-                    seed_contribution_floor: 0.05,
-                    seed_contribution_ratio: 0.1,
+        let result = select_seeds(
+            SeedSelectionInput {
+                epa: &EpaAnalysis::default(),
+                query_text: "",
+                query: &query,
+                pyramid: &pyramid,
+                tag_vectors: VectorMatrixView::new(&flat, vectors.len(), dim).unwrap(),
+                lexical_meta: TagLexicalMetaView {
+                    node_count: vectors.len(),
+                    names: TextRows::Borrowed(&names),
+                    alias_offsets: &[0, 0, 0],
+                    aliases: TextRows::Borrowed(&[]),
                 },
-            )
-            .unwrap();
+                core_tags: cores,
+            },
+            &SeedSelectionConfig {
+                hypernym: Some(config.clone()),
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap()
+        .disambiguated;
         let parents: Vec<_> = decode::<Vec<u32>>(&case["parents"])
             .into_iter()
             .map(|id| NodeId(id - 1))
@@ -242,24 +244,19 @@ fn upstream_hypernym_and_dedup_contracts() {
         let vectors: Vec<Vec<f32>> = decode(&case["vectors"]);
         let flat: Vec<_> = vectors.iter().flatten().copied().collect();
         let ranks: Vec<_> = (0..vectors.len() as u32).map(CandidateId).collect();
-        let result = CosineDedupOperator
-            .execute(
-                &ctx,
-                &CosineDedupConfig {
-                    threshold: decode(&case["threshold"]),
-                    ..CosineDedupConfig::default()
-                },
-                CosineDedupInput {
-                    ranked: &ranks,
-                    candidate_vectors: VectorMatrixView::new(
-                        &flat,
-                        vectors.len(),
-                        vectors[0].len(),
-                    )
+        let result = cosine_dedup(
+            CosineDedupInput {
+                ranked: &ranks,
+                candidate_vectors: VectorMatrixView::new(&flat, vectors.len(), vectors[0].len())
                     .unwrap(),
-                },
-            )
-            .unwrap();
+            },
+            &CosineDedupConfig {
+                threshold: decode(&case["threshold"]),
+                ..CosineDedupConfig::default()
+            },
+            &ctx,
+        )
+        .unwrap();
         let upstream: Vec<_> = decode::<Vec<u32>>(&case["survivors"])
             .into_iter()
             .map(|id| CandidateId(id - 1))
@@ -294,7 +291,7 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldValues) {
             ObservationNode {
                 node: NodeId(id - 1),
                 energy: decode(&node["energy"]),
-                normalized_energy: decode(&node["normalizedEnergy"]),
+
                 hop: decode(&node["hop"]),
                 source_kind: match id {
                     1 => SeedSourceKind::Core,
@@ -339,7 +336,6 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldValues) {
                 differentia_confidence: decode(&calibration["differentiaConfidence"]),
                 differentia_q_perp: Some(decode(&calibration["differentiaVector"])),
                 pruned_hypernyms: ids(&calibration["supersededIds"]),
-                ..DisambiguatedTags::default()
             },
             gated_seeds: GatedSeeds {
                 exact_focus: Some(NodeId(decode::<u32>(&calibration["exactFocusId"]) - 1)),
@@ -352,10 +348,6 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldValues) {
             sense: SenseOutput {
                 nodes,
                 edges,
-                source_field: decode::<Vec<(u32, f64)>>(&state["sourceField"])
-                    .into_iter()
-                    .map(|(id, mass)| (NodeId(id - 1), mass))
-                    .collect(),
                 ..SenseOutput::default()
             },
         },
@@ -370,8 +362,8 @@ fn observation(input: &Value, count: usize) -> (ObservationState, FieldValues) {
                 ..DualFields::default()
             },
             basins: BasinSupports {
-                local_vector: decode(&input["localVector"]),
-                transfer_vector: decode(&input["transferVector"]),
+                local_direction: Some(decode(&input["localVector"])),
+                transfer_direction: Some(decode(&input["transferVector"])),
                 ..BasinSupports::default()
             },
         },
@@ -432,7 +424,7 @@ fn upstream_river_and_cross_file_wormhole_scores() {
         .unwrap();
         let candidates = CandidateRowsView {
             candidate_count: 3,
-            document_ids: &[DocumentId(0), DocumentId(1), DocumentId(2)],
+            document_ids: &[0, 1, 2],
             candidate_vectors: VectorMatrixView::new(&body_values, 3, 3).unwrap(),
             candidate_root_offsets: &[0; 4],
             candidate_roots: &[],
@@ -448,7 +440,6 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             &state.fused.enhanced_query,
         )
         .unwrap();
-        let features = RiverFeatures::prepare(&ctx, &query, &fields).unwrap();
         let has_provenance: bool = decode(&case["has_provenance"]);
         let provenance = if has_provenance {
             ProvenanceView {
@@ -465,49 +456,51 @@ fn upstream_river_and_cross_file_wormhole_scores() {
                 prov_masses: &[],
             }
         };
-        let base = RiverReadoutOperator
-            .execute(
-                &ctx,
-                &RiverReadoutConfig::default(),
-                RiverReadoutInput {
-                    observation: &state,
-                    evidence: EvidencePolicy::DiscountWhenUnattributed,
-                    features: &features,
-                    graph,
-                    provenance,
-                    support_groups: SupportGroupView::empty(),
-                    tag_vectors,
-                },
-            )
-            .unwrap();
-        let result = if wormhole {
-            let roots: Vec<Vec<u32>> = decode(&case["witness_tags"]);
-            let root_tags: Vec<_> = roots.iter().flatten().map(|id| NodeId(*id - 1)).collect();
-            let offsets = [0, roots[0].len() as u32, root_tags.len() as u32];
-            CrossFileWormholeOperator
-                .execute(
-                    &ctx,
-                    &CrossFileWormholeConfig::default(),
-                    CrossFileWormholeInput {
-                        observation: &state,
-                        readout: &base,
-                        features: &features,
-                        graph,
-                        root_facts: RootFactView {
-                            root_count: 2,
-                            checksum_hashes: &[1, 2],
-                            root_tag_offsets: &offsets,
-                            root_tags: &root_tags,
-                            root_req_offsets: &[0, 1, 2],
-                            root_required_roots: &[RootId(0), RootId(1)],
-                        },
-                        tag_vectors,
-                    },
-                )
-                .unwrap()
+        let roots: Vec<Vec<u32>> = if wormhole {
+            decode(&case["witness_tags"])
         } else {
-            base
+            Vec::new()
         };
+        let root_tags: Vec<_> = roots.iter().flatten().map(|id| NodeId(*id - 1)).collect();
+        let offsets = [
+            0,
+            roots.first().map_or(0, |tags| tags.len() as u32),
+            root_tags.len() as u32,
+        ];
+        let root_facts = wormhole.then_some(RootFactView {
+            root_count: 2,
+            checksum_hashes: &[1, 2],
+            root_tag_offsets: &offsets,
+            root_tags: &root_tags,
+            root_req_offsets: &[0, 1, 2],
+            root_required_roots: &[RootId(0), RootId(1)],
+        });
+        let result = prepare_river_evidence(
+            RiverAnalysisInput {
+                observation: &state,
+                query: &query,
+                fields: &fields,
+                graph,
+                provenance,
+                support_groups: SupportGroupView::empty(),
+                tag_vectors,
+                root_facts,
+            },
+            &RiverAnalysisConfig {
+                evidence: EvidencePolicy::DiscountWhenUnattributed,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap()
+        .readout(
+            &RiverScoringConfig {
+                unified_budget_ct: VCP_TOPOLOGY_BUDGET,
+                ..Default::default()
+            },
+            &ctx,
+        )
+        .unwrap();
         close(
             case,
             "omega",
@@ -534,47 +527,47 @@ fn upstream_river_and_cross_file_wormhole_scores() {
             close(
                 case,
                 &name("Genus Gate"),
-                item.genus_gate,
+                item.scores.genus_gate,
                 decode(&expected["genus_gate"]),
                 2e-7,
             );
             close(
                 case,
                 &name("semantic base"),
-                item.base_score,
+                item.scores.base_score,
                 decode(&expected["base_score"]),
                 2e-7,
             );
             close(
                 case,
                 &name("path bonus"),
-                item.path_bonus,
+                item.scores.path_bonus,
                 decode(&expected["path_bonus"]),
                 2e-7,
             );
             if !has_provenance && item.candidate == CandidateId(1) {
                 // The upstream assumes complete independence when attribution
                 // is absent. The discount policy uses its 0.15 floor.
-                assert!(item.graph_bonus < decode::<f64>(&expected["graph_bonus"]));
+                assert!(item.scores.graph_bonus < decode::<f64>(&expected["graph_bonus"]));
                 close(
                     case,
                     &name("quality sum"),
-                    item.score,
-                    item.base_score + item.path_bonus + item.graph_bonus,
+                    item.scores.score,
+                    item.scores.base_score + item.scores.path_bonus + item.scores.graph_bonus,
                     1e-12,
                 );
             } else {
                 close(
                     case,
                     &name("graph and transport bonus"),
-                    item.graph_bonus,
+                    item.scores.graph_bonus,
                     decode(&expected["graph_bonus"]),
                     2e-7,
                 );
                 close(
                     case,
                     &name("quality"),
-                    item.score,
+                    item.scores.score,
                     decode(&expected["score"]),
                     2e-7,
                 );
