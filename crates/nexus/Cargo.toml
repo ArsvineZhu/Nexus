@@ -8,22 +8,17 @@ publish = false
 description = "In-memory composable numerical and retrieval algorithms"
 
 [features]
-schemars = ["nexus-core/schemars", "nexus-math/schemars", "nexus-vcp/schemars"]
+schemars = ["nexus-math/schemars", "dep:schemars"]
 
 [dependencies]
-nexus-core.workspace = true
 nexus-math.workspace = true
-nexus-vcp.workspace = true
-
-[dev-dependencies]
-criterion.workspace = true
 rayon.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+schemars = { workspace = true, optional = true }
 
-[[bench]]
-name = "frozen"
-harness = false
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

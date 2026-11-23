@@ -1,14 +1,12 @@
 # Live vector retrieval
 
-The example embeds ten passages, concept tags and seven queries through an OpenAI-compatible endpoint. Nexus prepares the math assets and optional warped Tag and Chunk indexes. Each query builds one observation, recalls an ordered candidate set, and evaluates that set once. River, DTSC and Thinking use the same evaluation.
+The Python host embeds the demo passages, concepts, and queries through an OpenAI-compatible gateway. The Rust example loads those vectors, builds the relation model, observes each query, and sends its available directions through independent cosine recall. It compares raw recall, expanded candidate pools, and several readouts.
 
-Supply the gateway's `/v1` endpoint and embedding model explicitly. Pass an authorized key in `NEXUS_EMBEDDING_KEY`. The generated vectors can be kept in the local `temp/` directory and replayed without calling the model again.
+Set the gateway's `/v1` endpoint and model, and supply its token in `NEXUS_EMBEDDING_KEY`.
 
-```sh
-python scripts/live-retrieval.py temp/live-retrieval/embeddings.json --endpoint "$EMBEDDING_ENDPOINT" --model "$EMBEDDING_MODEL"
-cargo run -p nexus --example live_retrieval --locked -- temp/live-retrieval/embeddings.json
-```
+~~~sh
+python scripts/live-retrieval.py temp/live-vectors --endpoint "$EMBEDDING_ENDPOINT" --model "$EMBEDDING_MODEL"
+cargo run -p nexus --example retrieval_study --release --locked -- temp/live-vectors
+~~~
 
-To compare embedding widths, run the exporter with `--dimensions` set to a width your model supports. Keep concepts, passages and queries in the same model and dimension for each run.
-
-The output shows the expected rank, River score, DTSC result count and number of grounded routes. Use the [frozen corpus benchmark](benchmarks.md) for larger host-style inputs.
+The exporter supports `--dimensions` for models that accept a requested dimension. Each run uses one embedding space for concepts, candidates, and queries. The exported directory can be replayed without another gateway call. For a larger labeled study, see [retrieval evaluation](benchmarks.md).

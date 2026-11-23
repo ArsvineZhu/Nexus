@@ -1,619 +1,88 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nexus_math::nexus_core::{
-    CancellationToken, CandidateId, CandidateRowsView, CsrGraph, CsrStorage, ExecutionContext,
-    NodeId, PathId, QueryCosines, TransportGraph, TransportGraphView, VcpError, VcpResult,
-    VectorMatrixView,
+use nexus_math::dtsc::{
+    DtscAuxConfig, DtscEvidenceConfig, DtscFallbackReason, DtscFieldConfig, DtscIdentityConfig,
+    DtscReadoutConfig, DtscRewardConfig, DtscTrustConfig, EnergyNode, EvidenceClass, EvidenceInput,
+    EvidenceOptions, EvidenceSource, FieldOptions, GeometryState, Path, ReadoutOptions,
+    SampleInput, build_field, evidence, sample_field,
 };
 use nexus_math::{
-    DtscAuxConfig, DtscConfig, DtscDecision, DtscEvidenceConfig, DtscEvidenceInput,
-    DtscEvidenceValues, DtscFallbackOrder, DtscFallbackReason, DtscFieldBuildInput,
-    DtscFieldConfig, DtscFieldSampler, DtscFieldValues, DtscGeometryState, DtscIdentityConfig,
-    DtscNodeInput, DtscOutput, DtscReadoutConfig, DtscRewardConfig, DtscSourceType,
-    DtscTrustConfig, build_dtsc_field, dtsc_cosine, prepare_dtsc_evidence, readout_dtsc,
+    CancelToken, DtscDecision, Error, Parallelism, RunOptions, Scores, TransportGraph, VectorRows,
+    WeightedEdge,
 };
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-struct CandidateRows {
-    matrix: Vec<f32>,
-    dim: usize,
-    document_ids: Vec<u64>,
-    root_offsets: Vec<u32>,
-    candidate_path_offsets: Vec<u32>,
-    path_tag_offsets: Vec<u32>,
-    path_tags: Vec<NodeId>,
-    path_positions: Vec<u32>,
-}
-
-type Steps = Vec<(NodeId, u32)>;
-type Candidate = (Vec<f32>, Vec<Steps>);
-
-impl CandidateRows {
-    fn new(dim: usize, items: &[Candidate]) -> Self {
-        let mut rows = Self {
-            matrix: Vec::new(),
-            dim,
-            document_ids: (0..items.len() as u64).collect(),
-            root_offsets: vec![0; items.len() + 1],
-            candidate_path_offsets: vec![0],
-            path_tag_offsets: vec![0],
-            path_tags: Vec::new(),
-            path_positions: Vec::new(),
-        };
-        for (vector, paths) in items {
-            rows.matrix.extend_from_slice(vector);
-            for path in paths {
-                for &(node, position) in path {
-                    rows.path_tags.push(node);
-                    rows.path_positions.push(position);
-                }
-                rows.path_tag_offsets.push(rows.path_tags.len() as u32);
-            }
-            rows.candidate_path_offsets
-                .push((rows.path_tag_offsets.len() - 1) as u32);
-        }
-        rows
-    }
-
-    fn view(&self) -> CandidateRowsView<'_> {
-        CandidateRowsView {
-            candidate_count: self.document_ids.len(),
-            document_ids: &self.document_ids,
-            candidate_vectors: VectorMatrixView::new(
-                &self.matrix,
-                self.document_ids.len(),
-                self.dim,
-            )
-            .unwrap(),
-            candidate_root_offsets: &self.root_offsets,
-            candidate_roots: &[],
-            candidate_path_offsets: &self.candidate_path_offsets,
-            path_tag_offsets: &self.path_tag_offsets,
-            path_tags: &self.path_tags,
-            path_positions: &self.path_positions,
-        }
-    }
-}
-
-fn graph(
-    node_count: usize,
-    edges: &[(usize, usize, f64)],
-    inbound: Vec<f64>,
-    anchor_gains: Vec<f64>,
-) -> TransportGraph {
-    let mut adjacency = vec![Vec::new(); node_count];
-    for &(source, target, weight) in edges {
-        adjacency[source].push((NodeId(target as u32), weight));
-    }
-    let mut row_offsets = vec![0];
-    let mut targets = Vec::new();
-    let mut weights = Vec::new();
-    for row in &mut adjacency {
-        row.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for &(target, weight) in row.iter() {
-            targets.push(target);
-            weights.push(weight);
-        }
-        row_offsets.push(targets.len());
-    }
-    let max_inbound = inbound.iter().copied().fold(0.0, f64::max);
-    let csr = CsrGraph::new(CsrStorage {
-        node_count,
-        row_offsets,
-        targets,
-        is_static_wormhole: vec![false; weights.len()],
-        weights,
-        inbound,
-        max_inbound,
-        anchor_gains,
-        target_sorted_indices: None,
-    })
-    .unwrap();
-    TransportGraph::new(csr).unwrap()
-}
-
-fn empty_graph(node_count: usize) -> TransportGraph {
-    graph(
-        node_count,
-        &[],
-        vec![0.0; node_count],
-        vec![1.0; node_count],
-    )
-}
-
-fn unit_vector(dim: usize, hot_index: usize) -> Vec<f32> {
-    let mut vector = vec![0.0; dim];
-    vector[hot_index] = 1.0;
-    vector
-}
-
-fn path(tags: &[u32]) -> Steps {
-    tags.iter()
-        .enumerate()
-        .map(|(i, &node)| (NodeId(node), i as u32 + 1))
-        .collect()
-}
-
-fn seeds(values: &[(u32, f64)]) -> Vec<DtscNodeInput> {
-    values
-        .iter()
-        .map(|&(node, energy)| DtscNodeInput {
-            node: NodeId(node),
-            mass: energy,
-
-            source_type: DtscSourceType::Seed,
-        })
-        .collect()
-}
-
-fn build_field(
-    nodes: &[DtscNodeInput],
-    tag_vectors: VectorMatrixView<'_, f32>,
-    config: &DtscFieldConfig,
-) -> DtscFieldValues {
-    build_dtsc_field(
-        DtscFieldBuildInput { nodes, tag_vectors },
-        config,
-        &ExecutionContext::default(),
-    )
-    .unwrap()
-}
-
-fn evidence(
-    field: &DtscFieldValues,
-    query: &QueryCosines<'_, '_>,
-    graph: TransportGraphView<'_>,
-    tag_vectors: VectorMatrixView<'_, f32>,
-    config: &DtscEvidenceConfig,
-) -> VcpResult<DtscEvidenceValues> {
-    prepare_dtsc_evidence(
-        DtscEvidenceInput {
-            field,
-            query,
-            graph,
-            tag_vectors,
-            geometry: DtscGeometryState::default(),
-        },
-        config,
-        &ExecutionContext::default(),
-    )
-}
-
-fn readout(evidence: &DtscEvidenceValues, config: &DtscReadoutConfig) -> DtscOutput {
-    readout_dtsc(evidence, config, &ExecutionContext::default()).unwrap()
-}
-
-#[test]
-fn evidence_is_candidate_local_and_fallback_uses_the_entire_pool() {
-    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
-    let nodes = seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]);
-    let field = build_field(&nodes, tags, &DtscFieldConfig::default());
-    close("entropy", field.field_entropy(), 1.0);
-    let graph = empty_graph(3);
-    let contacted = (vec![1.0, 0.0], vec![path(&[0])]);
-    let no_path = (vec![0.0, 1.0], vec![]);
-    let a = CandidateRows::new(2, std::slice::from_ref(&contacted));
-    let b = CandidateRows::new(2, &[no_path.clone(), contacted]);
-    let ctx = ExecutionContext::default();
-    let q = [1.0, 0.0];
-    let a_query = QueryCosines::prepare(&ctx, a.view(), &q, &q).unwrap();
-    let b_query = QueryCosines::prepare(&ctx, b.view(), &q, &q).unwrap();
-    let scoring = DtscEvidenceConfig::default();
-    let a_evidence = evidence(&field, &a_query, graph.view(), tags, &scoring).unwrap();
-    let b_evidence = evidence(&field, &b_query, graph.view(), tags, &scoring).unwrap();
-    let a_contact = &a_evidence.items()[0];
-    let b_contact = &b_evidence.items()[1];
-    assert_eq!(
-        a_contact.scores.geo_score.to_bits(),
-        b_contact.scores.geo_score.to_bits()
-    );
-    assert_eq!(
-        a_contact.scores.geo_bonus.to_bits(),
-        b_contact.scores.geo_bonus.to_bits()
-    );
-    assert_eq!(b_contact.chosen_path, Some(PathId(0)));
-    assert!(b_contact.scores.geo_bonus > 0.0);
-
-    let mut config = DtscReadoutConfig {
-        trust: DtscTrustConfig {
-            min_geo_score: 1.0,
-            min_strong_evidence: 100.0,
-            min_candidate_coverage: 0.75,
-            ..Default::default()
-        },
-        ..Default::default()
+fn fixture(name: &str) -> Value {
+    let source = match name {
+        "field" => include_str!("fixtures/vcp-dtsc-field.json"),
+        "curve" => include_str!("fixtures/vcp-dtsc.json"),
+        _ => unreachable!(),
     };
-    let alone = readout(&a_evidence, &config);
-    assert_eq!(alone.decision, DtscDecision::Scored);
-    assert!(alone.results[0].scores.score > 1.0);
-    let mixed = readout(&b_evidence, &config);
-    assert_eq!(
-        mixed.decision,
-        DtscDecision::Fallback {
-            reason: DtscFallbackReason::InsufficientCandidateCoverage,
-            order: DtscFallbackOrder::OriginalCosine,
-        }
-    );
-    assert_eq!(
-        mixed
-            .results
-            .iter()
-            .map(|item| item.scores.score)
-            .collect::<Vec<_>>(),
-        [1.0, 0.0]
-    );
-    for item in &mixed.results {
-        assert_eq!(item.scores.score, item.scores.original_cosine);
-        assert_eq!(item.scores.geo_bonus, 0.0);
-        assert_eq!(item.scores.geo_base_bonus, 0.0);
-        assert_eq!(item.scores.geo_aux_bonus, 0.0);
-        assert_eq!(item.scores.geo_effect, "neutral");
+    serde_json::from_str(source).unwrap()
+}
+
+fn fixture_kind(value: &Value) -> Option<EvidenceSource> {
+    match value.as_str().unwrap() {
+        "core" => Some(EvidenceSource::Core),
+        "seed" => Some(EvidenceSource::Lexical),
+        "emergent" => Some(EvidenceSource::Emergent),
+        "inferred" => Some(EvidenceSource::Inferred),
+        "unknown" => None,
+        _ => panic!("unknown field source type: {value}"),
     }
-    assert!(b_evidence.items()[1].scores.geo_bonus > 0.0);
-
-    config.top_k = 1;
-    let dense_fallback = readout(&b_evidence, &config);
-    assert_eq!(dense_fallback.results[0].candidate, CandidateId(1));
-    config.fallback_order = DtscFallbackOrder::InputOrder;
-    let host_fallback = readout(&b_evidence, &config);
-    assert_eq!(
-        host_fallback.decision,
-        DtscDecision::Fallback {
-            reason: DtscFallbackReason::InsufficientCandidateCoverage,
-            order: DtscFallbackOrder::InputOrder,
-        }
-    );
-    assert_eq!(host_fallback.results[0].candidate, CandidateId(0));
-
-    config.fallback_on_low_trust = false;
-    config.fallback_order = DtscFallbackOrder::OriginalCosine;
-    let first = readout(&b_evidence, &config);
-    assert_eq!(first.decision, DtscDecision::Scored);
-    assert_eq!(first.available, 2);
-    assert_eq!(first.results.len(), 1);
-    assert_eq!(first.results[0].candidate, CandidateId(1));
-    close(
-        "default weighted score",
-        first.results[0].scores.score,
-        b_contact.scores.original_cosine + 0.15 * b_contact.scores.geo_bonus,
-    );
-
-    let short = build_field(&nodes[..1], tags, &DtscFieldConfig::default());
-    let short_evidence = evidence(&short, &a_query, graph.view(), tags, &scoring).unwrap();
-    assert_eq!(
-        readout(&short_evidence, &config).decision,
-        DtscDecision::Fallback {
-            reason: DtscFallbackReason::InsufficientFieldSupport,
-            order: DtscFallbackOrder::OriginalCosine,
-        }
-    );
-    let cold = CandidateRows::new(2, &[no_path]);
-    let cold_query = QueryCosines::prepare(&ctx, cold.view(), &q, &q).unwrap();
-    let cold_evidence = evidence(&field, &cold_query, graph.view(), tags, &scoring).unwrap();
-    assert_eq!(
-        readout(&cold_evidence, &config).decision,
-        DtscDecision::Fallback {
-            reason: DtscFallbackReason::NoCurveContact,
-            order: DtscFallbackOrder::OriginalCosine,
-        }
-    );
 }
 
-#[test]
-fn identity_auxiliary_adds_the_expected_reward() {
-    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
-    let field = build_field(
-        &seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
-        tags,
-        &DtscFieldConfig::default(),
-    );
-    let graph = empty_graph(3);
-    let rows = CandidateRows::new(2, &[(vec![1.0, 0.0], vec![path(&[0])])]);
-    let q = [1.0, 0.0];
-    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
-    let mut config = DtscEvidenceConfig {
-        reward: DtscRewardConfig {
-            alpha: 0.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let disabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let baseline = &disabled.items()[0];
-    assert_eq!(baseline.scores.geo_base_bonus, 0.0);
-    assert_eq!(baseline.scores.geo_aux_bonus, 0.0);
-    assert_eq!(baseline.scores.auxiliary_evidence, None);
-    config.auxiliary = Some(DtscAuxConfig::default());
-    let geometry = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let item = &geometry.items()[0];
-    let auxiliary = item.scores.auxiliary_evidence.unwrap();
-    assert!(auxiliary.geometry_floor > 0.0);
-    assert_eq!(auxiliary.identity_floor, 0.0);
-    close(
-        "geometry-only auxiliary bonus",
-        item.scores.geo_aux_bonus,
-        auxiliary.geometry_floor,
-    );
-
-    config.auxiliary = Some(DtscAuxConfig {
-        identity_anchor: Some(DtscIdentityConfig::default()),
-        ..Default::default()
-    });
-    let enabled = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let result = readout(
-        &enabled,
-        &DtscReadoutConfig {
-            geometry_weight: 1.0,
-            ..Default::default()
-        },
-    );
-    let item = &result.results[0];
-    let auxiliary = item.scores.auxiliary_evidence.unwrap();
-    assert!(auxiliary.shadow_score > 0.0);
-    close("identity floor", auxiliary.identity_floor, 0.018);
-    close("auxiliary bonus", item.scores.geo_aux_bonus, 0.018);
-    close("score", item.scores.score, 1.018);
-    assert!(item.scores.geo_bonus <= config.reward.direct_bonus_cap);
-}
-
-#[test]
-fn inferred_contact_contributes_structure_without_a_direct_anchor() {
-    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
-    let mut nodes = seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]);
-    let graph = empty_graph(3);
-    let rows = CandidateRows::new(2, &[(vec![1.0, 0.0], vec![path(&[0])])]);
-    let q = [1.0, 0.0];
-    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
-    let score = |nodes: &[DtscNodeInput]| {
-        let field = build_field(nodes, tags, &DtscFieldConfig::default());
-        evidence(
-            &field,
-            &query,
-            graph.view(),
-            tags,
-            &DtscEvidenceConfig::default(),
-        )
-        .unwrap()
-        .items()[0]
-            .scores
-            .clone()
-    };
-
-    let direct = score(&nodes);
-    nodes[0].source_type = DtscSourceType::Inferred;
-    let inferred = score(&nodes);
-
-    assert_eq!(direct.geo_evidence_class, "direct");
-    assert_eq!(inferred.geo_evidence_class, "structural");
-    assert_eq!(inferred.geo_exact_hits, direct.geo_exact_hits);
-    assert!(inferred.geo_bonus > 0.0 && inferred.geo_bonus < direct.geo_bonus);
-}
-
-#[test]
-fn sparse_association_uses_effective_transport_edges() {
-    let directions = [
-        [0.9, 0.4, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.85, 0.5, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.88, 0.45, 0.0, 0.0],
-    ]
-    .concat();
-    let tags = VectorMatrixView::new(&directions, 5, 4).unwrap();
-    let field = build_field(
-        &seeds(&[(0, 1.0), (2, 0.9), (4, 0.85)]),
-        tags,
-        &DtscFieldConfig::default(),
-    );
-    let graph = graph(
-        5,
-        &[(0, 2, 0.5), (2, 4, 0.7), (0, 4, 0.5)],
-        vec![0.1; 5],
-        vec![1.0; 5],
-    );
-    let q = unit_vector(4, 0);
-    let rows = CandidateRows::new(4, &[(q.clone(), vec![path(&[0, 1, 2, 3, 4])])]);
-    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
-    let mut config = DtscEvidenceConfig::default();
-    let with_relief = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let zeros = [0.0; 3];
-    let gated = graph.view().with_edge_gates(&zeros).unwrap();
-    let with_gate = evidence(&field, &query, gated, tags, &config).unwrap();
-    config.sparse.enabled = false;
-    let without_relief = evidence(&field, &query, graph.view(), tags, &config).unwrap();
-    let on = &with_relief.items()[0];
-    let off = &without_relief.items()[0];
-    assert!(on.scores.geo_isolated_ratio < off.scores.geo_isolated_ratio);
-    assert!(on.scores.geo_score > off.scores.geo_score);
-    assert_eq!(
-        off.scores.geo_isolated_ratio.to_bits(),
-        with_gate.items()[0].scores.geo_isolated_ratio.to_bits()
-    );
-}
-
-#[test]
-fn full_path_scoring_keeps_path_identity_and_stable_ties() {
-    let dim = 6;
-    let tag_data = (0..dim)
-        .flat_map(|i| unit_vector(dim, i))
-        .collect::<Vec<_>>();
-    let tags = VectorMatrixView::new(&tag_data, dim, dim).unwrap();
-    let field = build_field(
-        &seeds(&[(0, 1.0), (1, 0.9), (2, 0.85)]),
-        tags,
-        &DtscFieldConfig::default(),
-    );
-    let graph = graph(
-        dim,
-        &[(0, 1, 0.9), (1, 2, 0.8)],
-        vec![0.1; dim],
-        vec![1.0; dim],
-    );
-    let q = vec![0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
-    let strong = path(&[0, 1, 2]);
-    let rows = CandidateRows::new(
-        dim,
-        &[
-            (
-                q.clone(),
-                vec![path(&[4, 5]), strong.clone(), strong.clone()],
-            ),
-            (q.clone(), vec![strong]),
-            (q.clone(), vec![path(&[0]), path(&[1])]),
-        ],
-    );
-    let query = QueryCosines::prepare(&ExecutionContext::default(), rows.view(), &q, &q).unwrap();
-    let raw = evidence(
-        &field,
-        &query,
-        graph.view(),
-        tags,
-        &DtscEvidenceConfig::default(),
-    )
-    .unwrap();
-    assert_eq!(raw.items()[0].chosen_path, Some(PathId(1)));
-    assert_eq!(
-        raw.items()[0].scores.score.to_bits(),
-        raw.items()[1].scores.score.to_bits()
-    );
-    assert_eq!(raw.items()[0].scores.geo_hit_count, 3);
-    assert_eq!(raw.items()[2].scores.geo_hit_count, 1);
-    assert!(raw.items()[0].scores.score > raw.items()[2].scores.score);
-    let result = readout(
-        &raw,
-        &DtscReadoutConfig {
-            top_k: 2,
-            ..Default::default()
-        },
-    );
-    assert_eq!(
-        result
-            .results
-            .iter()
-            .map(|item| item.candidate)
-            .collect::<Vec<_>>(),
-        [CandidateId(0), CandidateId(1)]
-    );
-}
-
-#[test]
-fn trust_rejects_an_undifferentiated_pool_until_policy_changes() {
-    let tags = VectorMatrixView::new(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 3, 2).unwrap();
-    let field = build_field(
-        &seeds(&[(0, 1.0), (1, 1.0), (2, 1.0)]),
-        tags,
-        &DtscFieldConfig::default(),
-    );
-    let graph = empty_graph(3);
-    let row = (vec![1.0, 0.0], vec![path(&[0])]);
-    let rows = CandidateRows::new(2, &[row.clone(), row]);
-    let q = [1.0, 0.0];
-    let ctx = ExecutionContext::default();
-    let query = QueryCosines::prepare(&ctx, rows.view(), &q, &q).unwrap();
-    let evidence = evidence(
-        &field,
-        &query,
-        graph.view(),
-        tags,
-        &DtscEvidenceConfig::default(),
-    )
-    .unwrap();
-    let mut config = DtscReadoutConfig {
-        trust: DtscTrustConfig {
-            min_geo_score: 1.0,
-            min_strong_evidence: 100.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    assert_eq!(
-        readout(&evidence, &config).decision,
-        DtscDecision::Fallback {
-            reason: DtscFallbackReason::InsufficientScoreSpread,
-            order: DtscFallbackOrder::OriginalCosine,
-        }
-    );
-    config.fallback_on_low_trust = false;
-    assert_eq!(readout(&evidence, &config).decision, DtscDecision::Scored);
-
-    let flag = AtomicBool::new(false);
-    let ctx = ExecutionContext {
-        cancel: CancellationToken::from_atomic(&flag),
-        ..Default::default()
-    };
-    flag.store(true, Ordering::Relaxed);
-    let cancelled = readout_dtsc(&evidence, &config, &ctx);
-    assert!(matches!(cancelled, Err(VcpError::Cancelled { .. })));
-}
-
-#[test]
-fn config_deserialization_and_validation_follow_stage_ownership() {
-    let config: DtscConfig = serde_json::from_value(serde_json::json!({
-        "scoring": {
-            "evidence": {"reward": {"alpha": 0.2}},
-            "readout": {"top_k": 7, "trust": {"min_field_entropy": 0.5}}
-        }
-    }))
-    .unwrap();
-    config.validate().unwrap();
-    assert_eq!(config.scoring.readout.trust.min_field_entropy, 0.5);
-    assert_eq!(config.scoring.evidence.reward.alpha, 0.2);
-    assert_eq!(config.scoring.readout.top_k, 7);
-    assert!(serde_json::from_value::<DtscConfig>(serde_json::json!({"top_k": 7})).is_err());
-    let mut invalid_evidence = config.scoring.evidence;
-    invalid_evidence.curve.weak_contact_threshold = 0.9;
-    assert!(matches!(
-        invalid_evidence.validate(),
-        Err(VcpError::InvalidInput { .. })
-    ));
-    let mut invalid_readout = config.scoring.readout;
-    invalid_readout.trust.min_strong_evidence = f64::NAN;
-    assert!(matches!(
-        invalid_readout.validate(),
-        Err(VcpError::InvalidInput { .. })
-    ));
-}
-
-#[cfg(feature = "schemars")]
-#[test]
-fn config_schema_describes_scoring_inputs() {
-    let schema = serde_json::to_value(schemars::schema_for!(DtscConfig)).unwrap();
-    let scoring = &schema["$defs"]["DtscScoringConfig"]["properties"];
-    assert!(scoring.get("evidence").is_some() && scoring.get("readout").is_some());
-}
-
-fn fixture_matrix(input: &Value, dim: usize) -> Vec<f32> {
-    let rows: Vec<(usize, Vec<f32>)> =
-        serde_json::from_value(input["tag_vectors"].clone()).unwrap();
-    let count = rows.iter().map(|(id, _)| *id).max().unwrap_or(0);
-    let mut values = vec![0.0; count * dim];
-    for (id, vector) in rows {
-        values[(id - 1) * dim..id * dim].copy_from_slice(&vector);
-    }
-    values
-}
-
-fn fixture_nodes(input: &Value) -> Vec<DtscNodeInput> {
+fn nodes(input: &Value) -> Vec<EnergyNode> {
     input["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|node| DtscNodeInput {
-            node: NodeId((node["id"].as_u64().unwrap() - 1) as u32),
-            mass: node["energy"].as_f64().unwrap(),
-
-            source_type: serde_json::from_value(node["sourceType"].clone()).unwrap(),
+        .map(|node| EnergyNode {
+            concept: node["id"].as_u64().unwrap(),
+            energy: node["energy"].as_f64().unwrap(),
+            kind: fixture_kind(&node["sourceType"]).unwrap(),
+            hop: node["hop"].as_u64().unwrap_or(0) as usize,
+            seed: node["seedId"].as_u64(),
         })
         .collect()
 }
 
-fn fixture_weights(input: &Value, field: &str, count: usize, default: f64) -> Vec<f64> {
-    let mut values = vec![default; count];
-    for (id, mass) in serde_json::from_value::<Vec<(usize, f64)>>(input[field].clone()).unwrap() {
-        values[id - 1] = mass;
-    }
-    values
+fn fixture_vectors(value: &Value) -> (Vec<u64>, Vec<f32>) {
+    let rows: Vec<(u64, Vec<f32>)> = serde_json::from_value(value.clone()).unwrap();
+    rows.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut ids, mut values), (id, row)| {
+            ids.push(id);
+            values.extend(row);
+            (ids, values)
+        },
+    )
+}
+
+fn graph(ids: &[u64], input: &Value) -> TransportGraph {
+    let edges: Vec<(u64, u64, f64)> = serde_json::from_value(input["edges"].clone()).unwrap();
+    let edges = edges
+        .into_iter()
+        .map(|(from, to, weight)| WeightedEdge {
+            from,
+            to,
+            weight,
+            wormhole: false,
+        })
+        .collect::<Vec<_>>();
+    let mut graph = TransportGraph::from_edges(ids, &edges, &Default::default()).unwrap();
+    let anchors: Vec<(u64, f64)> = serde_json::from_value(input["anchor_gain"].clone()).unwrap();
+    let gains = ids
+        .iter()
+        .map(|id| {
+            anchors
+                .iter()
+                .find(|(anchor, _)| anchor == id)
+                .map_or(1.0, |(_, gain)| *gain)
+        })
+        .collect::<Vec<_>>();
+    graph.set_anchor_gains(&gains).unwrap();
+    graph
 }
 
 #[track_caller]
@@ -624,253 +93,596 @@ fn close(label: &str, actual: f64, expected: f64) {
     );
 }
 
-#[test]
-fn nous_wave_field_corpus() {
-    let fixture: Value =
-        serde_json::from_str(include_str!("fixtures/vcp-dtsc-field.json")).unwrap();
-    for case in fixture["cases"].as_array().unwrap() {
-        let input = &case["input"];
-        let expected = &case["expected"];
-        let dim = input["dimension"].as_u64().unwrap() as usize;
-        let data = fixture_matrix(input, dim);
-        let tags = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
-        let inbound = fixture_weights(input, "inbound", tags.rows, 0.0);
-        let custom = &input["config"];
-        let config = DtscFieldConfig {
-            min_field_tags: custom["minFieldTags"].as_u64().unwrap_or(3) as usize,
-            max_field_nodes: custom["maxFieldNodes"].as_u64().unwrap_or(48) as usize,
-            field_energy_mass_ratio: custom["fieldEnergyMassRatio"].as_f64().unwrap_or(0.95),
-            ..Default::default()
-        };
-        let field = build_field(&fixture_nodes(input), tags, &config);
-        close(
-            "field entropy",
-            field.field_entropy(),
-            expected["fieldEntropy"].as_f64().unwrap(),
-        );
-        close(
-            "total energy",
-            field.total_energy(),
-            expected["totalEnergy"].as_f64().unwrap(),
-        );
-        let retained = expected["fieldNodes"].as_array().unwrap();
-        assert_eq!(field.field_nodes().len(), retained.len());
-        for (node, expected) in field.field_nodes().iter().zip(retained) {
-            assert_eq!(u64::from(node.node.0) + 1, expected["id"].as_u64().unwrap());
-            close(
-                "retained potential",
-                node.potential,
-                expected["potential"].as_f64().unwrap(),
-            );
-        }
-        let sampler = DtscFieldSampler::new(&field, &inbound);
-        let targets: Vec<(u32, Vec<f32>)> =
-            serde_json::from_value(input["sample_tags"].clone()).unwrap();
-        for ((id, vector), expected) in targets.iter().zip(expected["samples"].as_array().unwrap())
-        {
-            let result = sampler.sample(NodeId(id - 1), vector);
-            close(
-                "sample potential",
-                result.potential,
-                expected["potential"].as_f64().unwrap(),
-            );
-            assert_eq!(result.exact, expected["exact"].as_bool().unwrap());
-            assert_eq!(
-                result.source_type,
-                serde_json::from_value::<DtscSourceType>(expected["sourceType"].clone()).unwrap()
-            );
-        }
-        let graph = empty_graph(tags.rows);
-        let empty = CandidateRows::new(dim, &[]);
-        let zero = vec![0.0; dim];
-        let query = QueryCosines::prepare(&ExecutionContext::default(), empty.view(), &zero, &zero)
-            .unwrap();
-        let raw = evidence(
-            &field,
-            &query,
-            graph.view(),
-            tags,
-            &DtscEvidenceConfig::default(),
-        )
-        .unwrap();
-        let strict = readout(&raw, &DtscReadoutConfig::default());
-        let permissive = readout(
-            &raw,
-            &DtscReadoutConfig {
-                fallback_on_low_trust: false,
-                ..Default::default()
-            },
-        );
-        assert_eq!(strict.field, permissive.field);
-        let expected_reason = if expected["fieldTrusted"] == false {
-            DtscFallbackReason::LowFieldEntropy
-        } else {
-            DtscFallbackReason::NoCurveContact
-        };
-        assert_eq!(
-            strict.decision,
-            DtscDecision::Fallback {
-                reason: expected_reason,
-                order: DtscFallbackOrder::OriginalCosine,
-            }
-        );
-        assert_eq!(
-            permissive.decision,
-            DtscDecision::Fallback {
-                reason: DtscFallbackReason::NoCurveContact,
-                order: DtscFallbackOrder::OriginalCosine,
-            }
-        );
+fn energy(concept: u64, energy: f64, kind: EvidenceSource) -> EnergyNode {
+    EnergyNode {
+        concept,
+        energy,
+        kind,
+        hop: 0,
+        seed: None,
     }
 }
 
 #[test]
-fn nous_wave_curve_and_fallback_corpus() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/vcp-dtsc.json")).unwrap();
-    let ctx = ExecutionContext::default();
-    for case in fixture["cases"].as_array().unwrap() {
+fn samples_match_nous_wave_float64_reference_for_valid_vectors() {
+    let captured = fixture("field");
+    let graph_fixture = fixture("curve");
+    for case in captured["cases"].as_array().unwrap() {
+        let input = &case["input"];
+        let (ids, values) = fixture_vectors(&input["tag_vectors"]);
+        let concepts = VectorRows::new(&ids, &values, 3).unwrap();
+        // Both probes captured the same persisted transport graph.
+        let graph = graph(&ids, &graph_fixture["cases"][0]["input"]);
+        let config = &input["config"];
+        let defaults = DtscFieldConfig::default();
+        let options = FieldOptions {
+            config: DtscFieldConfig {
+                min_field_tags: config["minFieldTags"]
+                    .as_u64()
+                    .map_or(defaults.min_field_tags, |n| n as usize),
+                max_field_nodes: config["maxFieldNodes"]
+                    .as_u64()
+                    .map_or(defaults.max_field_nodes, |n| n as usize),
+                field_energy_mass_ratio: config["fieldEnergyMassRatio"]
+                    .as_f64()
+                    .unwrap_or(defaults.field_energy_mass_ratio),
+                ..defaults
+            },
+            ..Default::default()
+        };
+        let field = build_field(concepts, &nodes(input), &options).unwrap();
+        let report = evidence(
+            EvidenceInput {
+                field: &field,
+                concepts,
+                graph: Some(&graph),
+                query: concepts.row(0).unwrap(),
+                enhanced_query: None,
+                candidates: VectorRows::new(&[], &[], 3).unwrap(),
+                paths: &[],
+                geometry: None,
+            },
+            &Default::default(),
+        )
+        .unwrap();
+
+        let expected = &case["expected"];
+        close(
+            "entropy",
+            report.field_stats().entropy,
+            expected["fieldEntropy"].as_f64().unwrap(),
+        );
+        close(
+            "mass",
+            report.field_stats().total_mass,
+            expected["totalEnergy"].as_f64().unwrap(),
+        );
+        assert_eq!(
+            report.field_stats().positive_nodes,
+            expected["exactField"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            report.field_stats().retained_nodes,
+            expected["fieldNodes"].as_array().unwrap().len()
+        );
+
+        let (sample_ids, samples) = fixture_vectors(&input["sample_tags"]);
+        let actual_samples = sample_ids
+            .iter()
+            .zip(samples.as_chunks::<3>().0)
+            .map(|(&id, vector)| SampleInput {
+                concept: ids.contains(&id).then_some(id),
+                vector,
+            })
+            .collect::<Vec<_>>();
+        // The zero vector in the capture is now a public input error. A vector
+        // with no known identity continues to exercise vector-only sampling.
+        assert!(matches!(
+            sample_field(
+                &field,
+                Some(&graph),
+                &actual_samples[4..],
+                &Default::default()
+            ),
+            Err(Error::Input {
+                field: "sample.vector",
+                ..
+            })
+        ));
+        let actual = sample_field(
+            &field,
+            Some(&graph),
+            &actual_samples[..4],
+            &Default::default(),
+        )
+        .unwrap();
+        for (actual, expected) in actual.iter().zip(expected["samples"].as_array().unwrap()) {
+            close(
+                "potential",
+                actual.potential,
+                expected["potential"].as_f64().unwrap(),
+            );
+            assert_eq!(actual.exact, expected["exact"].as_bool().unwrap());
+            assert_eq!(actual.kind, fixture_kind(&expected["sourceType"]));
+        }
+    }
+}
+
+#[test]
+fn exact_sampling_retains_identities_outside_the_interpolation_top_n() {
+    let rows = VectorRows::new(&[17, 10, 90], &[1.0, 0.0, 1.0, 0.0, 0.0, 1.0], 2).unwrap();
+    let field = build_field(
+        rows,
+        &[
+            energy(17, 1.0, EvidenceSource::Inferred),
+            energy(10, 1.0, EvidenceSource::Core),
+            energy(90, 0.5, EvidenceSource::Emergent),
+        ],
+        &FieldOptions {
+            config: DtscFieldConfig {
+                min_field_tags: 1,
+                max_field_nodes: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let samples = sample_field(
+        &field,
+        None,
+        &[
+            SampleInput {
+                concept: Some(17),
+                vector: &[1.0, 0.0],
+            },
+            SampleInput {
+                concept: Some(90),
+                vector: &[0.0, 1.0],
+            },
+            SampleInput {
+                concept: None,
+                vector: &[1.0, 0.0],
+            },
+            SampleInput {
+                concept: None,
+                vector: &[0.0, 1.0],
+            },
+        ],
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(samples[0].potential, 1.0);
+    assert!(samples[0].exact);
+    assert_eq!(samples[0].kind, Some(EvidenceSource::Inferred));
+    assert_eq!(samples[1].potential, 0.5);
+    assert!(samples[1].exact);
+    assert_eq!(samples[1].kind, Some(EvidenceSource::Emergent));
+    assert_eq!(samples[2].potential, 1.0);
+    assert!(!samples[2].exact);
+    assert_eq!(samples[2].kind, Some(EvidenceSource::Core));
+    assert_eq!(samples[3].kind, None);
+    assert!(samples.iter().all(|s| s.specificity == 1.0));
+    assert!(matches!(
+        sample_field(
+            &field,
+            None,
+            &[SampleInput {
+                concept: Some(99),
+                vector: &[1.0, 0.0]
+            }],
+            &Default::default()
+        ),
+        Err(Error::Input {
+            field: "sample.concept",
+            id: Some(99),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn curve_and_applied_scores_match_nous_wave_reference() {
+    let captured = fixture("curve");
+    for case in captured["cases"].as_array().unwrap() {
         let input = &case["input"];
         let dim = input["dimension"].as_u64().unwrap() as usize;
         if dim == 0 {
-            let tags = VectorMatrixView::empty(0);
-            let field = build_field(&[], tags, &DtscFieldConfig::default());
-            let graph = empty_graph(0);
-            let rows = CandidateRows::new(0, &[]);
-            let query = QueryCosines::prepare(&ctx, rows.view(), &[], &[]).unwrap();
-            let result = evidence(
-                &field,
-                &query,
-                graph.view(),
-                tags,
-                &DtscEvidenceConfig::default(),
-            );
-            assert!(matches!(result, Err(VcpError::InvalidInput { .. })));
+            assert!(matches!(
+                VectorRows::new(&[], &[], dim),
+                Err(Error::Input {
+                    field: "dimension",
+                    ..
+                })
+            ));
             continue;
         }
-
-        let data = fixture_matrix(input, dim);
-        let tags = VectorMatrixView::new(&data, data.len() / dim, dim).unwrap();
-        let edges: Vec<(usize, usize, f64)> =
-            serde_json::from_value(input["edges"].clone()).unwrap();
-        let edges: Vec<_> = edges
-            .into_iter()
-            .map(|(a, b, weight)| (a - 1, b - 1, weight))
-            .collect();
-        let graph = graph(
-            tags.rows,
-            &edges,
-            fixture_weights(input, "inbound", tags.rows, 0.0),
-            fixture_weights(input, "anchor_gain", tags.rows, 1.0),
-        );
-        let candidates = input["candidates"].as_array().unwrap();
-        let specs: Vec<_> = candidates
-            .iter()
-            .map(|candidate| {
-                let curve = &candidate["curve"];
-                let steps = curve["tags"]
+        let (ids, vectors) = fixture_vectors(&input["tag_vectors"]);
+        let concepts = VectorRows::new(&ids, &vectors, dim).unwrap();
+        let graph = graph(&ids, input);
+        let field = build_field(concepts, &nodes(input), &Default::default()).unwrap();
+        let baseline = Scores::new(input["candidates"].as_array().unwrap().iter().map(|row| {
+            (
+                row["curve"]["id"].as_u64().unwrap(),
+                row["score"].as_f64().unwrap(),
+            )
+        }))
+        .unwrap();
+        let candidate_ids = baseline.values().map(|(id, _)| id).collect::<Vec<_>>();
+        let mut candidate_values = Vec::new();
+        let mut tags = Vec::new();
+        for row in input["candidates"].as_array().unwrap() {
+            let values: Vec<f32> =
+                serde_json::from_value(row["curve"]["chunk_vector"].clone()).unwrap();
+            candidate_values.extend(values);
+            tags.push(
+                row["curve"]["tags"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|tag| {
-                        (
-                            NodeId(tag["id"].as_u64().unwrap() as u32 - 1),
-                            tag["position"].as_u64().unwrap() as u32,
-                        )
-                    })
-                    .collect();
-                (
-                    serde_json::from_value(curve["chunk_vector"].clone()).unwrap(),
-                    vec![steps],
-                )
+                    .map(|tag| tag["id"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let paths = candidate_ids
+            .iter()
+            .zip(&tags)
+            .map(|(&id, concepts)| Path {
+                candidate: id,
+                ordinal: 0,
+                concepts,
             })
-            .collect();
-        let rows = CandidateRows::new(dim, &specs);
-        let original: Vec<f32> = serde_json::from_value(input["original_vector"].clone()).unwrap();
+            .collect::<Vec<_>>();
+        let query: Vec<f32> = serde_json::from_value(input["original_vector"].clone()).unwrap();
         let enhanced: Vec<f32> = serde_json::from_value(input["enhanced_vector"].clone()).unwrap();
-        let query = QueryCosines::prepare(&ctx, rows.view(), &original, &enhanced).unwrap();
-        let field = build_field(&fixture_nodes(input), tags, &DtscFieldConfig::default());
-        let raw = evidence(
-            &field,
-            &query,
-            graph.view(),
-            tags,
-            &DtscEvidenceConfig::default(),
-        )
-        .unwrap();
-        let top_k = input["top_k"].as_u64().unwrap() as usize;
-        let actual = readout(
-            &raw,
-            &DtscReadoutConfig {
-                top_k,
-                fallback_order: DtscFallbackOrder::InputOrder,
-                geometry_weight: 1.0,
+        let report = evidence(
+            EvidenceInput {
+                field: &field,
+                concepts,
+                graph: Some(&graph),
+                query: &query,
+                enhanced_query: Some(&enhanced),
+                candidates: VectorRows::new(&candidate_ids, &candidate_values, dim).unwrap(),
+                paths: &paths,
+                geometry: None,
+            },
+            &EvidenceOptions {
+                run: RunOptions {
+                    parallelism: Parallelism::Rayon,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
+        let result = report.apply(&baseline, &Default::default()).unwrap();
         let expected = &case["expected"];
-        let diagnostics = &expected["diagnostics"];
-        let expected_decision = match diagnostics["fallbackReason"].as_str() {
-            None => DtscDecision::Scored,
-            Some(reason) => DtscDecision::Fallback {
-                reason: match reason {
-                    "query-energy-field-low-trust" if actual.field.positive_nodes < 3 => {
-                        DtscFallbackReason::InsufficientFieldSupport
-                    }
-                    "query-energy-field-low-trust" => DtscFallbackReason::LowFieldEntropy,
-                    "no-candidate-curve-contacted-query-field" => {
-                        DtscFallbackReason::NoCurveContact
-                    }
-                    "candidate-curve-readout-jointly-low-trust" => {
-                        DtscFallbackReason::InsufficientCandidateCoverage
-                    }
-                    "candidate-curve-scores-lack-discrimination" => {
-                        DtscFallbackReason::InsufficientScoreSpread
-                    }
-                    _ => panic!("unknown fixture reason {reason}"),
-                },
-                order: DtscFallbackOrder::InputOrder,
-            },
+        let decision = if expected["diagnostics"]["fallbackUsed"].as_bool().unwrap() {
+            DtscDecision::Baseline {
+                reason: DtscFallbackReason::InsufficientFieldSupport,
+            }
+        } else {
+            DtscDecision::Applied
         };
-        assert_eq!(actual.decision, expected_decision);
+        assert_eq!(result.decision, decision);
         close(
-            "curve field entropy",
-            actual.field.entropy,
-            diagnostics["fieldEntropy"].as_f64().unwrap(),
+            "entropy",
+            report.field_stats().entropy,
+            expected["diagnostics"]["fieldEntropy"].as_f64().unwrap(),
         );
-
-        // Apply the new base score to the captured geometric rewards, indexed by the captured ID.
-        let captured = expected["results"].as_array().unwrap();
-        let mut expected_scores = Vec::new();
-        for (i, candidate) in candidates.iter().enumerate() {
-            let expected = captured
-                .iter()
-                .find(|row| row["id"] == candidate["curve"]["id"])
-                .unwrap();
-            let cosine = dtsc_cosine(&specs[i].0, &original);
-            let bonus = expected["geoBonus"].as_f64().unwrap();
-            expected_scores.push((CandidateId(i as u32), cosine, cosine + bonus, expected));
-        }
-        if !diagnostics["fallbackUsed"].as_bool().unwrap() {
-            expected_scores.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| b.1.total_cmp(&a.1)));
-        }
-        if top_k != 0 {
-            expected_scores.truncate(top_k);
-        }
-        assert_eq!(actual.results.len(), expected_scores.len());
-        for (item, (candidate, cosine, score, expected)) in
-            actual.results.iter().zip(expected_scores)
+        let ranked = result.scores.top(None);
+        for (actual, expected) in ranked
+            .rows()
+            .iter()
+            .zip(expected["results"].as_array().unwrap())
         {
-            assert_eq!(item.candidate, candidate);
-            close("original cosine", item.scores.original_cosine, cosine);
-            close("score", item.scores.score, score);
-            for (label, value) in [
-                ("geoScore", item.scores.geo_score),
-                ("geoBonus", item.scores.geo_bonus),
-                ("geoConfidence", item.scores.geo_confidence),
-                ("geoIsolatedRatio", item.scores.geo_isolated_ratio),
+            assert_eq!(actual.id, expected["id"].as_u64().unwrap());
+            close("score", actual.value, expected["score"].as_f64().unwrap());
+            let geometry = &report
+                .items()
+                .iter()
+                .find(|row| row.candidate == actual.id)
+                .unwrap()
+                .metrics;
+            for (key, value) in [
+                ("geoScore", geometry.geo_score),
+                ("geoBonus", geometry.geo_bonus),
+                ("geoConfidence", geometry.confidence),
+                ("geoContinuity", geometry.continuity),
+                ("geoIsolatedRatio", geometry.isolated_ratio),
             ] {
-                close(label, value, expected[label].as_f64().unwrap());
+                close(key, value, expected[key].as_f64().unwrap());
             }
         }
     }
+}
+
+#[test]
+fn evidence_preserves_entire_path_identity_and_explicit_baseline() {
+    let ids = [90, 40, 17];
+    let concept_values = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+    let concepts = VectorRows::new(&ids, &concept_values, 2).unwrap();
+    let nodes = [
+        energy(90, 1.0, EvidenceSource::Core),
+        energy(40, 0.8, EvidenceSource::Inferred),
+        energy(17, 0.8, EvidenceSource::Emergent),
+    ];
+    let field = build_field(concepts, &nodes, &Default::default()).unwrap();
+    let paths = [
+        Path {
+            candidate: 100,
+            ordinal: 7,
+            concepts: &[40],
+        },
+        Path {
+            candidate: 100,
+            ordinal: 3,
+            concepts: &[90, 90],
+        },
+        Path {
+            candidate: 100,
+            ordinal: 4,
+            concepts: &[90],
+        },
+        Path {
+            candidate: 200,
+            ordinal: 0,
+            concepts: &[17],
+        },
+    ];
+    let query = [1.0, 0.0];
+    let candidate_vectors =
+        VectorRows::new(&[100, 200, 300], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0], 2).unwrap();
+    let report = evidence(
+        EvidenceInput {
+            field: &field,
+            concepts,
+            graph: None,
+            query: &query,
+            enhanced_query: None,
+            candidates: candidate_vectors,
+            paths: &paths,
+            geometry: None,
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let direct = &report.items()[0];
+    let structural = &report.items()[1];
+    assert_eq!(direct.path, Some(3));
+    assert_eq!(direct.metrics.exact_hits, 1);
+    assert_eq!(direct.metrics.class, EvidenceClass::Direct);
+    assert_eq!(structural.metrics.class, EvidenceClass::Structural);
+    assert!(direct.metrics.geo_bonus > structural.metrics.geo_bonus);
+    assert!(report.items()[2].path.is_none());
+
+    let primary = Scores::new([(300, 1.7), (100, -0.25), (200, 1.4)]).unwrap();
+    for (baseline, gain) in [
+        (&primary, 1.0),
+        (&primary, 0.0),
+        (
+            &Scores::new([(200, 2.0), (100, 2.0), (300, -2.0)]).unwrap(),
+            0.5,
+        ),
+    ] {
+        let options = ReadoutOptions {
+            config: DtscReadoutConfig {
+                correction_gain: gain,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = report.apply(baseline, &options).unwrap();
+        assert_eq!(result.decision, DtscDecision::Applied);
+        let expected = baseline
+            .values()
+            .map(|(id, baseline)| {
+                let bonus = report
+                    .items()
+                    .iter()
+                    .find(|row| row.candidate == id)
+                    .unwrap()
+                    .metrics
+                    .geo_bonus;
+                (id, baseline + gain * bonus)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result.scores.values().collect::<Vec<_>>(), expected);
+        assert_eq!(direct.metrics.geo_bonus, direct.metrics.base_bonus);
+    }
+    assert!(matches!(
+        report.apply(
+            &Scores::new([(100, 1.0), (200, 2.0), (400, 1.0)]).unwrap(),
+            &Default::default()
+        ),
+        Err(Error::Input {
+            field: "baseline",
+            id: Some(400),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn identity_floor_and_geometry_run_from_their_own_inputs() {
+    let query = [1.0, 0.0];
+    let concepts = VectorRows::new(&[1], &query, 2).unwrap();
+    let field = build_field(
+        concepts,
+        &[energy(1, 1.0, EvidenceSource::Core)],
+        &FieldOptions {
+            config: DtscFieldConfig {
+                min_field_tags: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let paths = [Path {
+        candidate: 1,
+        ordinal: 0,
+        concepts: &[1],
+    }];
+    let input = |geometry| EvidenceInput {
+        field: &field,
+        concepts,
+        graph: None,
+        query: &query,
+        enhanced_query: Some(&query),
+        candidates: concepts,
+        paths: &paths,
+        geometry,
+    };
+    let mut options = EvidenceOptions {
+        config: DtscEvidenceConfig {
+            reward: DtscRewardConfig {
+                alpha: 0.0,
+                ..Default::default()
+            },
+            auxiliary: Some(DtscAuxConfig {
+                max_aux_bonus: 0.012,
+                geometry: None,
+                identity: Some(DtscIdentityConfig::default()),
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let identity = evidence(input(None), &options).unwrap().items()[0].metrics;
+    close(
+        "identity floor",
+        identity.auxiliary.unwrap().identity_floor,
+        0.018,
+    );
+    assert!(identity.auxiliary.unwrap().shadow_score.is_none());
+    close("limited identity bonus", identity.geo_bonus, 0.012);
+
+    options.config.auxiliary.as_mut().unwrap().geometry = Some(Default::default());
+    assert!(matches!(
+        evidence(input(None), &options),
+        Err(Error::Input {
+            field: "geometry",
+            ..
+        })
+    ));
+    let state = GeometryState {
+        epa_concentration: 0.9,
+        epa_entropy: 0.1,
+        epa_resonance: 0.4,
+        pyramid_coverage: 0.95,
+        pyramid_novelty: 0.2,
+        pyramid_depth: 1.0,
+    };
+    options.config.auxiliary.as_mut().unwrap().identity = None;
+    let geometry = evidence(input(Some(state)), &options).unwrap().items()[0].metrics;
+    assert!(geometry.auxiliary.unwrap().shadow_score.unwrap() > 0.1);
+    assert!(geometry.geo_bonus > 0.0);
+}
+
+#[test]
+fn trust_guards_use_geometric_limits_and_preserve_supplied_ties_on_fallback() {
+    let query = [1.0, 0.0];
+    let concepts = VectorRows::new(&[1], &query, 2).unwrap();
+    let candidate_rows =
+        VectorRows::new(&[10, 20, 30], &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0], 2).unwrap();
+    let paths = [
+        Path {
+            candidate: 10,
+            ordinal: 0,
+            concepts: &[1],
+        },
+        Path {
+            candidate: 20,
+            ordinal: 0,
+            concepts: &[1],
+        },
+    ];
+    let node = energy(1, 1.0, EvidenceSource::Core);
+    let field = build_field(
+        concepts,
+        &[node],
+        &FieldOptions {
+            config: DtscFieldConfig {
+                min_field_tags: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let prepare = |paths| {
+        evidence(
+            EvidenceInput {
+                field: &field,
+                concepts,
+                graph: None,
+                query: &query,
+                enhanced_query: None,
+                candidates: candidate_rows,
+                paths,
+                geometry: None,
+            },
+            &Default::default(),
+        )
+        .unwrap()
+    };
+    let baseline = Scores::new([(30, 2.0), (20, -3.0), (10, -3.0)]).unwrap();
+    let pool = prepare(&paths);
+    assert_eq!(
+        pool.apply(&baseline, &Default::default()).unwrap().decision,
+        DtscDecision::Baseline {
+            reason: DtscFallbackReason::LowFieldEntropy
+        }
+    );
+    let mut options = ReadoutOptions {
+        config: DtscReadoutConfig {
+            trust: DtscTrustConfig {
+                min_field_entropy: 0.0,
+                min_candidate_coverage: 0.9,
+                min_geo_score: 1.0,
+                min_strong_evidence: 10.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let no_contact = prepare(&[]);
+    assert_eq!(
+        no_contact.apply(&baseline, &options).unwrap().decision,
+        DtscDecision::Baseline {
+            reason: DtscFallbackReason::NoContact
+        }
+    );
+    let fallback = pool.apply(&baseline, &options).unwrap();
+    assert_eq!(
+        fallback.decision,
+        DtscDecision::Baseline {
+            reason: DtscFallbackReason::InsufficientCoverage
+        }
+    );
+    assert_eq!(fallback.scores, baseline);
+    assert_eq!(fallback.scores.top(None).ids(), &[30, 20, 10]);
+    options.config.trust.min_candidate_coverage = 0.0;
+    assert_eq!(
+        pool.apply(&baseline, &options).unwrap().decision,
+        DtscDecision::Baseline {
+            reason: DtscFallbackReason::InsufficientSpread
+        }
+    );
+    options.config.trust.min_strong_evidence = 0.0;
+    options.config.trust.min_candidate_coverage = 0.9;
+    assert_eq!(
+        pool.apply(&baseline, &options).unwrap().decision,
+        DtscDecision::Applied
+    );
+    let token = CancelToken::default();
+    token.cancel();
+    options.run.cancel = Some(token);
+    assert!(matches!(
+        pool.apply(&baseline, &options),
+        Err(Error::Cancelled)
+    ));
 }

@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use super::curve::{DtscCurveContext, DtscEval, Sample, is_direct};
+use super::curve::{DtscCurveContext, DtscEval, GeometryState, Sample, is_direct};
 use super::field::dtsc_cosine;
 use super::{positive, unit};
-use nexus_core::NodeId;
+use crate::Result;
+
+fn contacting(sample: &Sample, threshold: f64) -> bool {
+    sample.field.potential > 0.0 && sample.field.potential >= threshold
+}
 
 pub(super) fn contacts(
-    samples: &[Sample<'_>],
+    samples: &[Sample],
     ctx: &DtscCurveContext<'_>,
     score: &mut DtscEval,
 ) -> f64 {
@@ -17,15 +21,15 @@ pub(super) fn contacts(
 
     for s in samples {
         closure_mass += s.closure * s.mass;
-        if s.field.potential >= ctx.config.curve.weak_contact_threshold {
-            score.geo_hit_count += 1;
+        if contacting(s, ctx.config.curve.weak_contact_threshold) {
+            score.metrics.hit_count += 1;
             contacted_mass += s.mass;
             potential_mass += s.mass * s.field.potential;
         }
-        score.geo_strong_hits +=
-            usize::from(s.field.potential >= ctx.config.curve.strong_contact_threshold);
+        score.metrics.strong_hits +=
+            usize::from(contacting(s, ctx.config.curve.strong_contact_threshold));
         if s.field.exact {
-            score.geo_exact_hits += 1;
+            score.metrics.exact_hits += 1;
             if is_direct(s) {
                 score.geo_direct_exact_hits += 1;
             } else {
@@ -58,20 +62,26 @@ pub(super) fn contacts(
 }
 
 #[inline]
-fn edge(ctx: &DtscCurveContext<'_>, a: NodeId, b: NodeId) -> f64 {
-    ctx.graph.edge_weight(a, b)
+fn edge(ctx: &DtscCurveContext<'_>, a: u64, b: u64) -> f64 {
+    ctx.graph.map_or(0.0, |graph| graph.edge(a, b))
+}
+
+fn similarity(ctx: &DtscCurveContext<'_>, a: &Sample, b: &Sample) -> f64 {
+    let left = ctx.tag_vectors.row(a.row).expect("validated concept row");
+    let right = ctx.tag_vectors.row(b.row).expect("validated concept row");
+    dtsc_cosine(left, right)
 }
 
 fn sparse(
-    samples: &[Sample<'_>],
+    samples: &[Sample],
     isolated: &[usize],
     isolated_mass: f64,
     ctx: &DtscCurveContext<'_>,
     connected_flags: &mut Vec<bool>,
-) -> f64 {
+) -> Result<f64> {
     let cfg = &ctx.config.sparse;
-    if !cfg.enabled || isolated.len() < cfg.min_contacts {
-        return 0.0;
+    if !cfg.enabled || ctx.graph.is_none() || isolated.len() < cfg.min_contacts {
+        return Ok(0.0);
     }
 
     connected_flags.clear();
@@ -81,11 +91,15 @@ fn sparse(
     let mut quality_sum = 0.0;
 
     for (offset, &a) in isolated.iter().enumerate() {
+        ctx.run.check_cancelled()?;
         let left = &samples[a];
         if left.field.potential < cfg.min_potential || left.closure < cfg.min_closure {
             continue;
         }
-        for &b in isolated.iter().skip(offset + 1) {
+        for (index, &b) in isolated.iter().skip(offset + 1).enumerate() {
+            if index.is_multiple_of(64) {
+                ctx.run.check_cancelled()?;
+            }
             let right = &samples[b];
             if a.abs_diff(b) <= 1
                 || right.field.potential < cfg.min_potential
@@ -95,8 +109,11 @@ fn sparse(
             }
             let conductance =
                 edge(ctx, left.node, right.node).max(edge(ctx, right.node, left.node));
-            let similarity = dtsc_cosine(left.vector, right.vector);
-            if conductance < cfg.min_conductance || similarity < cfg.min_similarity {
+            let similarity = similarity(ctx, left, right);
+            if conductance <= 0.0
+                || conductance < cfg.min_conductance
+                || similarity < cfg.min_similarity
+            {
                 continue;
             }
             let tq =
@@ -124,29 +141,33 @@ fn sparse(
         .map(|(i, _)| samples[i].mass * samples[i].field.potential)
         .sum();
 
-    if pairs > 0 && isolated_mass > 0.0 {
+    let relief = if pairs > 0 && isolated_mass > 0.0 {
         unit(connected_mass / isolated_mass)
             * unit(pairs as f64 / cfg.pair_saturation as f64)
             * unit(quality_sum / pairs as f64)
     } else {
         0.0
-    }
+    };
+    Ok(relief)
 }
 
 pub(super) fn path(
-    samples: &[Sample<'_>],
+    samples: &[Sample],
     weighted_potential: f64,
     ctx: &DtscCurveContext<'_>,
     score: &mut DtscEval,
     isolated_buf: &mut Vec<usize>,
     connected_flags: &mut Vec<bool>,
-) {
+) -> Result<()> {
     let weak = ctx.config.curve.weak_contact_threshold;
     isolated_buf.clear();
     for (i, s) in samples.iter().enumerate() {
-        if s.field.potential >= weak
-            && (i == 0 || samples[i - 1].field.potential < weak)
-            && (i + 1 == samples.len() || samples[i + 1].field.potential < weak)
+        if i.is_multiple_of(64) {
+            ctx.run.check_cancelled()?;
+        }
+        if contacting(s, weak)
+            && (i == 0 || !contacting(&samples[i - 1], weak))
+            && (i + 1 == samples.len() || !contacting(&samples[i + 1], weak))
         {
             isolated_buf.push(i);
         }
@@ -158,10 +179,13 @@ pub(super) fn path(
         .sum();
 
     let mut sums = [0.0; 6];
-    for pair in samples.windows(2) {
+    for (index, pair) in samples.windows(2).enumerate() {
+        if index.is_multiple_of(64) {
+            ctx.run.check_cancelled()?;
+        }
         let a = &pair[0];
         let b = &pair[1];
-        let arc = dtsc_cosine(a.vector, b.vector).clamp(-1.0, 1.0).acos() / std::f64::consts::PI;
+        let arc = similarity(ctx, a, b).clamp(-1.0, 1.0).acos() / std::f64::consts::PI;
         let forward = edge(ctx, a.node, b.node);
         let reverse = edge(ctx, b.node, a.node);
         let topology = unit(forward.max(reverse).sqrt());
@@ -179,14 +203,14 @@ pub(super) fn path(
         }
     }
 
-    score.geo_continuity = if sums[0] > 0.0 {
+    score.metrics.continuity = if sums[0] > 0.0 {
         unit(sums[1] / sums[0])
     } else {
         unit(score.geo_max_potential * 0.35)
     };
     let isolated_ratio = unit(isolated_mass / weighted_potential.max(1e-12));
-    let confidence = sparse(samples, isolated_buf, isolated_mass, ctx, connected_flags);
-    score.geo_isolated_ratio =
+    let confidence = sparse(samples, isolated_buf, isolated_mass, ctx, connected_flags)?;
+    score.metrics.isolated_ratio =
         unit(isolated_ratio * (1.0 - ctx.config.sparse.max_relief * confidence));
 
     score.geo_action_quality = if sums[2] > 0.0 {
@@ -200,22 +224,22 @@ pub(super) fn path(
     } else {
         0.0
     };
+    Ok(())
 }
 
 pub(super) fn shadow(
-    [a, b]: [f64; 2],
+    (a, b): (f64, Option<f64>),
     target: usize,
     ctx: &DtscCurveContext<'_>,
+    g: GeometryState,
     score: &mut DtscEval,
 ) {
-    let lift = b - a;
-    score.geo_closure_score = unit(
-        0.25 * a + 0.35 * b + 0.30 * score.geo_closure_quality + 0.10 * unit(0.5 + lift * 5.0),
-    );
+    let enhanced = b.map_or(0.0, |b| 0.35 * b + 0.10 * unit(0.5 + (b - a) * 5.0));
+    score.geo_closure_score = unit(0.25 * a + 0.30 * score.geo_closure_quality + enhanced);
 
     let saturation = unit(
         (score.geo_direct_exact_hits + score.geo_direct_semantic_hits) as f64
-            / (ctx.config.reward.direct_semantic_min_contacts + 1) as f64,
+            / (ctx.config.reward.direct_semantic_min_contacts as f64 + 1.0),
     );
     score.geo_direct_score = unit(
         0.45 * score
@@ -231,14 +255,14 @@ pub(super) fn shadow(
     );
 
     let contact = unit(
-        (score.geo_indirect_exact_hits + score.geo_strong_hits.min(target)) as f64
-            / (target + 1) as f64,
+        (score.geo_indirect_exact_hits + score.metrics.strong_hits.min(target)) as f64
+            / (target as f64 + 1.0),
     );
     score.geo_structural_score = unit(
-        0.25 * score.geo_continuity
+        0.25 * score.metrics.continuity
             + 0.2 * score.geo_action_quality
             + 0.15 * score.geo_closure_quality
-            + 0.15 * (1.0 - score.geo_isolated_ratio)
+            + 0.15 * (1.0 - score.metrics.isolated_ratio)
             + 0.15 * score.geo_direction_consistency
             + 0.1 * contact,
     );
@@ -246,19 +270,18 @@ pub(super) fn shadow(
     score.geo_thematic_score = unit(
         0.35 * score.geo_weighted_coverage
             + 0.3 * score.geo_mean_potential
-            + 0.2 * (1.0 - score.geo_isolated_ratio)
+            + 0.2 * (1.0 - score.metrics.isolated_ratio)
             + 0.15 * score.geo_closure_quality,
     );
 
-    let g = &ctx.geometry;
     let weights = [
-        0.45 + 0.35 * unit(g.epa_spectral_concentration) + 0.2 * unit(g.pyramid_coverage),
+        0.45 + 0.35 * unit(g.epa_concentration) + 0.2 * unit(g.pyramid_coverage),
         0.35 + 0.3 * unit(g.pyramid_depth)
             + 0.25 * unit(g.pyramid_novelty)
             + 0.1 * unit(g.epa_resonance),
         0.2 + 0.35 * unit(g.epa_entropy)
             + 0.3 * unit(g.epa_resonance)
-            + 0.15 * (1.0 - unit(g.epa_spectral_concentration)),
+            + 0.15 * (1.0 - unit(g.epa_concentration)),
     ];
     let total = weights.iter().sum::<f64>().max(1e-12);
 

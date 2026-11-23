@@ -1,323 +1,400 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::dataset::{invalid, path_steps, push_offset, slot, validate_unit_matrix};
-use crate::{Document, Nexus, Sequence};
-use nexus_core::kernel::normalize_direction;
-use nexus_core::{CandidateRowsView, NodeId, RootId, VcpResult, VectorMatrixView};
-use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use nexus_math::{NodeId, OwnedUnitVectors, UnitVectors, VectorRows};
 
-const STAGE: &str = "candidates";
+use crate::{CandidateId, DocumentId, Model, Result, SelectedPath, SourceId, input};
 
-pub enum CandidateInput<'rows> {
-    Ids(&'rows [u64]),
-    Owned(Vec<Document>),
-    Borrowed(BorrowedCandidates<'rows>),
+pub type CandidateData = Vec<Candidate>;
+
+pub struct Candidate {
+    pub id: CandidateId,
+    pub vector: Vec<f32>,
+    pub document_id: Option<DocumentId>,
+    pub sources: Vec<SourceId>,
+    pub paths: Option<Vec<PathRef>>,
 }
 
-pub struct BorrowedCandidates<'rows> {
-    ids: &'rows [u64],
-    vectors: VectorMatrixView<'rows>,
-    document_ids: Option<&'rows [u64]>,
-    paths: Option<&'rows [&'rows [Sequence]]>,
-}
-
-impl<'rows> BorrowedCandidates<'rows> {
-    pub fn new(ids: &'rows [u64], vectors: VectorMatrixView<'rows>) -> Self {
+impl Candidate {
+    pub fn new(id: CandidateId, vector: Vec<f32>) -> Self {
         Self {
-            ids,
-            vectors,
-            document_ids: None,
+            id,
+            vector,
+            document_id: None,
+            sources: Vec::new(),
             paths: None,
         }
     }
 
-    pub fn with_document_ids(mut self, ids: &'rows [u64]) -> Self {
-        self.document_ids = Some(ids);
+    pub fn with_sources(mut self, sources: Vec<SourceId>) -> Self {
+        self.sources = sources;
         self
     }
 
-    pub fn with_paths(mut self, paths: &'rows [&'rows [Sequence]]) -> Self {
+    pub fn with_paths(mut self, paths: Vec<PathRef>) -> Self {
         self.paths = Some(paths);
         self
     }
+
+    pub fn with_document_id(mut self, document: DocumentId) -> Self {
+        self.document_id = Some(document);
+        self
+    }
+
+    fn into_data(self) -> (Vec<f32>, CandidateMetadata) {
+        (
+            self.vector,
+            CandidateMetadata {
+                id: self.id,
+                document_id: self.document_id,
+                sources: self.sources,
+                paths: self.paths,
+            },
+        )
+    }
 }
 
-/// Static ordered candidate facts that may be evaluated by multiple observations.
-pub struct CandidateSet<'data> {
-    pub(crate) nexus: &'data Nexus<'data>,
-    ids: Cow<'data, [u64]>,
-    document_ids: Cow<'data, [u64]>,
-    vectors: CandidateVectors<'data>,
-    columns: CandidateColumns,
-    pub(crate) slots: HashMap<u64, usize>,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PathRef {
+    pub source: SourceId,
+    pub path: usize,
+    pub positions: Option<Vec<usize>>,
 }
 
-enum CandidateVectors<'data> {
-    Owned { data: Vec<f32>, dim: usize },
-    Borrowed(VectorMatrixView<'data>),
+pub struct CandidateMetadata {
+    pub id: CandidateId,
+    pub document_id: Option<DocumentId>,
+    pub sources: Vec<SourceId>,
+    pub paths: Option<Vec<PathRef>>,
 }
 
-struct CandidateColumns {
-    root_offsets: Vec<u32>,
-    roots: Vec<RootId>,
-    path_offsets: Vec<u32>,
-    path_sources: Vec<Option<u64>>,
-    path_tag_offsets: Vec<u32>,
-    path_tags: Vec<NodeId>,
-    path_positions: Vec<u32>,
+pub struct CandidateView<'a> {
+    vectors: UnitVectors<'a>,
+    metadata: HashMap<CandidateId, CandidateMetadata>,
 }
 
-impl CandidateColumns {
-    fn new() -> Self {
+impl<'a> CandidateView<'a> {
+    pub fn new(vectors: UnitVectors<'a>) -> Self {
         Self {
-            root_offsets: vec![0],
-            roots: Vec::new(),
-            path_offsets: vec![0],
-            path_sources: Vec::new(),
-            path_tag_offsets: vec![0],
-            path_tags: Vec::new(),
-            path_positions: Vec::new(),
-        }
-    }
-
-    fn add_path(
-        &mut self,
-        tags: &[NodeId],
-        positions: &[u32],
-        source: Option<u64>,
-    ) -> VcpResult<()> {
-        self.path_tags.extend_from_slice(tags);
-        self.path_positions.extend_from_slice(positions);
-        self.finish_path(source)
-    }
-
-    fn finish_path(&mut self, source: Option<u64>) -> VcpResult<()> {
-        self.path_sources.push(source);
-        push_offset(&mut self.path_tag_offsets, self.path_tags.len())
-    }
-
-    fn finish_row(&mut self, roots: impl IntoIterator<Item = RootId>) -> VcpResult<()> {
-        self.roots.extend(roots);
-        push_offset(&mut self.root_offsets, self.roots.len())?;
-        push_offset(&mut self.path_offsets, self.path_tag_offsets.len() - 1)
-    }
-
-    fn add_host_row(&mut self, nexus: &Nexus<'_>, paths: &[Sequence]) -> VcpResult<()> {
-        let mut roots = BTreeSet::new();
-        let sources = nexus.prepared().sources;
-        for path in paths {
-            let root = RootId::from_index(slot(&nexus.source_slots, path.source)?, STAGE)?;
-            roots.insert(root);
-            roots.extend(sources.required_roots(root));
-            for (position, tag) in path_steps(&nexus.concept_slots, path)? {
-                self.path_positions.push(position);
-                self.path_tags.push(tag);
-            }
-            self.finish_path(Some(path.source))?;
-        }
-        self.finish_row(roots)
-    }
-}
-
-fn offsets(values: &[u32], row: usize) -> std::ops::Range<usize> {
-    values[row] as usize..values[row + 1] as usize
-}
-
-impl<'data> CandidateSet<'data> {
-    fn new(
-        nexus: &'data Nexus<'data>,
-        ids: Cow<'data, [u64]>,
-        document_ids: Cow<'data, [u64]>,
-        vectors: CandidateVectors<'data>,
-        columns: CandidateColumns,
-    ) -> VcpResult<Self> {
-        let slots = crate::dataset::ids(ids.iter().copied())?;
-        Ok(Self {
-            nexus,
-            ids,
-            document_ids,
             vectors,
-            columns,
-            slots,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn with_metadata(mut self, metadata: Vec<CandidateMetadata>) -> Result<Self> {
+        let rows = self.vectors.as_rows();
+        let ids: HashSet<_> = rows.ids().iter().copied().collect();
+        for item in metadata {
+            let id = item.id;
+            if !ids.contains(&id) || self.metadata.insert(id, item).is_some() {
+                return Err(input(
+                    "candidate.metadata",
+                    Some(id),
+                    "expected unique metadata for an existing vector ID",
+                ));
+            }
+        }
+        Ok(self)
+    }
+}
+
+pub(crate) struct BoundPath {
+    pub(crate) source: SourceId,
+    pub(crate) ordinal: usize,
+    pub(crate) nodes: Vec<NodeId>,
+    pub(crate) positions: Vec<usize>,
+}
+
+impl BoundPath {
+    pub(crate) fn selected(&self, model: &Model) -> SelectedPath {
+        let ids = model.concepts().ids();
+        SelectedPath {
+            source: self.source,
+            path: self.ordinal,
+            positions: self.positions.clone(),
+            concepts: self.nodes.iter().map(|node| ids[node.index()]).collect(),
+        }
+    }
+}
+
+pub(crate) struct CandidateInfo {
+    pub(crate) document_id: Option<DocumentId>,
+    pub(crate) roots: Option<BTreeSet<SourceId>>,
+    pub(crate) paths: Vec<BoundPath>,
+}
+
+struct Catalog<'a> {
+    identity: Arc<()>,
+    vectors: Storage<'a>,
+    info: Vec<CandidateInfo>,
+    slots: HashMap<CandidateId, usize>,
+}
+
+enum Storage<'a> {
+    Owned(OwnedUnitVectors),
+    Borrowed(UnitVectors<'a>),
+}
+
+impl Storage<'_> {
+    fn rows(&self) -> VectorRows<'_> {
+        match self {
+            Self::Owned(vectors) => vectors.as_rows(),
+            Self::Borrowed(vectors) => vectors.as_rows(),
+        }
+    }
+}
+
+struct Selection {
+    ids: Vec<CandidateId>,
+    slots: Vec<usize>,
+}
+
+pub struct Candidates<'data> {
+    catalog: Arc<Catalog<'data>>,
+    selection: Option<Selection>,
+}
+
+impl<'data> Candidates<'data> {
+    pub fn select(&self, ids: impl IntoIterator<Item = CandidateId>) -> Result<Self> {
+        let mut selection = Selection {
+            ids: Vec::new(),
+            slots: Vec::new(),
+        };
+        let allowed = self
+            .selection
+            .as_ref()
+            .map(|subset| subset.ids.iter().copied().collect::<HashSet<_>>());
+        let mut seen = HashSet::new();
+        for id in ids {
+            let slot = self
+                .catalog
+                .slots
+                .get(&id)
+                .filter(|_| allowed.as_ref().is_none_or(|set| set.contains(&id)))
+                .ok_or_else(|| input("candidates.select", Some(id), "unknown candidate ID"))?;
+            if !seen.insert(id) {
+                return Err(input(
+                    "candidates.select",
+                    Some(id),
+                    "duplicate candidate ID",
+                ));
+            }
+            selection.ids.push(id);
+            selection.slots.push(*slot);
+        }
+        Ok(Self {
+            catalog: self.catalog.clone(),
+            selection: Some(selection),
         })
     }
 
-    pub(crate) fn from_catalog_slots(
-        nexus: &'data Nexus<'data>,
-        slots: impl IntoIterator<Item = usize>,
-    ) -> VcpResult<Self> {
-        let assets = nexus.prepared();
-        let Some(catalog) = assets.documents else {
-            return Err(invalid(STAGE, "candidate IDs require a prepared catalog"));
-        };
-        let mut ids = Vec::new();
-        let mut document_ids = Vec::new();
-        let mut vectors = Vec::new();
-        let mut columns = CandidateColumns::new();
-        for row in slots {
-            let id = catalog.ids[row];
-            ids.push(id);
-            document_ids.push(catalog.document_ids.map_or(id, |values| values[row]));
-            vectors.extend_from_slice(catalog.vectors.row(row).expect("validated catalog"));
-            for path in offsets(catalog.path_offsets, row) {
-                let steps = offsets(catalog.tag_offsets, path);
-                let source = catalog
-                    .path_sources
-                    .map(|roots| assets.source_ids[roots[path].index()]);
-                columns.add_path(
-                    &catalog.tags[steps.clone()],
-                    &catalog.positions[steps],
-                    source,
-                )?;
-            }
-            columns.finish_row(
-                catalog.roots[offsets(catalog.root_offsets, row)]
-                    .iter()
-                    .copied(),
-            )?;
-        }
-        Self::new(
-            nexus,
-            Cow::Owned(ids),
-            Cow::Owned(document_ids),
-            CandidateVectors::Owned {
-                data: vectors,
-                dim: assets.tags.dim,
-            },
-            columns,
+    pub fn ids(&self) -> &[CandidateId] {
+        self.selection.as_ref().map_or_else(
+            || self.catalog.vectors.rows().ids(),
+            |selection| &selection.ids,
         )
     }
-
-    pub fn ids(&self) -> &[u64] {
-        &self.ids
+    pub fn len(&self) -> usize {
+        self.ids().len()
     }
-    pub fn document_ids(&self) -> &[u64] {
-        &self.document_ids
-    }
-
-    pub(crate) fn path_sources(&self) -> &[Option<u64>] {
-        &self.columns.path_sources
+    pub fn is_empty(&self) -> bool {
+        self.ids().is_empty()
     }
 
-    pub(crate) fn rows(&self) -> CandidateRowsView<'_> {
-        let columns = &self.columns;
-        CandidateRowsView {
-            candidate_count: self.ids.len(),
-            candidate_vectors: match &self.vectors {
-                CandidateVectors::Owned { data, dim } => {
-                    VectorMatrixView::new(data, self.ids.len(), *dim)
-                        .expect("prepared candidate dimensions")
-                }
-                CandidateVectors::Borrowed(view) => *view,
-            },
-            document_ids: &self.document_ids,
-            candidate_root_offsets: &columns.root_offsets,
-            candidate_roots: &columns.roots,
-            candidate_path_offsets: &columns.path_offsets,
-            path_tag_offsets: &columns.path_tag_offsets,
-            path_tags: &columns.path_tags,
-            path_positions: &columns.path_positions,
-        }
+    pub fn vectors(&self) -> VectorRows<'_> {
+        let base = self.catalog.vectors.rows();
+        self.selection.as_ref().map_or(base, |s| {
+            base.select_rows(&s.ids, &s.slots)
+                .expect("validated selection")
+        })
+    }
+
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.catalog.identity
+    }
+
+    pub(crate) fn info(&self, ordinal: usize) -> &CandidateInfo {
+        let slot = self
+            .selection
+            .as_ref()
+            .map_or(ordinal, |s| s.slots[ordinal]);
+        &self.catalog.info[slot]
     }
 }
 
-impl Nexus<'_> {
-    pub fn candidates<'data>(
-        &'data self,
-        input: CandidateInput<'data>,
-    ) -> VcpResult<CandidateSet<'data>> {
-        let dim = self.prepared().tags.dim;
-        let mut columns = CandidateColumns::new();
-        match input {
-            CandidateInput::Ids(keys) => {
-                let slots = keys
-                    .iter()
-                    .map(|&id| slot(&self.document_slots, id))
-                    .collect::<VcpResult<Vec<_>>>()?;
-                CandidateSet::from_catalog_slots(self, slots)
+impl Model {
+    pub fn candidates(&self, data: CandidateData) -> Result<Candidates<'static>> {
+        let dimension = self.concepts().dimension();
+        let length = data
+            .len()
+            .checked_mul(dimension)
+            .ok_or_else(|| input("candidates", None, "matrix size overflows"))?;
+        let mut ids = Vec::with_capacity(data.len());
+        let mut values = Vec::with_capacity(length);
+        let mut info = Vec::with_capacity(data.len());
+        let mut slots = HashMap::with_capacity(data.len());
+        for candidate in data {
+            let (vector, metadata) = candidate.into_data();
+            let id = metadata.id;
+            if slots.insert(id, ids.len()).is_some() {
+                return Err(input("candidate.id", Some(id), "duplicate candidate ID"));
             }
-            CandidateInput::Owned(rows) => {
-                let mut ids = Vec::with_capacity(rows.len());
-                let mut document_ids = Vec::with_capacity(rows.len());
-                let mut vectors = Vec::with_capacity(rows.len().saturating_mul(dim));
-                for row in rows {
-                    ids.push(row.id);
-                    document_ids.push(row.document_id.unwrap_or(row.id));
-                    vectors.extend(normalize_direction(&row.vector, dim, STAGE)?);
-                    columns.add_host_row(self, &row.paths)?;
-                }
-                CandidateSet::new(
-                    self,
-                    Cow::Owned(ids),
-                    Cow::Owned(document_ids),
-                    CandidateVectors::Owned { data: vectors, dim },
-                    columns,
-                )
+            if vector.len() != dimension {
+                return Err(input(
+                    "candidate.vector",
+                    Some(id),
+                    format!("expected dimension {dimension}, got {}", vector.len()),
+                ));
             }
-            CandidateInput::Borrowed(rows) => {
-                if rows.vectors.dim != dim
-                    || rows.vectors.rows != rows.ids.len()
-                    || rows
-                        .document_ids
-                        .is_some_and(|ids| ids.len() != rows.ids.len())
-                    || rows
-                        .paths
-                        .is_some_and(|paths| paths.len() != rows.ids.len())
-                {
-                    return Err(invalid(
-                        STAGE,
-                        "borrowed candidate columns must align with candidate IDs and asset dimension",
-                    ));
-                }
-                let mut vectors = rows.vectors;
-                vectors.sq_norms_f64 = None;
-                validate_unit_matrix(vectors, STAGE)?;
-                for row in 0..rows.ids.len() {
-                    columns.add_host_row(self, rows.paths.map_or(&[], |paths| paths[row]))?;
-                }
-                CandidateSet::new(
-                    self,
-                    Cow::Borrowed(rows.ids),
-                    Cow::Borrowed(rows.document_ids.unwrap_or(rows.ids)),
-                    CandidateVectors::Borrowed(vectors),
-                    columns,
-                )
-            }
+            ids.push(id);
+            values.extend(vector);
+            info.push(bind(self, metadata)?);
         }
+        let vectors = OwnedUnitVectors::new(ids.into(), values, dimension, &Default::default())
+            .map_err(|error| match error {
+                crate::Error::Input { id, message, .. } => input("candidate.vector", id, message),
+                error => error,
+            })?;
+        Ok(Candidates {
+            catalog: Arc::new(Catalog {
+                identity: self.identity().clone(),
+                vectors: Storage::Owned(vectors),
+                info,
+                slots,
+            }),
+            selection: None,
+        })
+    }
+
+    pub fn candidate_view<'a>(&self, mut data: CandidateView<'a>) -> Result<Candidates<'a>> {
+        let rows = data.vectors.as_rows();
+        let dimension = self.concepts().dimension();
+        if dimension != rows.dimension() {
+            return Err(input(
+                "candidate.vectors",
+                None,
+                format!("expected dimension {dimension}, got {}", rows.dimension()),
+            ));
+        }
+        let mut info = Vec::with_capacity(rows.len());
+        let mut slots = HashMap::with_capacity(rows.len());
+        for (slot, &id) in rows.ids().iter().enumerate() {
+            slots.insert(id, slot);
+            let metadata = data.metadata.remove(&id).unwrap_or(CandidateMetadata {
+                id,
+                document_id: None,
+                sources: Vec::new(),
+                paths: None,
+            });
+            info.push(bind(self, metadata)?);
+        }
+        Ok(Candidates {
+            catalog: Arc::new(Catalog {
+                identity: self.identity().clone(),
+                vectors: Storage::Borrowed(data.vectors),
+                info,
+                slots,
+            }),
+            selection: None,
+        })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Concept, Dataset, ExecutionContext};
-
-    #[test]
-    fn borrowed_candidates_validate_directions_without_copying() -> VcpResult<()> {
-        let nexus = Nexus::prepare(
-            Dataset {
-                concepts: vec![Concept {
-                    id: 10,
-                    name: "example".into(),
-                    aliases: vec![],
-                    vector: vec![1., 0.],
-                }],
-                ..Default::default()
-            },
-            &Default::default(),
-            &ExecutionContext::default(),
-        )?;
-        let inside = [f32::from_bits(1.0_f32.to_bits() + 2), 0.];
-        let rows = BorrowedCandidates::new(&[100], VectorMatrixView::new(&inside, 1, 2)?);
-        let set = nexus.candidates(CandidateInput::Borrowed(rows))?;
-        assert!(std::ptr::eq(
-            set.rows().candidate_vectors.data,
-            inside.as_slice()
-        ));
-        let outside = [f32::from_bits(1.0_f32.to_bits() + 8), 0.];
-        let rows = BorrowedCandidates::new(&[100], VectorMatrixView::new(&outside, 1, 2)?);
-        assert!(nexus.candidates(CandidateInput::Borrowed(rows)).is_err());
+fn bind(model: &Model, metadata: CandidateMetadata) -> Result<CandidateInfo> {
+    let mut sources = BTreeSet::new();
+    let mut roots = Some(BTreeSet::new());
+    let book = &model.graph_assets().sources;
+    let candidate = Some(metadata.id);
+    let source_lookup = |source| {
+        book.get(source).ok_or_else(|| {
+            input(
+                "candidate.sources",
+                candidate,
+                format!("unknown source {source}"),
+            )
+        })
+    };
+    let mut paths = Vec::new();
+    let mut seen_paths = HashSet::new();
+    let mut add_path = |path: PathRef| -> Result<()> {
+        if !seen_paths.insert(path.clone()) {
+            return Ok(());
+        }
+        let source = source_lookup(path.source)?;
+        let original = source.paths.get(path.path).ok_or_else(|| {
+            input(
+                "candidate.paths",
+                candidate,
+                format!("unknown path {} of source {}", path.path, path.source),
+            )
+        })?;
+        let (positions, nodes) = if let Some(positions) = path.positions {
+            if positions.windows(2).any(|p| p[0] >= p[1])
+                || positions
+                    .last()
+                    .is_some_and(|&i| i >= original.original.len())
+            {
+                return Err(input(
+                    "candidate.paths.positions",
+                    candidate,
+                    format!(
+                        "invalid source {} path {} positions {positions:?}",
+                        path.source, path.path
+                    ),
+                ));
+            }
+            let mut seen = HashSet::new();
+            positions
+                .into_iter()
+                .map(|p| (p, original.original[p]))
+                .filter(|&(_, node)| seen.insert(node))
+                .unzip()
+        } else {
+            original.unique.iter().copied().unzip()
+        };
+        paths.push(BoundPath {
+            source: path.source,
+            ordinal: path.path,
+            nodes,
+            positions,
+        });
         Ok(())
+    };
+
+    if let Some(explicit) = metadata.paths {
+        for path in explicit {
+            sources.insert(path.source);
+            add_path(path)?;
+        }
+    } else {
+        for &id in &metadata.sources {
+            if sources.insert(id) {
+                for path in 0..source_lookup(id)?.paths.len() {
+                    add_path(PathRef {
+                        source: id,
+                        path,
+                        positions: None,
+                    })?;
+                }
+            }
+        }
     }
+    sources.extend(metadata.sources);
+    for &source in &sources {
+        let known = &source_lookup(source)?.roots;
+        match (&mut roots, known) {
+            (Some(roots), Some(known)) => roots.extend(known),
+            (_, None) => roots = None,
+            (None, Some(_)) => {}
+        }
+    }
+    if sources.is_empty() {
+        roots = None;
+    }
+    Ok(CandidateInfo {
+        document_id: metadata.document_id,
+        roots,
+        paths,
+    })
 }

@@ -1,359 +1,483 @@
 // SPDX-License-Identifier: CC-BY-NC-SA-4.0
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
-use crate::dataset::invalid;
-use crate::readout::{CandidateIdentity, dtsc_readout, river_readout};
+use nexus_math::dtsc::{
+    self, CurveMetrics, DtscConfig, DtscEvidenceConfig, DtscFieldConfig, DtscReadoutConfig,
+    FieldStats,
+};
+use nexus_math::kernel::{PrecisionMode, cosine_f32, cosine_f32_with_norms, norm_sq_f32};
+use nexus_math::{NodeId, VectorRows, cosine_columns};
+use rayon::prelude::*;
+
+use crate::candidates::CandidateInfo;
 use crate::{
-    CandidateInput, CandidateSet, DtscField, DtscReadout, FieldState, Nexus, Observation, PathRef,
-    Query, RiverReadout, ScoreItem, Stage, TagMemoReadout, ThinkingPlan,
+    CandidateId, Candidates, DtscCandidateEvidence, DtscDecision, Error, Observation,
+    ReadoutSummary, RecallKind, Result, RunOptions, ScoreEvidence, ScoreRow, Scores, SelectedPath,
+    input,
 };
-use nexus_core::{CandidateId, ExecutionContext, QueryCosines, ThinkingStageInputView, VcpResult};
-use nexus_math::{
-    DtscConfig, DtscEvidenceConfig, DtscEvidenceInput, DtscEvidenceValues, DtscGeometryState,
-    DtscReadoutConfig, prepare_dtsc_evidence, readout_dtsc,
-};
-use nexus_vcp::{
-    FieldConfig, ObservationConfig, PathEvidence, PropagationCompletion, RiverAnalysisConfig,
-    RiverAnalysisInput, RiverScoringConfig, ThinkingConfig, ThinkingInput, plan_thinking,
-    prepare_river_evidence,
-};
-use std::collections::HashSet;
-use std::time::Instant;
 
-#[derive(Clone, Debug, Default)]
-pub struct RiverQueryConfig {
-    pub observation: ObservationConfig,
-    pub river: RiverConfig,
+#[derive(Clone, Default)]
+pub struct EvaluateOptions {
+    pub run: RunOptions,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RiverConfig {
-    pub fields: FieldConfig,
-    pub analysis: RiverAnalysisConfig,
-    pub scoring: RiverScoringConfig,
+#[derive(Clone, Default)]
+pub struct DtscOptions {
+    pub config: DtscConfig,
+    pub run: RunOptions,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct DtscQueryConfig {
-    pub observation: ObservationConfig,
-    pub dtsc: DtscConfig,
+#[derive(Clone, Default)]
+pub struct DtscEvidenceOptions {
+    pub field: DtscFieldConfig,
+    pub evidence: DtscEvidenceConfig,
+    pub run: RunOptions,
 }
 
-pub struct Evaluation<'obs, 'set, 'data> {
-    observation: &'obs Observation<'data>,
-    candidates: &'set CandidateSet<'data>,
-    cosines: QueryCosines<'set, 'obs>,
+#[derive(Clone, Default)]
+pub struct DtscReadoutOptions {
+    pub config: DtscReadoutConfig,
+    pub run: RunOptions,
 }
 
-pub struct RiverEvidence {
-    ids: Vec<CandidateIdentity>,
-    path_sources: Vec<Option<u64>>,
-    values: nexus_vcp::RiverEvidence,
+const LANES: [RecallKind; 4] = [
+    RecallKind::Original,
+    RecallKind::Enhanced,
+    RecallKind::LocalField,
+    RecallKind::TransferField,
+];
+const FOLD: PrecisionMode = PrecisionMode::StrictLeftFold;
+
+struct Similarities {
+    closures: HashMap<NodeId, f64>,
 }
 
-pub struct DtscEvidence {
-    ids: Vec<CandidateIdentity>,
-    path_sources: Vec<Option<u64>>,
-    values: DtscEvidenceValues,
-    propagation: PropagationCompletion,
+pub struct Evaluation<'a> {
+    pub(crate) observation: &'a Observation,
+    pub(crate) candidates: &'a Candidates<'a>,
+    vectors: VectorRows<'a>,
+    identity: Arc<()>,
+    slots: HashMap<CandidateId, usize>,
+    similarities: Vec<Similarities>,
+    lanes: [Vec<f64>; 5],
 }
 
-impl<'data> Observation<'data> {
-    pub fn evaluate<'obs, 'set>(
-        &'obs self,
-        candidates: &'set CandidateSet<'data>,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<Evaluation<'obs, 'set, 'data>> {
-        self.check_candidates(candidates)?;
-        let values = self.values();
-        let cosines = QueryCosines::prepare(
-            ctx,
-            candidates.rows(),
-            &values.original_query,
-            &values.fused.enhanced_query,
-        )?;
+impl Observation {
+    pub fn evaluate<'a>(
+        &'a self,
+        candidates: &'a Candidates<'_>,
+        options: &EvaluateOptions,
+    ) -> Result<Evaluation<'a>> {
+        let run = &options.run;
+        run.check_cancelled()?;
+        if !Arc::ptr_eq(self.model.identity(), candidates.identity()) {
+            return Err(Error::Association {
+                message: "candidates and observation belong to different models".into(),
+            });
+        }
+        let rows = candidates.vectors();
+        let concepts = self.model.concepts();
+        let seeds = &self.analysis().seeds;
+        let [original, enhanced, local, transfer] = LANES.map(|kind| self.vector(kind));
+        let directions = [
+            original,
+            enhanced,
+            local,
+            transfer,
+            seeds.differentia.as_ref().map(|v| v.as_slice()),
+        ];
+        let columns = cosine_columns(directions, rows, run)?;
+        let lanes = std::array::from_fn(|i| columns.iter().map(|row| row[i]).collect());
+        let parent_ids: Vec<_> = seeds
+            .pruned_hypernyms
+            .iter()
+            .map(|id| concepts.node(*id))
+            .collect::<Result<_>>()?;
+        let calculate = |index| -> Result<Similarities> {
+            run.check_cancelled()?;
+            let row = rows.row(index).expect("validated candidate index");
+            let norm = norm_sq_f32(row, FOLD);
+            let nodes: BTreeSet<_> = candidates
+                .info(index)
+                .paths
+                .iter()
+                .flat_map(|path| path.nodes.iter().copied())
+                .chain(parent_ids.iter().copied())
+                .collect();
+            let closures = nodes
+                .into_iter()
+                .map(|node| {
+                    run.check_cancelled()?;
+                    let tag = concepts.row(node);
+                    let cosine =
+                        cosine_f32_with_norms(row, tag, norm, norm_sq_f32(tag, FOLD), FOLD, 0.0)
+                            .clamp(-1.0, 1.0);
+                    Ok((node, cosine))
+                })
+                .collect::<Result<_>>()?;
+            Ok(Similarities { closures })
+        };
+        let similarities: Vec<_> = if run.parallelism.is_parallel() {
+            (0..rows.len())
+                .into_par_iter()
+                .map(calculate)
+                .collect::<Result<_>>()?
+        } else {
+            (0..rows.len()).map(calculate).collect::<Result<_>>()?
+        };
+        let slots = rows
+            .ids()
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+        run.check_cancelled()?;
         Ok(Evaluation {
             observation: self,
             candidates,
-            cosines,
+            vectors: rows,
+            identity: Arc::new(()),
+            slots,
+            similarities,
+            lanes,
+        })
+    }
+}
+
+impl Evaluation<'_> {
+    pub(crate) fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+    pub fn cosine(&self) -> Scores {
+        self.cosine_lane(0)
+    }
+    pub fn tag_memo(&self) -> Scores {
+        self.cosine_lane(1)
+    }
+
+    fn cosine_lane(&self, lane: usize) -> Scores {
+        let direction = LANES[lane];
+        let rows = self.lanes[lane]
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| self.row(i, value, ScoreEvidence::Cosine { direction }))
+            .collect();
+        self.scores(rows, ReadoutSummary::Cosine { direction })
+    }
+
+    pub fn baseline(&self, values: impl IntoIterator<Item = (CandidateId, f64)>) -> Result<Scores> {
+        let count = self.candidates.len();
+        let mut rows = vec![None; count];
+        let mut priorities = vec![0; count];
+        for (priority, (id, value)) in values.into_iter().enumerate() {
+            let slot = self.slot(id, "baseline")?;
+            if !value.is_finite() || rows[slot].is_some() {
+                return Err(input(
+                    "baseline",
+                    Some(id),
+                    "expected a unique finite value",
+                ));
+            }
+            rows[slot] = Some(self.row(slot, value, ScoreEvidence::External));
+            priorities[slot] = priority;
+        }
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(slot, row)| {
+                row.ok_or_else(|| {
+                    input(
+                        "baseline",
+                        Some(self.candidates.ids()[slot]),
+                        "missing candidate value",
+                    )
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Scores {
+            rows,
+            priorities,
+            ..self.scores(Vec::new(), ReadoutSummary::External)
         })
     }
 
-    fn check_candidates(&self, set: &CandidateSet<'data>) -> VcpResult<()> {
-        if std::ptr::eq(self.nexus, set.nexus) {
-            Ok(())
+    pub fn dtsc(&self, baseline: &Scores, options: &DtscOptions) -> Result<Scores> {
+        if !Arc::ptr_eq(&self.identity, &baseline.evaluation) {
+            return Err(Error::Association {
+                message: "baseline belongs to a different evaluation".into(),
+            });
+        }
+        self.build_dtsc(
+            &options.config.field,
+            &options.config.evidence,
+            &options.run,
+        )?
+        .apply_with(baseline, &options.config.readout, &options.run)
+    }
+
+    pub fn dtsc_evidence(&self, options: &DtscEvidenceOptions) -> Result<DtscEvidence> {
+        self.build_dtsc(&options.field, &options.evidence, &options.run)
+    }
+
+    fn build_dtsc(
+        &self,
+        field_config: &DtscFieldConfig,
+        evidence_config: &DtscEvidenceConfig,
+        run: &RunOptions,
+    ) -> Result<DtscEvidence> {
+        let observation = self.observation;
+        let data = observation.model.concepts().vectors().as_rows();
+        let analysis = observation.analysis();
+        let geometry = if evidence_config
+            .auxiliary
+            .as_ref()
+            .is_some_and(|aux| aux.geometry.is_some())
+        {
+            let epa = analysis.epa.as_ref().ok_or_else(|| {
+                input(
+                    "dtsc.auxiliary.geometry",
+                    None,
+                    "geometry auxiliary requires an EPA analysis",
+                )
+            })?;
+            let pyramid = analysis.pyramid.as_ref().ok_or_else(|| {
+                input(
+                    "dtsc.auxiliary.geometry",
+                    None,
+                    "geometry auxiliary requires a Pyramid analysis",
+                )
+            })?;
+            Some(dtsc::GeometryState {
+                epa_concentration: epa.concentration,
+                epa_entropy: epa.entropy,
+                epa_resonance: epa.resonance,
+                pyramid_coverage: pyramid.coverage,
+                pyramid_novelty: pyramid.novelty,
+                pyramid_depth: pyramid.levels.len() as f64,
+            })
         } else {
-            Err(invalid(
-                "evaluation",
-                "candidate set belongs to a different Nexus",
-            ))
-        }
-    }
-}
-
-impl<'obs, 'set, 'data> Evaluation<'obs, 'set, 'data> {
-    /// Runs River on the same observation and candidates used by this evaluation.
-    pub fn river(
-        &self,
-        config: &RiverConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<RiverReadout> {
-        let fields = self.observation.fields(&config.fields, ctx)?;
-        self.river_evidence(&fields, &config.analysis, ctx)?
-            .readout(&config.scoring, ctx)
-    }
-
-    /// Runs DTSC on the same observation and candidates used by this evaluation.
-    pub fn dtsc(&self, config: &DtscConfig, ctx: &ExecutionContext<'_>) -> VcpResult<DtscReadout> {
-        let field = self.observation.dtsc_field(&config.field, ctx)?;
-        self.dtsc_evidence(&field, &config.scoring.evidence, ctx)?
-            .readout(&config.scoring.readout, ctx)
-    }
-
-    pub fn tag_memo(&self, ctx: &ExecutionContext<'_>) -> VcpResult<TagMemoReadout> {
-        let start = Instant::now();
-        ctx.check_cancelled("tag_memo")?;
-        let mut items = self
-            .candidates
-            .ids()
-            .iter()
-            .zip(self.candidates.document_ids())
-            .zip(self.cosines.enhanced_cosines())
-            .map(|((&id, &document_id), &score)| ScoreItem {
-                id,
-                document_id,
-                score,
-            })
-            .collect::<Vec<_>>();
-        items.sort_by(|a, b| b.score.total_cmp(&a.score));
-        ctx.check_cancelled("tag_memo")?;
-        Ok(TagMemoReadout {
-            items,
-            propagation: self.observation.values().sense.propagation,
-            elapsed_ms: elapsed_ms(start),
-        })
-    }
-
-    pub fn river_evidence(
-        &self,
-        fields: &FieldState<'obs, 'data>,
-        config: &RiverAnalysisConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<RiverEvidence> {
-        let observation = self.observation;
-        if !std::ptr::eq(observation, fields.observation) {
-            return Err(invalid(
-                "river.prepare",
-                "field state belongs to a different observation",
-            ));
-        }
-        let assets = observation.nexus.prepared();
-        let values = prepare_river_evidence(
-            RiverAnalysisInput {
-                observation: observation.values(),
-                fields: fields.values(),
-                query: &self.cosines,
-                graph: observation.graph(),
-                provenance: assets.provenance,
-                support_groups: assets.groups,
-                root_facts: (assets.sources.root_count > 0).then_some(assets.sources),
-                tag_vectors: assets.tags,
+            None
+        };
+        let field = dtsc::build_field(
+            data,
+            observation.active_concepts(),
+            &dtsc::FieldOptions {
+                config: field_config.clone(),
+                run: run.clone(),
             },
-            config,
-            ctx,
         )?;
-        Ok(RiverEvidence {
-            ids: self.candidates.identity_snapshot(),
-            path_sources: self.candidates.path_sources().to_vec(),
-            values,
-        })
-    }
-
-    pub fn dtsc_evidence(
-        &self,
-        field: &DtscField<'obs, 'data>,
-        config: &DtscEvidenceConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<DtscEvidence> {
-        let observation = self.observation;
-        if !std::ptr::eq(observation, field.observation) {
-            return Err(invalid(
-                "dtsc.evidence",
-                "DTSC field belongs to a different observation",
-            ));
-        }
-        let state = observation.values();
-        let assets = observation.nexus.prepared();
-        let values = prepare_dtsc_evidence(
-            DtscEvidenceInput {
-                field: field.values(),
-                query: &self.cosines,
-                graph: observation.graph(),
-                tag_vectors: assets.tags,
-                geometry: DtscGeometryState {
-                    epa_spectral_concentration: state.epa.spectral_concentration,
-                    epa_entropy: state.epa.entropy,
-                    epa_resonance: state.epa.resonance,
-                    pyramid_coverage: state.pyramid.coverage,
-                    pyramid_novelty: state.pyramid.novelty,
-                    pyramid_depth: state.pyramid.levels.len() as f64,
-                },
-            },
-            config,
-            ctx,
-        )?;
-        Ok(DtscEvidence {
-            ids: self.candidates.identity_snapshot(),
-            path_sources: self.candidates.path_sources().to_vec(),
-            values,
-            propagation: state.sense.propagation,
-        })
-    }
-
-    pub fn thinking(
-        &self,
-        stages: &[Stage<'_>],
-        config: &ThinkingConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<ThinkingPlan> {
-        const STAGE: &str = "thinking.plan";
-        let start = Instant::now();
-        let observation = self.observation;
-        ctx.check_cancelled(STAGE)?;
-        let trace = observation.values().sense.complete_trace()?;
-        let mut seen = HashSet::new();
-        let mut slots_for_stages = Vec::with_capacity(stages.len());
-        for stage in stages {
-            seen.clear();
-            slots_for_stages.push(
-                stage
-                    .candidates
+        let mut sequences = Vec::new();
+        for (i, &id) in self.candidates.ids().iter().enumerate() {
+            run.check_cancelled()?;
+            for (ordinal, path) in self.info(i).paths.iter().enumerate() {
+                let concepts = path
+                    .nodes
                     .iter()
-                    .map(|id| {
-                        if !seen.insert(id) {
-                            return Err(invalid(
-                                STAGE,
-                                format!("candidate {id} is repeated in stage {}", stage.name),
-                            ));
-                        }
-                        let slot = self
-                            .candidates
-                            .slots
-                            .get(id)
-                            .ok_or_else(|| invalid(STAGE, format!("unknown candidate {id}")))?;
-                        CandidateId::from_index(*slot, STAGE)
-                    })
-                    .collect::<VcpResult<Vec<_>>>()?,
-            );
+                    .map(|node| data.ids()[node.index()])
+                    .collect::<Vec<_>>();
+                if !concepts.is_empty() {
+                    sequences.push((id, ordinal, concepts));
+                }
+            }
         }
-        let stages = stages
+        let paths = sequences
             .iter()
-            .zip(&slots_for_stages)
-            .map(|(stage, slots)| ThinkingStageInputView {
-                stage_label: stage.name,
-                k: stage.limit,
-                candidates: slots,
+            .map(|(candidate, ordinal, concepts)| dtsc::Path {
+                candidate: *candidate,
+                ordinal: *ordinal,
+                concepts,
             })
             .collect::<Vec<_>>();
-        let assets = observation.nexus.prepared();
-        let result = plan_thinking(
-            ThinkingInput {
-                trace,
-                query: &self.cosines,
-                stages: &stages,
-                graph: observation.graph(),
-                provenance: assets.provenance,
-                support_groups: assets.groups,
-                tag_vectors: assets.tags,
+        let tag_body = |candidate, concept| {
+            let slot = *self.slots.get(&candidate)?;
+            let node = observation.model.concepts().node(concept).ok()?;
+            self.similarities[slot].closures.get(&node).copied()
+        };
+        let evidence = dtsc::evidence_with_shared(
+            dtsc::EvidenceInput {
+                field: &field,
+                concepts: data,
+                graph: Some(observation.model.transport()),
+                query: observation
+                    .vector(RecallKind::Original)
+                    .expect("original direction"),
+                enhanced_query: observation.vector(RecallKind::Enhanced),
+                candidates: self.vectors,
+                paths: &paths,
+                geometry,
             },
-            config,
-            ctx,
+            &dtsc::EvidenceOptions {
+                config: evidence_config.clone(),
+                run: run.clone(),
+            },
+            dtsc::SharedEvidence {
+                effective: observation.effective.as_ref(),
+                cosines: Some([&self.lanes[0], &self.lanes[1]]),
+                tag_body: Some(&tag_body),
+            },
         )?;
-        let mut plan = self.candidates.thinking_plan(result);
-        plan.elapsed_ms = elapsed_ms(start);
-        Ok(plan)
+        let path_by_id: HashMap<_, _> = evidence
+            .items()
+            .iter()
+            .filter_map(|item| {
+                let index = *self.slots.get(&item.candidate)?;
+                let path = self.info(index).paths.get(item.path?)?;
+                Some((item.candidate, path.selected(&observation.model)))
+            })
+            .collect();
+        let metrics_slots = evidence
+            .items()
+            .iter()
+            .enumerate()
+            .map(|(i, item)| (item.candidate, i))
+            .collect();
+        Ok(DtscEvidence {
+            evaluation: self.identity.clone(),
+            ids: self.candidates.ids().to_vec(),
+            evidence,
+            metrics_slots,
+            path_by_id,
+        })
+    }
+
+    pub(crate) fn slot(&self, id: CandidateId, field: &'static str) -> Result<usize> {
+        self.slots
+            .get(&id)
+            .copied()
+            .ok_or_else(|| input(field, Some(id), "candidate is outside this evaluation"))
+    }
+
+    pub(crate) fn info(&self, slot: usize) -> &CandidateInfo {
+        self.candidates.info(slot)
+    }
+    pub(crate) fn lane(&self, slot: usize, lane: usize) -> f64 {
+        self.lanes[lane][slot]
+    }
+    pub(crate) fn differentia(&self, slot: usize) -> f64 {
+        self.lanes[4][slot]
+    }
+
+    pub(crate) fn closure(&self, slot: usize, node: NodeId) -> f64 {
+        self.similarities[slot]
+            .closures
+            .get(&node)
+            .copied()
+            .unwrap_or_else(|| {
+                cosine_f32(
+                    self.vectors.row(slot).expect("validated candidate"),
+                    self.observation.model.concepts().row(node),
+                    FOLD,
+                )
+                .clamp(-1.0, 1.0)
+            })
+    }
+
+    pub(crate) fn row(&self, slot: usize, value: f64, evidence: ScoreEvidence) -> ScoreRow {
+        ScoreRow {
+            id: self.candidates.ids()[slot],
+            value,
+            document_id: self.info(slot).document_id,
+            evidence,
+        }
+    }
+
+    pub(crate) fn scores(&self, rows: Vec<ScoreRow>, summary: ReadoutSummary) -> Scores {
+        Scores {
+            evaluation: self.identity.clone(),
+            priorities: (0..rows.len()).collect(),
+            rows,
+            summary,
+        }
     }
 }
 
-impl RiverEvidence {
-    pub fn readout(
-        &self,
-        config: &RiverScoringConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<RiverReadout> {
-        Ok(river_readout(
-            self.values.readout(config, ctx)?,
-            &self.ids,
-            &self.path_sources,
-        ))
-    }
-
-    pub fn candidate_paths(
-        &self,
-        id: u64,
-    ) -> Option<impl Iterator<Item = (Option<PathRef>, &PathEvidence)>> {
-        let index = self.ids.iter().position(|identity| identity.id == id)?;
-        let identity = self.ids[index];
-        Some(
-            self.values.paths()[index]
-                .iter()
-                .map(move |path| (identity.path_ref(path.path, &self.path_sources), path)),
-        )
-    }
+pub struct DtscEvidence {
+    evaluation: Arc<()>,
+    ids: Vec<CandidateId>,
+    evidence: dtsc::Evidence,
+    metrics_slots: HashMap<CandidateId, usize>,
+    path_by_id: HashMap<CandidateId, SelectedPath>,
 }
 
 impl DtscEvidence {
-    pub fn readout(
+    pub fn candidate_ids(&self) -> &[CandidateId] {
+        &self.ids
+    }
+    pub fn metrics(&self, id: CandidateId) -> Option<&CurveMetrics> {
+        Some(
+            &self
+                .evidence
+                .items()
+                .get(*self.metrics_slots.get(&id)?)?
+                .metrics,
+        )
+    }
+    pub fn selected_path(&self, id: CandidateId) -> Option<&SelectedPath> {
+        self.path_by_id.get(&id)
+    }
+    pub fn field_stats(&self) -> &FieldStats {
+        self.evidence.field_stats()
+    }
+
+    pub fn apply(&self, baseline: &Scores, options: &DtscReadoutOptions) -> Result<Scores> {
+        self.apply_with(baseline, &options.config, &options.run)
+    }
+
+    fn apply_with(
         &self,
+        baseline: &Scores,
         config: &DtscReadoutConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<DtscReadout> {
-        Ok(dtsc_readout(
-            readout_dtsc(&self.values, config, ctx)?,
-            &self.ids,
-            &self.path_sources,
-            self.propagation,
-        ))
+        run: &RunOptions,
+    ) -> Result<Scores> {
+        run.check_cancelled()?;
+        if !Arc::ptr_eq(&self.evaluation, &baseline.evaluation) {
+            return Err(Error::Association {
+                message: "DTSC evidence and baseline belong to different evaluations".into(),
+            });
+        }
+        let base = nexus_math::Scores::new(baseline.values())?;
+        let result = self.evidence.apply(
+            &base,
+            &dtsc::ReadoutOptions {
+                config: config.clone(),
+                run: run.clone(),
+            },
+        )?;
+        let rows = result
+            .scores
+            .values()
+            .zip(baseline.iter())
+            .map(|((id, value), base)| {
+                debug_assert_eq!(id, base.id);
+                let geometry = *self.metrics(id).expect("evidence covers candidates");
+                let correction = if result.decision == DtscDecision::Applied {
+                    config.correction_gain * geometry.geo_bonus
+                } else {
+                    0.0
+                };
+                ScoreRow {
+                    id,
+                    value,
+                    document_id: base.document_id,
+                    evidence: ScoreEvidence::Dtsc(DtscCandidateEvidence {
+                        selected_path: self.selected_path(id).cloned(),
+                        baseline_value: base.value,
+                        correction_gain: config.correction_gain,
+                        correction,
+                        geometry,
+                    }),
+                }
+            })
+            .collect();
+        Ok(Scores {
+            evaluation: self.evaluation.clone(),
+            rows,
+            priorities: baseline.priorities.clone(),
+            summary: ReadoutSummary::Dtsc {
+                decision: result.decision,
+            },
+        })
     }
-}
-
-impl Nexus<'_> {
-    pub fn rank_river<'data>(
-        &'data self,
-        query: &Query<'_>,
-        candidates: CandidateInput<'data>,
-        config: &RiverQueryConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<RiverReadout> {
-        let set = self.candidates(candidates)?;
-        let observation = self.observe(query, &config.observation, ctx)?;
-        observation.evaluate(&set, ctx)?.river(&config.river, ctx)
-    }
-
-    pub fn rank_dtsc<'data>(
-        &'data self,
-        query: &Query<'_>,
-        candidates: CandidateInput<'data>,
-        config: &DtscQueryConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<DtscReadout> {
-        let set = self.candidates(candidates)?;
-        let observation = self.observe(query, &config.observation, ctx)?;
-        observation.evaluate(&set, ctx)?.dtsc(&config.dtsc, ctx)
-    }
-
-    pub fn rank_tag_memo<'data>(
-        &'data self,
-        query: &Query<'_>,
-        candidates: CandidateInput<'data>,
-        config: &ObservationConfig,
-        ctx: &ExecutionContext<'_>,
-    ) -> VcpResult<TagMemoReadout> {
-        let set = self.candidates(candidates)?;
-        let observation = self.observe(query, config, ctx)?;
-        observation.evaluate(&set, ctx)?.tag_memo(ctx)
-    }
-}
-
-fn elapsed_ms(start: Instant) -> f64 {
-    start.elapsed().as_secs_f64() * 1_000.0
 }

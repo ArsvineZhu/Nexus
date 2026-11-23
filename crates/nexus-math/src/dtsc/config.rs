@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use nexus_core::{VcpError, VcpResult};
+use crate::{Error, Result};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -173,6 +173,24 @@ impl Default for DtscIdentityConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DtscAuxConfig {
     pub max_aux_bonus: f64,
+    pub geometry: Option<DtscGeometryAuxConfig>,
+    pub identity: Option<DtscIdentityConfig>,
+}
+
+impl Default for DtscAuxConfig {
+    fn default() -> Self {
+        Self {
+            max_aux_bonus: 0.018,
+            geometry: Some(DtscGeometryAuxConfig::default()),
+            identity: None,
+        }
+    }
+}
+
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DtscGeometryAuxConfig {
     pub direct_floor_cap: f64,
     pub structural_floor_cap: f64,
     pub thematic_floor_cap: f64,
@@ -180,13 +198,11 @@ pub struct DtscAuxConfig {
     pub min_closure_score: f64,
     pub min_class_evidence: f64,
     pub floor_exponent: f64,
-    pub identity_anchor: Option<DtscIdentityConfig>,
 }
 
-impl Default for DtscAuxConfig {
+impl Default for DtscGeometryAuxConfig {
     fn default() -> Self {
         Self {
-            max_aux_bonus: 0.018,
             direct_floor_cap: 0.018,
             structural_floor_cap: 0.012,
             thematic_floor_cap: 0.006,
@@ -194,7 +210,6 @@ impl Default for DtscAuxConfig {
             min_closure_score: 0.55,
             min_class_evidence: 0.1,
             floor_exponent: 1.5,
-            identity_anchor: None,
         }
     }
 }
@@ -204,13 +219,6 @@ impl Default for DtscAuxConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DtscConfig {
     pub field: DtscFieldConfig,
-    pub scoring: DtscScoringConfig,
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct DtscScoringConfig {
     pub evidence: DtscEvidenceConfig,
     pub readout: DtscReadoutConfig,
 }
@@ -226,103 +234,97 @@ pub struct DtscEvidenceConfig {
 }
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DtscFallbackOrder {
-    #[default]
-    OriginalCosine,
-    /// The caller already ordered the candidate pool by its baseline rank.
-    InputOrder,
-}
-
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DtscReadoutConfig {
     pub trust: DtscTrustConfig,
-    pub top_k: usize,
     pub fallback_on_low_trust: bool,
-    /// Baseline ordering when geometric evidence is insufficient.
-    pub fallback_order: DtscFallbackOrder,
-    /// Fraction of the prepared geometric reward applied to the original cosine.
-    /// Set to 1.0 to use the full reward or 0.0 to rank by cosine.
-    pub geometry_weight: f64,
+    pub correction_gain: f64,
 }
 
 impl Default for DtscReadoutConfig {
     fn default() -> Self {
         Self {
             trust: DtscTrustConfig::default(),
-            top_k: 0,
             fallback_on_low_trust: true,
-            fallback_order: DtscFallbackOrder::default(),
-            geometry_weight: 0.15,
+            correction_gain: 1.0,
         }
     }
 }
 
-fn require(condition: bool, name: &str, constraint: &str) -> VcpResult<()> {
+fn require(condition: bool, field: &'static str, constraint: &str) -> Result<()> {
     if condition {
         Ok(())
     } else {
-        Err(VcpError::InvalidInput {
-            stage: "dtsc.config",
-            detail: format!("{name} must {constraint}"),
-        })
+        Err(Error::config(field, constraint))
     }
 }
 
-fn range(name: &str, value: f64, lower: f64, upper: f64) -> VcpResult<()> {
+fn range(field: &'static str, value: f64, start: f64, end: f64) -> Result<()> {
     require(
-        (lower..=upper).contains(&value),
-        name,
-        &format!("be in [{lower}, {upper}]"),
+        (start..=end).contains(&value),
+        field,
+        &format!("value must be in [{start}, {end}]"),
+    )
+}
+
+fn nonnegative(field: &'static str, value: f64) -> Result<()> {
+    require(
+        value.is_finite() && value >= 0.0,
+        field,
+        "value must be finite and nonnegative",
+    )
+}
+
+fn greater(field: &'static str, value: f64, min: f64) -> Result<()> {
+    require(
+        value.is_finite() && value > min,
+        field,
+        &format!("value must be finite and greater than {min}"),
+    )
+}
+
+fn fraction(field: &'static str, value: f64) -> Result<()> {
+    require(
+        (0.0..1.0).contains(&value),
+        field,
+        "value must be in [0, 1)",
     )
 }
 
 impl DtscFieldConfig {
-    pub fn validate(&self) -> VcpResult<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         require(
             self.min_field_tags > 0 && self.min_field_tags <= self.max_field_nodes,
             "min_field_tags",
-            "be positive and at most max_field_nodes",
+            "must be positive and at most max_field_nodes",
         )?;
         require(
             self.max_field_neighbors > 0,
             "max_field_neighbors",
-            "be positive",
+            "must be positive",
         )?;
-        range(
-            "field_energy_mass_ratio",
-            self.field_energy_mass_ratio,
-            0.5,
-            1.0,
-        )?;
-        range(
-            "field_similarity_threshold",
-            self.field_similarity_threshold,
-            -1.0,
-            1.0,
-        )?;
-        range("public_hub_floor", self.public_hub_floor, 0.05, 1.0)?;
         require(
-            self.field_kernel_exponent.is_finite() && self.field_kernel_exponent > 0.0,
+            self.field_energy_mass_ratio > 0.0 && self.field_energy_mass_ratio <= 1.0,
+            "field_energy_mass_ratio",
+            "must be in (0, 1]",
+        )?;
+        require(
+            (-1.0..1.0).contains(&self.field_similarity_threshold),
+            "field_similarity_threshold",
+            "must be in [-1, 1)",
+        )?;
+        range("public_hub_floor", self.public_hub_floor, 0.0, 1.0)?;
+        require(
+            self.field_kernel_exponent.is_finite() && self.field_kernel_exponent >= 0.25,
             "field_kernel_exponent",
-            "be finite and positive",
+            "must be finite and at least 0.25",
         )
     }
 }
 
-impl DtscConfig {
-    pub fn validate(&self) -> VcpResult<()> {
-        self.field.validate()?;
-        self.scoring.evidence.validate()?;
-        self.scoring.readout.validate()
-    }
-}
-
 impl DtscEvidenceConfig {
-    pub fn validate(&self) -> VcpResult<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         let c = &self.curve;
         range(
             "curve.strong_contact_threshold",
@@ -342,34 +344,30 @@ impl DtscEvidenceConfig {
             -1.0,
             1.0,
         )?;
-        require(
-            c.position_decay.is_finite() && c.position_decay >= 0.0,
-            "curve.position_decay",
-            "be finite and nonnegative",
-        )?;
+        nonnegative("curve.position_decay", c.position_decay)?;
         require(
             c.min_geo_samples > 0,
             "curve.min_geo_samples",
-            "be positive",
+            "must be positive",
         )?;
+
         let s = &self.sparse;
-        if s.enabled {
-            require(
-                s.min_contacts >= 2,
-                "sparse.min_contacts",
-                "be at least two",
-            )?;
-            require(
-                s.pair_saturation > 0,
-                "sparse.pair_saturation",
-                "be positive",
-            )?;
-            range("sparse.min_conductance", s.min_conductance, 0.0, 1.0)?;
-            range("sparse.min_similarity", s.min_similarity, -1.0, 1.0)?;
-            range("sparse.min_potential", s.min_potential, 0.0, 1.0)?;
-            range("sparse.min_closure", s.min_closure, 0.0, 1.0)?;
-            range("sparse.max_relief", s.max_relief, 0.0, 0.8)?;
-        }
+        require(
+            s.min_contacts >= 2,
+            "sparse.min_contacts",
+            "must be at least two",
+        )?;
+        require(
+            s.pair_saturation > 0,
+            "sparse.pair_saturation",
+            "must be positive",
+        )?;
+        nonnegative("sparse.min_conductance", s.min_conductance)?;
+        range("sparse.min_similarity", s.min_similarity, -1.0, 1.0)?;
+        range("sparse.min_potential", s.min_potential, 0.0, 1.0)?;
+        range("sparse.min_closure", s.min_closure, -1.0, 1.0)?;
+        range("sparse.max_relief", s.max_relief, 0.0, 1.0)?;
+
         let r = &self.reward;
         for (name, value) in [
             ("reward.alpha", r.alpha),
@@ -377,6 +375,10 @@ impl DtscEvidenceConfig {
             ("reward.structural_bonus_cap", r.structural_bonus_cap),
             ("reward.thematic_bonus_cap", r.thematic_bonus_cap),
             ("reward.geo_reward_floor", r.geo_reward_floor),
+        ] {
+            nonnegative(name, value)?;
+        }
+        for (name, value) in [
             (
                 "reward.structural_continuity_min",
                 r.structural_continuity_min,
@@ -394,47 +396,52 @@ impl DtscEvidenceConfig {
         ] {
             range(name, value, 0.0, 1.0)?;
         }
-        range(
+        greater(
             "reward.geo_reward_saturation",
             r.geo_reward_saturation,
-            r.geo_reward_floor + 1e-6,
-            1.0,
+            r.geo_reward_floor,
         )?;
-        range(
+        greater(
             "reward.direct_semantic_saturation",
             r.direct_semantic_saturation,
-            r.direct_semantic_min_potential + 1e-6,
-            1.0,
+            r.direct_semantic_min_potential,
         )?;
         require(
             r.direct_semantic_min_contacts > 0,
             "reward.direct_semantic_min_contacts",
-            "be positive",
+            "must be positive",
         )?;
-        if let Some(a) = &self.auxiliary {
-            range("auxiliary.max_aux_bonus", a.max_aux_bonus, 0.0, 0.05)?;
-            for (name, value) in [
-                ("auxiliary.min_fused_score", a.min_fused_score),
-                ("auxiliary.min_closure_score", a.min_closure_score),
-                ("auxiliary.min_class_evidence", a.min_class_evidence),
-                ("auxiliary.direct_floor_cap", a.direct_floor_cap),
-                ("auxiliary.structural_floor_cap", a.structural_floor_cap),
-                ("auxiliary.thematic_floor_cap", a.thematic_floor_cap),
-            ] {
-                range(name, value, 0.0, 1.0)?;
+
+        if let Some(aux) = &self.auxiliary {
+            nonnegative("auxiliary.max_aux_bonus", aux.max_aux_bonus)?;
+            if let Some(g) = &aux.geometry {
+                nonnegative("auxiliary.geometry.direct_floor_cap", g.direct_floor_cap)?;
+                nonnegative(
+                    "auxiliary.geometry.structural_floor_cap",
+                    g.structural_floor_cap,
+                )?;
+                nonnegative(
+                    "auxiliary.geometry.thematic_floor_cap",
+                    g.thematic_floor_cap,
+                )?;
+                fraction("auxiliary.geometry.min_fused_score", g.min_fused_score)?;
+                fraction("auxiliary.geometry.min_closure_score", g.min_closure_score)?;
+                fraction(
+                    "auxiliary.geometry.min_class_evidence",
+                    g.min_class_evidence,
+                )?;
+                greater("auxiliary.geometry.floor_exponent", g.floor_exponent, 0.0)?;
             }
-            range("auxiliary.floor_exponent", a.floor_exponent, 0.5, 4.0)?;
-            if let Some(id) = &a.identity_anchor {
-                for (name, value) in [
-                    ("identity.min_potential", id.min_potential),
-                    ("identity.min_specificity", id.min_specificity),
-                    ("identity.min_tag_chunk_closure", id.min_tag_chunk_closure),
-                    ("identity.min_strength", id.min_strength),
-                    ("identity.floor_cap", id.floor_cap),
-                ] {
-                    range(name, value, 0.0, 1.0)?;
-                }
-                range("identity.floor_exponent", id.floor_exponent, 0.5, 4.0)?;
+            if let Some(i) = &aux.identity {
+                fraction("auxiliary.identity.min_potential", i.min_potential)?;
+                fraction("auxiliary.identity.min_specificity", i.min_specificity)?;
+                fraction(
+                    "auxiliary.identity.min_tag_chunk_closure",
+                    i.min_tag_chunk_closure,
+                )?;
+                fraction("auxiliary.identity.min_strength", i.min_strength)?;
+                nonnegative("auxiliary.identity.floor_cap", i.floor_cap)?;
+                greater("auxiliary.identity.floor_exponent", i.floor_exponent, 0.0)?;
             }
         }
         Ok(())
@@ -442,22 +449,18 @@ impl DtscEvidenceConfig {
 }
 
 impl DtscReadoutConfig {
-    pub fn validate(&self) -> VcpResult<()> {
-        range("geometry_weight", self.geometry_weight, 0.0, 1.0)?;
-        let trust = &self.trust;
-        range("trust.min_field_entropy", trust.min_field_entropy, 0.0, 1.0)?;
+    pub(super) fn validate(&self) -> Result<()> {
+        nonnegative("correction_gain", self.correction_gain)?;
+        let t = &self.trust;
+        range("trust.min_field_entropy", t.min_field_entropy, 0.0, 1.0)?;
         range(
             "trust.min_candidate_coverage",
-            trust.min_candidate_coverage,
+            t.min_candidate_coverage,
             0.0,
             1.0,
         )?;
-        range("trust.min_geo_score", trust.min_geo_score, 0.0, 1.0)?;
-        range("trust.min_geo_spread", trust.min_geo_spread, 0.0, 1.0)?;
-        require(
-            trust.min_strong_evidence.is_finite() && trust.min_strong_evidence >= 0.0,
-            "trust.min_strong_evidence",
-            "be finite and nonnegative",
-        )
+        nonnegative("trust.min_geo_score", t.min_geo_score)?;
+        nonnegative("trust.min_geo_spread", t.min_geo_spread)?;
+        nonnegative("trust.min_strong_evidence", t.min_strong_evidence)
     }
 }

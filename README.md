@@ -1,40 +1,56 @@
 # Nexus
 
-Nexus is an in-memory Rust library for vector geometry, graph propagation and retrieval. Prepare a collection once, then use its built-in indexes or bring your own recall. Results carry the business IDs you supplied for candidates, documents, concepts and sources.
+Nexus is an in-memory Rust library for vector geometry, graph propagation, and retrieval. Supply concept vectors, ordered source facts, a query, and candidate vectors. Nexus derives the graph, query directions, and ranking evidence. Results use your candidate, concept, and source IDs.
 
-The workspace uses Rust 1.100.0.
+### Rank candidates you already have
 
 ~~~rust
-use nexus::{Concept, Dataset, Document, ExecutionContext, Nexus, Query, RecallRequest};
+use nexus::{Candidate, Concept, Model, Query, RelationData, Source};
 
-fn main() -> nexus::core::VcpResult<()> {
-    let ctx = ExecutionContext::default();
-    let data = Dataset {
-        concepts: vec![Concept::new(10, "battery", vec![1.0, 0.0])],
-        documents: vec![Document::new(101, vec![1.0, 0.0])],
-        ..Dataset::default()
-    };
-    let nexus = Nexus::prepare(data, &Default::default(), &ctx)?;
-    let indexes = nexus.prepare_recall(&Default::default(), &ctx)?;
+fn main() -> nexus::Result<()> {
+    let model = Model::build(
+        RelationData {
+            dimension: 2,
+            concepts: vec![
+                Concept::new(10, vec![1.0, 0.0]).with_label("cache"),
+                Concept::new(20, vec![0.8, 0.6]).with_label("index"),
+            ],
+            sources: vec![Source::independent(100, vec![vec![10, 20]])],
+            relations: vec![],
+        },
+        &Default::default(),
+    )?;
 
-    let query = Query::new(&[1.0, 0.0], "battery");
-    let observation = indexes.observe(&query, &Default::default(), &ctx)?;
-    let candidates = observation.recall(&indexes, &RecallRequest::top_k(10), &ctx)?;
-    let ranking = observation.evaluate(&candidates, &ctx)?.river(&Default::default(), &ctx)?;
-    for item in ranking.items {
-        println!("{} {}", item.id, item.scores.score);
+    let candidates = model.candidates(vec![
+        Candidate::new(101, vec![0.9, 0.6]).with_sources(vec![100]),
+        Candidate::new(102, vec![0.0, 1.0]),
+    ])?;
+
+    let ranking = model.rank_river(
+        Query::new(&[1.0, 0.2]).with_text("cache"),
+        &candidates,
+        &Default::default(),
+    )?;
+    for row in ranking.rows() {
+        println!("{} {}", row.id, row.value);
     }
     Ok(())
 }
 ~~~
 
-Use one evaluation for TagMemo, River, DTSC and Thinking. Reuse River or DTSC evidence to vary scoring, or call the independent algorithms with their typed inputs.
+For host recall, call **observe → search your index → select candidates → evaluate**. One observation exposes the original, enhanced and available field vectors. One evaluation supports cosine, TagMemo, River, DTSC and Thinking. Use the ordinary Rust functions in `nexus::math`, `nexus::operators` and `nexus::context` to compose individual computations.
 
-- [Host integration](docs/host-integration.md) covers host-provided recall, multiple lanes, provenance and reusable evidence.
-- [Algorithm map](INDEX.md) links each operation to its implementation and numerical contract.
-- [Live vector retrieval](docs/live-retrieval.md) runs on model-generated embeddings.
-- [Numerical sources](docs/upstream.md) identifies the upstream algorithms and their licenses.
+The [host guide](docs/host-integration.md) explains input ownership, score semantics and how to reuse evidence. The [algorithm map](INDEX.md) and [numerical sources](docs/upstream.md) document the computation.
 
-Run the self-contained host example with `cargo run -p nexus --example public_host --locked`. Run `just check` for the workspace checks.
+### Run the examples
 
-`nexus` and `nexus-vcp` are CC BY-NC-SA 4.0. `nexus-math` and `nexus-core` are Apache 2.0. Depend on `nexus-math` directly for DTSC and RRF without the VCP dependency.
+~~~sh
+cargo run --manifest-path examples/public-client/Cargo.toml --bin numeric --locked
+cargo run --manifest-path examples/public-client/Cargo.toml --bin direct_candidates --locked
+cargo run --manifest-path examples/public-client/Cargo.toml --bin host_recall --locked
+cargo run --manifest-path examples/public-client/Cargo.toml --bin custom_readouts --locked
+~~~
+
+The examples depend only on `nexus`. The workspace uses Rust 1.100.0. Run `just check` for lint, tests, and formatting.
+
+`nexus` distributes the VCP-derived implementation under [CC BY-NC-SA 4.0](LICENSES/CC-BY-NC-SA-4.0.txt) with file-level notices for code under other terms. Independent cosine, NNLS, DTSC, transport, deduplication and RRF are available under [Apache 2.0](LICENSES/Apache-2.0.txt) in `nexus-math`.

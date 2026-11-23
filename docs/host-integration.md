@@ -1,113 +1,77 @@
-# Calling Nexus from a host
+# Host integration
 
-## Prepare assets once
+## Build the model and give candidates their own identity
 
-Use `Nexus::prepare(data, &config, &ctx)` with raw concept and document vectors, ordered paths and source facts. Pass vectors from one embedding model and space, and keep the Nexus across queries. Raw vectors must be finite and nonzero. Preparation normalizes them. The host supplies embeddings, document text and any authorization or metadata filters.
+`Model::build` takes a `RelationData` with a positive dimension, concept vectors, source records and optional positive relations. Use one embedding space for concepts, queries and candidates. Nexus checks dimensions, finite values and nonzero vectors at the input boundary, then prepares the unit directions and graph.
 
-Assign each candidate a unique `Document::id`. Fragments can share a `document_id` so Thinking groups them by document. List each source referenced by a path or relation in `Dataset::sources`. A ranked `PathRef` identifies the path by candidate ID and its zero-based position in that candidate's input. It includes the business source ID when attribution is available. Position ties among the steps of a path preserve input order.
+Use stable `u64` IDs. A source ID identifies one canonical body of evidence. Copies and extra candidate passages can refer to the same source. Declare an origin with `Source::independent`, `Source::derived`, or `Source::unknown_origin`. Use a derived source for known ancestry. Unknown sources still supply ordinary paths and relations. Confirmed roots determine independent support and cross-source witnesses. Keep the original concept order when providing paths.
 
-Import immutable unit vectors and a checked base transport graph with `Nexus::from_prepared`. The borrowed `nexus.prepared()` view carries optional tag residuals for a concept index and optional per-path source roots. Keep the backing arrays alive for the lifetime of the borrowed Nexus. Stable business IDs can map directly to original files, passages or application records.
-
-## Built-in recall and ranking
-
-Build `nexus.prepare_recall(&RecallConfig::default(), &ctx)` once. The concept index supplies Pyramid recall and the document index selects candidates for ranking. Set the corresponding configuration field to `None` when only one index is needed.
+Use `Candidate::new` for a vector and ID, `with_document_id` for document grouping and `with_sources` for full source paths. Specify `with_paths` when a candidate covers a particular path or fragment:
 
 ~~~rust
-let observation = indexes.observe(&Query::new(vector, text), &Default::default(), &ctx)?;
-let request = RecallRequest {
-    allowed: Some(permitted_candidate_ids),
-    ..RecallRequest::top_k(100)
-};
-let candidates = observation.recall(&indexes, &request, &ctx)?;
-let evaluation = observation.evaluate(&candidates, &ctx)?;
-let river = evaluation.river(&Default::default(), &ctx)?;
-let dtsc = evaluation.dtsc(&Default::default(), &ctx)?;
+use nexus::{Candidate, PathRef};
+
+let fragment = Candidate::new(501, vec![0.9, 0.2, 0.1]).with_paths(vec![
+    PathRef { source: 100, path: 0, positions: Some(vec![1, 2]) },
+]);
 ~~~
 
-Document recall uses the original direction and returns up to the requested number of candidates. To run multiple recall lanes, call `indexes.search_documents(vector, &request, &ctx)` with each lane's vector. For example, use the raw embedding in one lane and `observation.values().fused.enhanced_query` in another. Results are ordered by increasing warped distance and carry candidate and document IDs. Combine the ordered IDs with `math::ranking::rrf` or your own selection policy, then prepare one `CandidateInput::Ids` from the combined order.
+Path numbers and positions are zero-based in the original source. A source path `[10, 20, 10, 40]` with positions `[1, 2]` yields `[20, 10]`; the selected path returns the same positions. `positions: None` selects the whole path. `with_paths(vec![])` keeps any declared source ownership and selects no paths.
+
+`Model::candidates` binds owned candidate data once. Use `Model::candidate_view` with `CandidateView::new(math::UnitVectors::new(...)? )` when the host already owns a row-major matrix of unit vectors. Optional `CandidateMetadata` supplies sources and document ID for specific rows. `Candidates::select(ids)` keeps the requested ID order and shares the original vectors and resolved evidence. A cloned model can use the same bound candidates.
+
+## Observe before host recall
+
+The observation is ready to use across an asynchronous host call. It owns the query results. The library supplies `Original`, `Enhanced`, and whichever of `LocalField` and `TransferField` have a direction.
 
 ~~~rust
-use nexus::math::{WeightedRanking, rrf};
+use nexus::{Candidates, Model, Query, Ranking, RecallKind};
 
-let id_order = [
-    indexes.search_documents(vector, &request, &ctx)?,
-    indexes.search_documents(&observation.values().fused.enhanced_query, &request, &ctx)?,
-].map(|hits| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>());
-let lanes = id_order.each_ref().map(|ids| WeightedRanking { ids, weight: 1.0 });
-let fused = rrf(&lanes, &Default::default(), &ctx)?;
-let ids: Vec<_> = fused.items.iter().take(request.limit).map(|hit| hit.id).collect();
-let candidates = nexus.candidates(CandidateInput::Ids(&ids))?;
-~~~
-
-To add field lanes, compute `observation.fields` before putting together the candidate set. Its basin output provides optional `local_direction` and `transfer_direction` vectors. Search with the directions that are present, then pass the same fields to `evaluation.river_evidence` after combining the lanes.
-
-## Host recall and supplied candidates
-
-A host provider fills each Pyramid layer with ordered concept IDs. The callback receives the current residual with its magnitude, the excluded IDs and the requested limit. Return distinct known IDs and skip excluded IDs. An empty output ends decomposition. The default observation enables Pyramid and uses either the prepared concept index or the host provider. When using core concepts alone, call `Query::with_core_concepts` and set `ObservationConfig::pyramid` to `None`.
-
-~~~rust
-let query = Query::new(vector, text).with_tag_recall(&recall);
-let config = RiverQueryConfig::default();
-let result = nexus.rank_river(&query, CandidateInput::Ids(ids), &config, &ctx)?;
-for item in result.items {
-    println!("{} {}", item.id, item.scores.score);
+fn rank_with_host(
+    model: &Model,
+    catalog: &Candidates<'_>,
+    query: &[f32],
+    recall: impl FnOnce(&[f32]) -> nexus::Result<Vec<u64>>,
+) -> nexus::Result<Ranking> {
+    let observation = model.observe(Query::new(query), &Default::default())?;
+    let ids = recall(observation.vector(RecallKind::Enhanced).expect("enhanced query"))?;
+    let candidates = catalog.select(ids)?;
+    let evaluation = observation.evaluate(&candidates, &Default::default())?;
+    Ok(evaluation.river(&Default::default())?.top(Some(10)))
 }
 ~~~
 
-Use `rank_dtsc` or `rank_tag_memo` for the corresponding one-call readout. Use `CandidateInput::Ids` for catalog IDs, `Owned` for `Document` rows with raw vectors, or `Borrowed` for a row-major matrix of unit vectors. The supplied order breaks exact scoring ties. When the host provides candidates, pass only rows allowed in the current query. For imported assets using host concept recall, the tag residual column is optional.
+To use several recall lanes, iterate `observation.recall_vectors()` and combine their ID lists with `math::merge_ranked_ids`. An independent `math::WarpedIndex` can search document directions supplied by an observation. Its hits carry distances ordered nearest first. `math::cosine_scores` provides exact cosine without building an index.
 
-Use `query.with_edge_gates(gates)` for request-specific attenuation. Gates follow the base CSR edge order and range from zero to one. The observation materializes the effective weights once and keeps the same edge slots and provenance. A static candidate set can be reused across requests with different gates.
+`Query::with_text` supplies the text for deterministic lexical matching against labels and aliases. Explicit core IDs participate even if concept search misses them. Vector anchors affect query fusion and need no graph identity. `with_edge_gates` takes concept pairs for this observation, with factors in `[0, 1]`. Duplicate factors combine by minimum. A positive edge gated to zero carries no flow; the other outgoing weights keep their mass.
 
-## Share observations and score fixed evidence
+Default Pyramid performs internal numeric concept search. `ObserveOptions::concept_search` allows a synchronous index to replace only that search. Its request contains the current residual, level, limit and excluded concept IDs. Return a unique set of permitted model IDs. Nexus fits those concepts using the original vectors. Use `ObserveConfig::pyramid = None` to disable the residual decomposition.
 
-Call `evaluation.tag_memo`, `evaluation.river`, `evaluation.dtsc` and `evaluation.thinking` on one evaluation to share candidate similarities. Thinking takes ordered named stages with candidate IDs from that evaluation. The staged form below keeps River and DTSC evidence for multiple scoring passes.
+## Reuse one evaluation and choose a score
+
+`Evaluation::cosine` and `tag_memo` return original and enhanced cosine. River reports a nonnegative score with separate baseline, path and graph contributions and the complete winning path. The topology budget defaults to `0.08`. Cross-source witnesses identify the positive wormhole, both sources, and the common third concept.
+
+DTSC applies geometric correction to a baseline you choose. On a trusted field the result is `baseline + correction_gain * geo_bonus`, with gain `1` by default. A low-trust decision preserves your baseline values and ordering. Use `evaluation.baseline([(id, value), ...])` to import finite scores that cover every candidate exactly once. This is also how you use a score from another evaluation.
 
 ~~~rust
-use nexus::{BorrowedCandidates, CandidateInput, RiverConfig};
-use nexus::math::DtscConfig;
-use nexus::vcp::{ObservationConfig, RiverScoringConfig, ThinkingConfig};
-
-let rows = BorrowedCandidates::new(ids, unit_matrix).with_paths(path_rows);
-let candidates = nexus.candidates(CandidateInput::Borrowed(rows))?;
-let observation = nexus.observe(&query, &ObservationConfig::default(), &ctx)?;
-let evaluation = observation.evaluate(&candidates, &ctx)?;
-
-let config = RiverConfig::default();
-let fields = observation.fields(&config.fields, &ctx)?;
-let river = evaluation.river_evidence(&fields, &config.analysis, &ctx)?;
-let standard = river.readout(&config.scoring, &ctx)?;
-let retuned = river.readout(
-    &RiverScoringConfig { unified_budget_ct: 0.04, ..config.scoring },
-    &ctx,
-)?;
-
-let dtsc_config = DtscConfig::default();
-let field = observation.dtsc_field(&dtsc_config.field, &ctx)?;
-let evidence = evaluation.dtsc_evidence(&field, &dtsc_config.scoring.evidence, &ctx)?;
-let dtsc = evidence.readout(&dtsc_config.scoring.readout, &ctx)?;
-let thinking = evaluation.thinking(&stages, &ThinkingConfig::default(), &ctx)?;
+let river = evaluation.river(&Default::default())?;
+let enhanced = evaluation.tag_memo();
+let curves = evaluation.dtsc_evidence(&Default::default())?;
+let on_river = curves.apply(&river, &Default::default())?;
+let on_enhanced = curves.apply(&enhanced, &Default::default())?;
 ~~~
 
-An evaluation computes the original and enhanced candidate similarities once. River and DTSC evidence own their scores and business identity mapping. You can release the observation, fields and candidates, then read out the evidence with a fresh execution context.
+For River, `evaluation.river_evidence` computes every path once. `RiverEvidence::readout` can then apply several topology budgets or Ω exponents and select the winning path each time. `operators::bridge_witnesses` exposes qualified source pairs before candidate scoring.
 
-| Change | Work to repeat |
-| --- | --- |
-| River budget or omega exponent | Read out the same evidence. Each readout picks the best complete path under its own settings |
-| River evidence policy, path thresholds or cross-file configuration | Rebuild River evidence |
-| River field configuration | Solve fields and rebuild River evidence |
-| DTSC geometry weight, fallback order, pool trust or top-k | Read out the same evidence |
-| DTSC path scoring or auxiliary policy | Rebuild DTSC evidence |
-| Candidate set or order | Evaluate the new set. Reuse the observation and fields |
-| Query, core concepts or edge gates | Observe and evaluate again |
+`Scores` retains every candidate in the input order. `top(Some(k))` produces an owned ranking, `top(None)` takes all scores, and `top(Some(0))` returns an empty ranking. Equal scores follow the baseline's stable order. Use `math::reciprocal_rank_fusion` to combine rank positions from algorithms with different score scales.
 
-River defaults to a topology budget of 0.02. Set `config.scoring.unified_budget_ct` to `nexus::vcp::VCP_TOPOLOGY_BUDGET` to use VCP's 0.08. The DTSC setting `dtsc_config.scoring.readout.geometry_weight` defaults to 0.15 of the prepared reward. When evidence is insufficient, candidates are ordered by original cosine before taking `top_k`. Set `dtsc_config.scoring.readout.fallback_order` to `nexus::math::DtscFallbackOrder::InputOrder` when candidate order already encodes your host's baseline ranking. `DtscDecision::Fallback` reports the reason and the order used.
+`Evaluation::thinking` takes ordered `ThinkingStage` values with candidate IDs and per-stage limits. It returns selected paths, parents, and retained routes. Already selected documents are skipped throughout the sequence. Candidates without a document ID are identified by their own candidate IDs.
 
-Propagation completeness is reported by every ordinary readout. River also reports projection limits. Thinking uses complete propagation and a complete recorded trace. A finite field iteration budget can return `NotConverged` before projection.
+## Configure the computation that owns each parameter
 
-Set `ExecutionContext::cancel` from the host's request token to cancel observations, search and readouts. Operations return `core::VcpError` for invalid input, cancellation and algorithm failures. Run synchronous queries on the host's blocking executor when integrating with an async service. Use `ParallelPolicy::CustomPool` when the service owns a bounded Rayon pool.
+- `BuildConfig` sets local and global geometry, fact weights, the transport graph and Warped concept-index geometry.
+- `ObserveConfig` sets EPA, Pyramid, seed selection, Sense, fusion, and both fields. A finite beam or iteration count gives a usable approximation. Field solutions report the returned iterate's residual and L1 error bound.
+- `RiverConfig`, DTSC field/evidence/readout configuration, and `ThinkingConfig` affect their corresponding readout. Change DTSC's geometry options to rebuild evidence. Change trust or gain to read the same evidence again.
+- `RunOptions` controls per-call cancellation and parallelism. Sequential is the default. Use `Parallelism::Rayon` inside your own `rayon::ThreadPool::install` to bound worker count.
 
-## Compose individual algorithms
-
-Use each function's typed input and borrow the results you need. For example, pass the `effective_vector` from `vcp::context::aggregate` to `vcp::observation::analyze_epa`. For ordered lists of business IDs, `math::ranking::rrf` returns rank scores over the union. `vcp::river::wormhole_rrf` uses a River baseline and chosen paths to compute rank scores from the baseline and supported routes.
-
-The [public host example](../crates/nexus/examples/public_host.rs) uses host recall, catalog and borrowed candidates, shared evidence, Thinking and independent fusion.
+All configuration structs expose their numerical parameters and support serde. The optional `schemars` feature generates configuration schemas. Consult the [algorithm map](../INDEX.md) and the [runnable consumer](../examples/public-client/) for individual operators and complete usage.

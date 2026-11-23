@@ -1,0 +1,27 @@
+[package]
+name = "nexus-public-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[workspace]
+
+[dependencies]
+nexus = { path = "../../crates/nexus" }
+
+[[bin]]
+name = "numeric"
+path = "numeric.rs"
+
+[[bin]]
+name = "direct_candidates"
+path = "direct_candidates.rs"
+
+[[bin]]
+name = "host_recall"
+path = "host_recall.rs"
+
+[[bin]]
+name = "custom_readouts"
+path = "custom_readouts.rs"
